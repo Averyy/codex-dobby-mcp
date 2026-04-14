@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+from codex_dobby_mcp.models import CODEX_DOBBY_DIRNAME, RunArtifacts, ToolName
+
+
+class PathResolutionError(ValueError):
+    pass
+
+
+def resolve_path(value: str, base_dir: Path) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    return candidate.resolve()
+
+
+def resolve_repo_root(spawn_root: Path, explicit_root: str | None = None) -> Path:
+    repo_root = resolve_path(explicit_root, spawn_root) if explicit_root else spawn_root.resolve()
+    if not repo_root.exists():
+        raise PathResolutionError(f"Repo root does not exist: {repo_root}")
+    if not repo_root.is_dir():
+        raise PathResolutionError(f"Repo root is not a directory: {repo_root}")
+    if not is_git_worktree(repo_root):
+        raise PathResolutionError(f"Repo root is not inside a git worktree: {repo_root}")
+    return repo_root
+
+
+def resolve_extra_roots(spawn_root: Path, extra_roots: list[str]) -> list[Path]:
+    resolved: list[Path] = []
+    for item in extra_roots:
+        raw = Path(item).expanduser()
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (spawn_root / raw).resolve()
+            try:
+                path.relative_to(spawn_root.resolve())
+            except ValueError as exc:
+                raise PathResolutionError(
+                    f"Relative extra root resolves outside the base directory through symlinks: {raw}"
+                ) from exc
+        if not path.exists():
+            raise PathResolutionError(f"Extra root does not exist: {path}")
+        if not path.is_dir():
+            raise PathResolutionError(f"Extra root is not a directory: {path}")
+        if path not in resolved:
+            resolved.append(path)
+    return resolved
+
+
+def reverse_engineer_default_writable_roots() -> list[Path]:
+    roots: list[Path] = []
+    candidate = Path("~/.claude/mcp-servers").expanduser().resolve()
+    if candidate.exists():
+        roots.append(candidate)
+    return roots
+
+
+def reverse_engineer_default_readonly_roots() -> list[Path]:
+    return []
+
+
+def create_run_artifacts(repo_root: Path, task_id: str | None = None) -> RunArtifacts:
+    run_id = _validate_task_id(task_id or uuid.uuid4().hex)
+    artifacts_root = _ensure_safe_directory(
+        repo_root / CODEX_DOBBY_DIRNAME,
+        f"{CODEX_DOBBY_DIRNAME} artifact directory",
+    )
+    runs_root = _ensure_safe_directory(artifacts_root / "runs", f"{CODEX_DOBBY_DIRNAME}/runs directory")
+    run_dir = _ensure_safe_directory(runs_root / run_id, f"{CODEX_DOBBY_DIRNAME} run directory")
+    return run_artifacts_for_task(repo_root, run_id)
+
+
+def run_artifacts_for_task(repo_root: Path, task_id: str) -> RunArtifacts:
+    run_id = _validate_task_id(task_id)
+    run_dir = _validate_optional_directory(
+        runs_root_for_repo(repo_root) / run_id,
+        f"{CODEX_DOBBY_DIRNAME} run directory",
+    )
+    return RunArtifacts(
+        run_dir=run_dir,
+        request_json=run_dir / "request.json",
+        prompt_txt=run_dir / "prompt.txt",
+        stdout_log=run_dir / "stdout.log",
+        stderr_log=run_dir / "stderr.log",
+        last_message_txt=run_dir / "last_message.txt",
+        result_json=run_dir / "result.json",
+        output_schema_json=run_dir / "output-schema.json",
+    )
+
+
+def runs_root_for_repo(repo_root: Path) -> Path:
+    artifacts_root = _validate_optional_directory(
+        repo_root / CODEX_DOBBY_DIRNAME,
+        f"{CODEX_DOBBY_DIRNAME} artifact directory",
+    )
+    return _validate_optional_directory(artifacts_root / "runs", f"{CODEX_DOBBY_DIRNAME}/runs directory")
+
+
+def private_runtime_root(task_id: str, temp_root: Path | None = None) -> Path:
+    base_root = (temp_root or Path(tempfile.gettempdir())).resolve()
+    if not base_root.exists():
+        raise PathResolutionError(f"Private runtime base directory does not exist: {base_root}")
+    if not base_root.is_dir():
+        raise PathResolutionError(f"Private runtime base directory is not a directory: {base_root}")
+
+    namespace_root = _ensure_safe_directory(base_root / "codex-dobby", "codex-dobby private runtime directory")
+    return _ensure_safe_directory(namespace_root / task_id, "codex-dobby private task runtime directory")
+
+
+def is_git_worktree(path: Path) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def write_json(path: Path, payload: object) -> None:
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def public_file_label(path: Path, repo_root: Path) -> str:
+    try:
+        return str(path.relative_to(repo_root))
+    except ValueError:
+        return str(path)
+
+
+def _ensure_safe_directory(path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise PathResolutionError(f"{label} must not be a symlink: {path}")
+    if path.exists():
+        if not path.is_dir():
+            raise PathResolutionError(f"{label} is not a directory: {path}")
+        return path
+    path.mkdir()
+    return path
+
+
+def _validate_optional_directory(path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise PathResolutionError(f"{label} must not be a symlink: {path}")
+    if path.exists() and not path.is_dir():
+        raise PathResolutionError(f"{label} is not a directory: {path}")
+    return path
+
+
+def _validate_task_id(task_id: str) -> str:
+    posix = PurePosixPath(task_id)
+    windows = PureWindowsPath(task_id)
+    if (
+        not task_id
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or len(posix.parts) != 1
+        or len(windows.parts) != 1
+        or posix.parts[0] in {".", ".."}
+    ):
+        raise PathResolutionError(f"Run task id must be a single safe path segment: {task_id!r}")
+    return task_id
