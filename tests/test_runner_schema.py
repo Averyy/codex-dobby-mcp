@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -39,7 +40,7 @@ def _request(**overrides) -> InvocationRequest:
     )
     defaults.update(overrides)
     return InvocationRequest.model_construct(**defaults)
-from codex_dobby_mcp.paths import PathResolutionError
+from codex_dobby_mcp.paths import PathResolutionError, reverse_engineer_default_writable_roots
 from codex_dobby_mcp.review_agents import (
     REVIEW_SUBAGENT_DEFAULT_MODEL,
     REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
@@ -2063,6 +2064,10 @@ async def test_runner_inherits_parent_environment_for_child_codex_process(
     assert captured_env["TEMP"] == captured_env["TMPDIR"]
     assert captured_env["UV_CACHE_DIR"].endswith("/.codex-dobby/runs/" + result.task_id + "/runtime/cache/uv")
     assert captured_env["XDG_CACHE_HOME"].endswith("/.codex-dobby/runs/" + result.task_id + "/runtime/cache/xdg")
+    expected_claude_config = Path(tempfile.gettempdir()).resolve() / "codex-dobby" / result.task_id / "claude-config"
+    assert Path(captured_env["CLAUDE_CONFIG_DIR"]) == expected_claude_config
+    assert "HOME" not in captured_env or captured_env["HOME"] == os.environ.get("HOME", captured_env["HOME"])
+    assert captured_env["CLAUDE_CODE_DISABLE_CRON"] == "1"
     assert captured_env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert captured_env[RECURSION_GUARD_ENV] == "1"
     assert not expected_codex_home.exists()
@@ -3571,7 +3576,7 @@ def test_reverse_engineer_adds_builtin_mcp_servers_root_only(
     monkeypatch.setattr("codex_dobby_mcp.paths.subprocess.run", fake_run)
     monkeypatch.setattr(
         "codex_dobby_mcp.runner.reverse_engineer_default_writable_roots",
-        lambda: [mcp_servers_root.resolve()],
+        lambda repo_root=None: [mcp_servers_root.resolve()],
     )
     monkeypatch.setattr(
         "codex_dobby_mcp.runner.reverse_engineer_default_readonly_roots",
@@ -3583,3 +3588,345 @@ def test_reverse_engineer_adds_builtin_mcp_servers_root_only(
     assert resolved.sandbox_roots == [repo_root.resolve(), mcp_servers_root.resolve()]
     assert resolved.writable_roots == [repo_root.resolve(), mcp_servers_root.resolve()]
     assert resolved.advisory_read_only_roots == []
+
+
+@pytest.mark.asyncio
+async def test_runner_rewrites_claude_config_references_into_private_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    parent_codex_home = tmp_path / "codex-home"
+    (parent_codex_home / "sessions").mkdir(parents=True, exist_ok=True)
+    (parent_codex_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+
+    parent_claude_config = tmp_path / "claude-home"
+    helpers_root = parent_claude_config / "mcp-servers" / "ghidra-mcp"
+    helpers_root.mkdir(parents=True)
+    (helpers_root / "bridge_mcp_ghidra.py").write_text("# bridge\n", encoding="utf-8")
+
+    (parent_codex_home / "config.toml").write_text(
+        (
+            "[mcp_servers.ghidra]\n"
+            'command = "uv"\n'
+            f'args = ["run", "{helpers_root / "bridge_mcp_ghidra.py"}"]\n'
+            f'helper_dir = "{helpers_root}"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(parent_codex_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(parent_claude_config))
+
+    seeded_config = ""
+    mirrored_bridge = ""
+    mirrored_helper_dir_exists = False
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+            return (b"", b"")
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal seeded_config, mirrored_bridge, mirrored_helper_dir_exists
+        child_env = dict(kwargs["env"])
+        child_codex_home = Path(child_env["CODEX_HOME"])
+        child_claude_config = Path(child_env["CLAUDE_CONFIG_DIR"])
+        seeded_config = (child_codex_home / "config.toml").read_text(encoding="utf-8")
+        mirrored_bridge = (child_claude_config / "mcp-servers" / "ghidra-mcp" / "bridge_mcp_ghidra.py").read_text(
+            encoding="utf-8"
+        )
+        mirrored_helper_dir_exists = (child_claude_config / "mcp-servers" / "ghidra-mcp").is_dir()
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "summary": "research complete",
+                    "completeness": "full",
+                    "important_facts": [],
+                    "next_steps": [],
+                    "files_changed": [],
+                    "warnings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+
+    result = await runner.run(ToolName.RESEARCH, InvocationRequest(prompt="inspect"))
+
+    assert result.status == RunStatus.SUCCESS
+    assert str(parent_claude_config) not in seeded_config
+    assert "/claude-config/mcp-servers/ghidra-mcp/bridge_mcp_ghidra.py" in seeded_config
+    assert mirrored_bridge == "# bridge\n"
+    assert mirrored_helper_dir_exists is True
+
+
+@pytest.mark.asyncio
+async def test_runner_rewrites_symlinked_claude_config_references_into_private_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    parent_codex_home = tmp_path / "codex-home"
+    (parent_codex_home / "sessions").mkdir(parents=True, exist_ok=True)
+    (parent_codex_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+
+    parent_claude_config = tmp_path / "claude-home"
+    parent_claude_config.mkdir()
+    shared_helpers_root = tmp_path / "shared-helpers"
+    helpers_root = shared_helpers_root / "ghidra-mcp"
+    helpers_root.mkdir(parents=True)
+    (helpers_root / "bridge_mcp_ghidra.py").write_text("# bridge\n", encoding="utf-8")
+    (parent_claude_config / "mcp-servers").symlink_to(shared_helpers_root, target_is_directory=True)
+    bridge_path = parent_claude_config / "mcp-servers" / "ghidra-mcp" / "bridge_mcp_ghidra.py"
+
+    (parent_codex_home / "config.toml").write_text(
+        (
+            "[mcp_servers.ghidra]\n"
+            'command = "uv"\n'
+            f'args = ["run", "{bridge_path}"]\n'
+            f'helper_dir = "{bridge_path.parent}"\n'
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(parent_codex_home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(parent_claude_config))
+
+    seeded_config = ""
+    mirrored_bridge = ""
+    mirrored_helper_dir_exists = False
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+            return (b"", b"")
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal seeded_config, mirrored_bridge, mirrored_helper_dir_exists
+        child_env = dict(kwargs["env"])
+        child_codex_home = Path(child_env["CODEX_HOME"])
+        child_claude_config = Path(child_env["CLAUDE_CONFIG_DIR"])
+        seeded_config = (child_codex_home / "config.toml").read_text(encoding="utf-8")
+        mirrored_bridge = (child_claude_config / "mcp-servers" / "ghidra-mcp" / "bridge_mcp_ghidra.py").read_text(
+            encoding="utf-8"
+        )
+        mirrored_helper_dir_exists = (child_claude_config / "mcp-servers" / "ghidra-mcp").is_dir()
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "summary": "research complete",
+                    "completeness": "full",
+                    "important_facts": [],
+                    "next_steps": [],
+                    "files_changed": [],
+                    "warnings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+
+    result = await runner.run(ToolName.RESEARCH, InvocationRequest(prompt="inspect"))
+
+    assert result.status == RunStatus.SUCCESS
+    assert str(parent_claude_config) not in seeded_config
+    assert "/claude-config/mcp-servers/ghidra-mcp/bridge_mcp_ghidra.py" in seeded_config
+    assert mirrored_bridge == "# bridge\n"
+    assert mirrored_helper_dir_exists is True
+
+
+def test_runner_reverse_engineer_uses_repo_local_codex_config_for_helper_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / ".codex").mkdir()
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("USER", "isolated-user")
+    monkeypatch.setattr(
+        "codex_dobby_mcp.paths._MACOS_GHIDRA_SOCKET_SCAN_ROOTS",
+        (tmp_path / "no-live-sockets",),
+    )
+
+    ghidra_root = tmp_path / "ghidra-mcp"
+    ghidra_root.mkdir()
+    bridge_path = ghidra_root / "bridge_mcp_ghidra.py"
+    bridge_path.write_text("# test\n", encoding="utf-8")
+    ((repo_root / ".codex") / "config.toml").write_text(
+        f'[mcp_servers.ghidra]\ncommand = "uv"\nargs = ["run", "{bridge_path}"]\n',
+        encoding="utf-8",
+    )
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    resolved = runner._resolve(ToolName.REVERSE_ENGINEER, InvocationRequest(prompt="inspect firmware"))
+
+    assert resolved.sandbox_roots == [repo_root.resolve(), ghidra_root.resolve()]
+    assert resolved.writable_roots == [repo_root.resolve(), ghidra_root.resolve()]
+    assert resolved.advisory_read_only_roots == []
+
+
+def test_reverse_engineer_default_writable_roots_use_configured_ghidra_bridge_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(exist_ok=True)
+    ghidra_root = tmp_path / "ghidra-mcp"
+    ghidra_root.mkdir()
+    (ghidra_root / "bridge_mcp_ghidra.py").write_text("# test\n", encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        f'[mcp_servers.ghidra]\ncommand = "uv"\nargs = ["run", "{ghidra_root / "bridge_mcp_ghidra.py"}"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("USER", "isolated-user")
+    monkeypatch.setattr(
+        "codex_dobby_mcp.paths._MACOS_GHIDRA_SOCKET_SCAN_ROOTS",
+        (tmp_path / "no-live-sockets",),
+    )
+
+    assert reverse_engineer_default_writable_roots() == [ghidra_root.resolve()]
+
+
+def test_reverse_engineer_default_writable_roots_ignore_unrelated_absolute_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(exist_ok=True)
+    ghidra_root = tmp_path / "ghidra-mcp"
+    ghidra_root.mkdir()
+    bridge_path = ghidra_root / "bridge_mcp_ghidra.py"
+    bridge_path.write_text("# test\n", encoding="utf-8")
+    unrelated_dir = tmp_path / "unrelated-dir"
+    unrelated_dir.mkdir()
+    log_file = tmp_path / "ghidra.log"
+    log_file.write_text("log\n", encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        (
+            '[mcp_servers.ghidra]\n'
+            'command = "uv"\n'
+            f'args = ["run", "{bridge_path}", "--project-dir", "{unrelated_dir}", "--log-file", "{log_file}"]\n'
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("USER", "isolated-user")
+    monkeypatch.setattr(
+        "codex_dobby_mcp.paths._MACOS_GHIDRA_SOCKET_SCAN_ROOTS",
+        (tmp_path / "no-live-sockets",),
+    )
+
+    assert reverse_engineer_default_writable_roots() == [ghidra_root.resolve()]
+
+
+def test_reverse_engineer_default_writable_roots_include_live_socket_runtime_from_tmpdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(exist_ok=True)
+    ghidra_root = tmp_path / "ghidra-mcp"
+    ghidra_root.mkdir()
+    (ghidra_root / "bridge_mcp_ghidra.py").write_text("# test\n", encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        f'[mcp_servers.ghidra]\ncommand = "uv"\nargs = ["run", "{ghidra_root / "bridge_mcp_ghidra.py"}"]\n',
+        encoding="utf-8",
+    )
+    runtime_tmp = tmp_path / "runtime-tmp"
+    socket_dir = runtime_tmp / "ghidra-mcp-avery"
+    socket_dir.mkdir(parents=True)
+    (socket_dir / "ghidra-123.sock").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("TMPDIR", str(runtime_tmp))
+    monkeypatch.setenv("USER", "avery")
+    monkeypatch.setattr(
+        "codex_dobby_mcp.paths._MACOS_GHIDRA_SOCKET_SCAN_ROOTS",
+        (tmp_path / "no-live-sockets",),
+    )
+
+    assert reverse_engineer_default_writable_roots() == [ghidra_root.resolve(), socket_dir.resolve()]
+
+
+def test_reverse_engineer_default_writable_roots_fall_back_to_macos_socket_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir(exist_ok=True)
+    ghidra_root = tmp_path / "ghidra-mcp"
+    ghidra_root.mkdir()
+    (ghidra_root / "bridge_mcp_ghidra.py").write_text("# test\n", encoding="utf-8")
+    (codex_home / "config.toml").write_text(
+        f'[mcp_servers.ghidra]\ncommand = "uv"\nargs = ["run", "{ghidra_root / "bridge_mcp_ghidra.py"}"]\n',
+        encoding="utf-8",
+    )
+    private_tmp = tmp_path / "private-tmp"
+    private_tmp.mkdir()
+    macos_scan_root = tmp_path / "var-folders"
+    socket_dir = macos_scan_root / "aa" / "bb" / "T" / "ghidra-mcp-avery"
+    socket_dir.mkdir(parents=True)
+    (socket_dir / "ghidra-456.sock").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setenv("TMPDIR", str(private_tmp))
+    monkeypatch.setenv("USER", "avery")
+    monkeypatch.setattr(
+        "codex_dobby_mcp.paths._MACOS_GHIDRA_SOCKET_SCAN_ROOTS",
+        (macos_scan_root,),
+    )
+
+    assert reverse_engineer_default_writable_roots() == [ghidra_root.resolve(), socket_dir.resolve()]

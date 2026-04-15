@@ -117,7 +117,7 @@ Default model `gpt-5.4`. Minimum timeout 300s.
 - `research` prefers codebase evidence and uses fetchaller MCP tools when available.
 - `validate` runs with `--full-auto` to compile and run tests; it is instructed not to edit sources or commit.
 - `review` uses a direct single-lens path for one agent, or multi-agent orchestration (via `spawn_agent` over `codex exec --json`) for multiple. Review subagents default to `gpt-5.4-mini` at `medium` reasoning.
-- `reverse_engineer` includes a Ghidra MCP workflow and mounts `~/.claude/mcp-servers/` as a writable helper root when present.
+- `reverse_engineer` includes a Ghidra MCP workflow and adds the configured Ghidra MCP helper repo as a writable helper root when Dobby can discover it from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`). When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.
 - Result artifacts are replaced atomically, so `get_run` sees either the startup placeholder or the final persisted response instead of a partially written `result.json`.
 - Blocking tools like `review` and `research` still behave exactly as before. If a caller insists on waiting synchronously, that caller can still hit its own outer MCP timeout.
@@ -126,7 +126,7 @@ Default model `gpt-5.4`. Minimum timeout 300s.
 
 - Read-only tools: only the repo root is sandbox-visible; `extra_roots` are prompt hints.
 - Mutating tools: `extra_roots` are mounted writable via `--add-dir`.
-- Child Codex runs no longer need write access to the parent `~/.codex/sessions`. Dobby seeds the child home from `CODEX_HOME/auth.json` and `CODEX_HOME/config.toml` when those files exist, then points the child at its private temp home. The server process therefore needs read access to the parent Codex auth/config files and read/write access to the temp runtime directory.
+- Child Codex runs no longer need write access to the parent `~/.codex/sessions`. Dobby seeds the child home from `CODEX_HOME/auth.json` and `CODEX_HOME/config.toml` when those files exist, mirrors referenced helper files from `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into a private runtime, then points the child at that private temp home. The server process therefore needs read access to the parent Codex and Claude config files plus read/write access to the temp runtime directory.
 - `CODEX_DOBBY_ACTIVE=1` is set on child runs and Dobby refuses to run if already set. Inherited `codex-dobby-mcp` entries are disabled so workers can't call back.
 - Commits are forbidden. A mutating worker that creates or moves a commit returns `status: "error"`.
 - Artifact access fails closed on invalid `task_id` values and symlinked artifact roots or paths. Wrapper writes also fail closed on unsafe `.gitignore` targets.

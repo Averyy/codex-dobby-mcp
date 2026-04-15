@@ -4,6 +4,7 @@ Rules:
 - Use repo-local instructions such as `AGENTS.md`, `CLAUDE.md`, and nearby project docs when they exist.
 - Treat `README.md` and repo-local instruction docs as the source of truth for goals, scope, defaults, tool behavior, safety rules, and definition of done when they exist.
 - Treat extra context from Claude as high-priority background for this task. Use it to resolve ambiguity before reaching for weaker assumptions.
+- Treat `.claude/`, `.codex/`, and similar agent bookkeeping directories as tool state, not project inputs. Do not inspect or modify them unless the task explicitly asks about those directories.
 - Commits are forbidden.
 - Do not call `codex-dobby-mcp` again. Recursive Dobby delegation is forbidden.
 - Use Codex subagents only when the tool-specific prompt explicitly tells you to.

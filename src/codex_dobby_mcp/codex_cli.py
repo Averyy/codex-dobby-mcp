@@ -79,6 +79,9 @@ def build_codex_command(
         argv.append("--full-auto")
         sandbox_mode = "workspace-write"
         uses_full_auto = True
+        if spec.tool == ToolName.REVERSE_ENGINEER:
+            for override in _reverse_engineer_network_overrides(spec):
+                argv.extend(["-c", override])
 
     for extra_root in spec.writable_roots:
         if extra_root != spec.repo_root:
@@ -144,6 +147,28 @@ def _read_only_add_dirs(spec: ResolvedInvocation) -> list[Path]:
         remember(extra_root)
 
     return ordered_roots
+
+
+def _reverse_engineer_network_overrides(spec: ResolvedInvocation) -> list[str]:
+    socket_roots = [
+        root
+        for root in spec.writable_roots
+        if root != spec.repo_root and _looks_like_live_socket_root(root)
+    ]
+    if not socket_roots:
+        return []
+
+    return [
+        "sandbox_workspace_write.network_access=true",
+        f"network.allow_unix_sockets={json.dumps([str(root) for root in socket_roots])}",
+    ]
+
+
+def _looks_like_live_socket_root(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(path.glob("*.sock"))
+    except OSError:
+        return False
 
 
 def _toml_string(value: str) -> str:

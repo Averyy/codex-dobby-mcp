@@ -88,6 +88,8 @@ def test_validate_tool_maps_to_full_auto_sandbox(tmp_path: Path) -> None:
     assert command.uses_full_auto is True
     assert "--full-auto" in command.argv
     assert "-s" not in command.argv
+    config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
+    assert "sandbox_workspace_write.network_access=true" not in config_values
 
 
 def test_read_only_tool_includes_advisory_read_only_roots(tmp_path: Path) -> None:
@@ -143,6 +145,51 @@ def test_danger_mode_maps_to_danger_full_access(tmp_path: Path) -> None:
     assert command.emits_json_events is False
     assert "--full-auto" not in command.argv
     assert ["-s", "danger-full-access"] == command.argv[command.argv.index("-s") : command.argv.index("-s") + 2]
+
+
+def test_reverse_engineer_tool_without_live_socket_root_does_not_enable_network_access(tmp_path: Path) -> None:
+    spec = make_spec(tmp_path, ToolName.REVERSE_ENGINEER)
+
+    command = build_codex_command(
+        spec,
+        "/opt/homebrew/bin/codex",
+        spec.artifacts.output_schema_json,
+        REVIEW_AGENTS_ROOT,
+    )
+
+    config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
+
+    assert command.sandbox_mode == "workspace-write"
+    assert command.uses_full_auto is True
+    assert "--full-auto" in command.argv
+    assert "sandbox_workspace_write.network_access=true" not in config_values
+    assert not any(value.startswith("network.allow_unix_sockets=") for value in config_values)
+
+
+def test_reverse_engineer_tool_enables_unix_socket_network_access_when_live_socket_root_present(
+    tmp_path: Path,
+) -> None:
+    spec = make_spec(tmp_path, ToolName.REVERSE_ENGINEER)
+    socket_root = tmp_path / "ghidra-mcp-avery"
+    socket_root.mkdir()
+    (socket_root / "ghidra-123.sock").write_text("", encoding="utf-8")
+    spec.sandbox_roots = [spec.repo_root, socket_root]
+    spec.writable_roots = [spec.repo_root, socket_root]
+
+    command = build_codex_command(
+        spec,
+        "/opt/homebrew/bin/codex",
+        spec.artifacts.output_schema_json,
+        REVIEW_AGENTS_ROOT,
+    )
+
+    config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
+
+    assert command.sandbox_mode == "workspace-write"
+    assert command.uses_full_auto is True
+    assert "--full-auto" in command.argv
+    assert "sandbox_workspace_write.network_access=true" in config_values
+    assert f'network.allow_unix_sockets=["{socket_root}"]' in config_values
 
 
 def test_review_tool_injects_selected_custom_agents(tmp_path: Path) -> None:

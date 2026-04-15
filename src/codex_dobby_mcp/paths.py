@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import tomllib
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -17,6 +18,9 @@ class PathResolutionError(ValueError):
 
 _ABSOLUTE_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`()\[\]{}<>]+")
 _TRAILING_PATH_PUNCTUATION = ",.;:)]}>"
+_MACOS_GHIDRA_SOCKET_SCAN_ROOTS = (Path("/var/folders"), Path("/private/var/folders"))
+_MACOS_GHIDRA_SOCKET_SCAN_PATTERNS = ("*/*/T/ghidra-mcp-{user}", "*/*/*/T/ghidra-mcp-{user}")
+_GHIDRA_BRIDGE_SCRIPT = "bridge_mcp_ghidra.py"
 
 
 def resolve_path(value: str, base_dir: Path) -> Path:
@@ -106,16 +110,163 @@ def _candidate_git_worktrees(path: Path) -> list[Path]:
     return candidates
 
 
-def reverse_engineer_default_writable_roots() -> list[Path]:
+def reverse_engineer_default_writable_roots(repo_root: Path | None = None) -> list[Path]:
     roots: list[Path] = []
-    candidate = Path("~/.claude/mcp-servers").expanduser().resolve()
-    if candidate.exists():
+    seen: set[Path] = set()
+    for ghidra_config in _mcp_server_configs("ghidra", repo_root=repo_root):
+        for candidate in _mcp_server_path_candidates(ghidra_config):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            roots.append(candidate)
+    for candidate in _ghidra_socket_runtime_roots():
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         roots.append(candidate)
     return roots
 
 
 def reverse_engineer_default_readonly_roots() -> list[Path]:
     return []
+
+
+def _ghidra_socket_runtime_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[Path] = set()
+
+    xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime_dir:
+        candidate = Path(xdg_runtime_dir).expanduser() / "ghidra-mcp"
+        if _looks_like_live_ghidra_socket_dir(candidate):
+            resolved = candidate.resolve()
+            roots.append(resolved)
+            seen.add(resolved)
+
+    user = os.environ.get("USER", "unknown")
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        candidate = Path(tmpdir).expanduser() / f"ghidra-mcp-{user}"
+        if _looks_like_live_ghidra_socket_dir(candidate):
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                roots.append(resolved)
+                seen.add(resolved)
+
+    for scan_root in _MACOS_GHIDRA_SOCKET_SCAN_ROOTS:
+        for pattern in _MACOS_GHIDRA_SOCKET_SCAN_PATTERNS:
+            for candidate in sorted(scan_root.glob(pattern.format(user=user))):
+                if not _looks_like_live_ghidra_socket_dir(candidate):
+                    continue
+                resolved = candidate.resolve()
+                if resolved in seen:
+                    continue
+                roots.append(resolved)
+                seen.add(resolved)
+
+    fallback = Path(f"/tmp/ghidra-mcp-{user}")
+    if _looks_like_live_ghidra_socket_dir(fallback):
+        resolved = fallback.resolve()
+        if resolved not in seen:
+            roots.append(resolved)
+
+    return roots
+
+
+def _looks_like_live_ghidra_socket_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    return any(path.glob("*.sock"))
+
+
+def _mcp_server_configs(server_name: str, *, repo_root: Path | None = None) -> list[dict[object, object]]:
+    configs: list[dict[object, object]] = []
+    for config_path in _codex_config_paths(repo_root=repo_root):
+        server_config = _load_mcp_server_config(config_path, server_name)
+        if server_config is not None:
+            configs.append(server_config)
+    return configs
+
+
+def _codex_config_paths(*, repo_root: Path | None = None) -> list[Path]:
+    config_paths = [Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "config.toml"]
+    if repo_root is not None:
+        config_paths.append(repo_root / ".codex" / "config.toml")
+    return config_paths
+
+
+def _load_mcp_server_config(config_path: Path, server_name: str) -> dict[object, object] | None:
+    if not config_path.exists():
+        return None
+
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+    servers = payload.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return None
+
+    server_config = servers.get(server_name)
+    return server_config if isinstance(server_config, dict) else None
+
+
+def _mcp_server_path_candidates(server_config: dict[object, object]) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    helper_dir = server_config.get("helper_dir")
+    if isinstance(helper_dir, str):
+        candidate = _existing_helper_root_from_hint(helper_dir)
+        if candidate is not None and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    values: list[str] = []
+
+    command = server_config.get("command")
+    if isinstance(command, str):
+        values.append(command)
+
+    args = server_config.get("args")
+    if isinstance(args, list):
+        values.extend(item for item in args if isinstance(item, str))
+
+    for value in values:
+        candidate = _existing_bridge_root_from_config_value(value)
+        if candidate is not None and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+
+    return candidates
+
+
+def _existing_helper_root_from_hint(value: str) -> Path | None:
+    if not value.startswith(("/", "~/")):
+        return None
+
+    path = Path(value).expanduser()
+    if not path.exists():
+        return None
+    resolved = path.resolve()
+    return resolved if resolved.is_dir() else resolved.parent
+
+
+def _existing_bridge_root_from_config_value(value: str) -> Path | None:
+    if not value.startswith(("/", "~/")):
+        return None
+
+    path = Path(value).expanduser()
+    if not path.exists():
+        return None
+
+    resolved = path.resolve()
+    if resolved.is_dir():
+        return resolved if (resolved / _GHIDRA_BRIDGE_SCRIPT).exists() else None
+    if resolved.name != _GHIDRA_BRIDGE_SCRIPT:
+        return None
+    return resolved.parent
 
 
 def create_run_artifacts(repo_root: Path, task_id: str | None = None) -> RunArtifacts:

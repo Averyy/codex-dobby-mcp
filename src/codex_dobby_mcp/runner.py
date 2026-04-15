@@ -73,6 +73,10 @@ _POST_TIMEOUT_IO_DRAIN_SECONDS = 1.0
 _CODEX_STALL_THRESHOLD_SECONDS = 180.0
 _CODEX_STALL_CHECK_INTERVAL_SECONDS = 15.0
 _POST_RUN_SNAPSHOT_MIN_BUDGET_SECONDS = 20.0
+_GLOBAL_CLAUDE_DIR = Path("~/.claude").expanduser()
+_GLOBAL_CODEX_DIR = Path("~/.codex").expanduser()
+_CONFIG_PATH_DELIMITERS = " \t\r\n\"',[](){}"
+_CONFIG_PATH_TRAILING_PUNCTUATION = ",.;:)]}>"
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,7 @@ class ReviewOrchestrationDiagnostics:
 class ChildRuntimeContext:
     private_root: Path
     codex_home: Path
+    claude_config_dir: Path
     home_config_path: Path
     env_overrides: dict[str, str]
 
@@ -636,7 +641,7 @@ class CodexRunner:
         advisory_read_only_roots: list[Path] = []
 
         if tool == ToolName.REVERSE_ENGINEER:
-            for root in reverse_engineer_default_writable_roots():
+            for root in reverse_engineer_default_writable_roots(repo_root=repo_root):
                 if root not in sandbox_roots:
                     sandbox_roots.append(root)
                 if root not in writable_roots:
@@ -1590,6 +1595,7 @@ def _prepare_child_runtime(
 ) -> ChildRuntimeContext:
     current_env = env or os.environ
     source_codex_home = Path(current_env.get("CODEX_HOME", "~/.codex")).expanduser()
+    source_claude_config = Path(current_env.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
     if source_codex_home.exists() and (
         not source_codex_home.is_dir() or not os.access(source_codex_home, os.R_OK | os.X_OK)
     ):
@@ -1605,22 +1611,31 @@ def _prepare_child_runtime(
         private_root = private_runtime_root(artifacts.run_dir.name)
         codex_home = _ensure_artifact_subdirectory(private_root / "codex-home", "child Codex home directory")
         _ensure_artifact_subdirectory(codex_home / "sessions", "child Codex sessions directory")
+        claude_config_dir = _ensure_artifact_subdirectory(private_root / "claude-config", "child Claude config directory")
         home_config_path = codex_home / "config.toml"
         _copy_codex_home_seed_file(
             source_codex_home / "auth.json",
             codex_home / "auth.json",
             subject="the parent Codex auth file",
         )
-        _copy_codex_home_seed_file(
+        _seed_child_codex_config(
             source_codex_home / "config.toml",
             home_config_path,
-            subject="the parent Codex config file",
+            source_codex_home=source_codex_home,
+            source_claude_config=source_claude_config,
+            codex_home=codex_home,
+            claude_config_dir=claude_config_dir,
         )
         return ChildRuntimeContext(
             private_root=private_root,
             codex_home=codex_home,
+            claude_config_dir=claude_config_dir,
             home_config_path=home_config_path,
-            env_overrides=_child_runtime_environment_overrides(artifacts, codex_home),
+            env_overrides=_child_runtime_environment_overrides(
+                artifacts,
+                codex_home=codex_home,
+                claude_config_dir=claude_config_dir,
+            ),
         )
     except RunnerError:
         if private_root is not None:
@@ -1656,6 +1671,159 @@ def _copy_codex_home_seed_file(source: Path, destination: Path, *, subject: str)
         ) from exc
 
 
+def _seed_child_codex_config(
+    source: Path,
+    destination: Path,
+    *,
+    source_codex_home: Path,
+    source_claude_config: Path,
+    codex_home: Path,
+    claude_config_dir: Path,
+) -> None:
+    if not source.exists():
+        return
+    if not source.is_file() or not os.access(source, os.R_OK):
+        raise RunnerError(
+            _codex_home_access_message(str(source), subject="the parent Codex config file", verb="cannot read")
+        )
+
+    try:
+        payload = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RunnerError(
+            _codex_home_access_message(str(source), subject="the parent Codex config file", verb="cannot read")
+        ) from exc
+
+    source_codex_home = _absolute_path(source_codex_home)
+    source_claude_config = _absolute_path(source_claude_config)
+
+    try:
+        _mirror_runtime_config_references(payload, source_root=source_codex_home, target_root=codex_home)
+        _mirror_runtime_config_references(payload, source_root=source_claude_config, target_root=claude_config_dir)
+    except OSError as exc:
+        failing_target = getattr(exc, "filename", None) or str(destination)
+        raise RunnerError(
+            _codex_home_access_message(
+                str(failing_target),
+                subject="the private runtime copy of the parent Codex config file",
+                verb="cannot write",
+            )
+        ) from exc
+
+    rewritten = payload.replace(str(source_codex_home), str(codex_home)).replace(
+        str(source_claude_config),
+        str(claude_config_dir),
+    )
+    if _same_path(source_codex_home, _GLOBAL_CODEX_DIR):
+        rewritten = rewritten.replace("~/.codex", str(codex_home))
+    if _same_path(source_claude_config, _GLOBAL_CLAUDE_DIR):
+        rewritten = rewritten.replace("~/.claude", str(claude_config_dir))
+
+    try:
+        destination.write_text(rewritten, encoding="utf-8")
+    except OSError as exc:
+        raise RunnerError(
+            _codex_home_access_message(
+                str(destination),
+                subject="the private runtime copy of the parent Codex config file",
+                verb="cannot write",
+            )
+        ) from exc
+
+
+def _mirror_runtime_config_references(payload: str, *, source_root: Path, target_root: Path) -> None:
+    if not source_root.exists():
+        return
+
+    tilde_prefix: str | None = None
+    if _same_path(source_root, _GLOBAL_CLAUDE_DIR):
+        tilde_prefix = "~/.claude"
+    elif _same_path(source_root, _GLOBAL_CODEX_DIR):
+        tilde_prefix = "~/.codex"
+
+    mirrored: set[Path] = set()
+    for reference in _iter_config_path_references(payload, source_root=source_root, tilde_prefix=tilde_prefix):
+        _mirror_runtime_path_reference(reference, source_root=source_root, target_root=target_root, mirrored=mirrored)
+
+
+def _iter_config_path_references(payload: str, *, source_root: Path, tilde_prefix: str | None) -> list[Path]:
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+    prefixes = [str(source_root)]
+    if tilde_prefix is not None:
+        prefixes.append(tilde_prefix)
+
+    for prefix in prefixes:
+        start = 0
+        while True:
+            idx = payload.find(prefix, start)
+            if idx == -1:
+                break
+            end = idx + len(prefix)
+            while end < len(payload) and payload[end] not in _CONFIG_PATH_DELIMITERS:
+                end += 1
+            raw = payload[idx:end].rstrip(_CONFIG_PATH_TRAILING_PUNCTUATION)
+            if raw:
+                if tilde_prefix is not None and raw.startswith(tilde_prefix):
+                    relative = raw.removeprefix(tilde_prefix).lstrip("/")
+                    resolved = _absolute_path(source_root / relative)
+                else:
+                    resolved = _absolute_path(Path(raw))
+                if resolved not in seen:
+                    seen.add(resolved)
+                    discovered.append(resolved)
+            start = idx + len(prefix)
+
+    return discovered
+
+
+def _mirror_runtime_path_reference(
+    reference: Path,
+    *,
+    source_root: Path,
+    target_root: Path,
+    mirrored: set[Path],
+) -> None:
+    try:
+        reference.relative_to(source_root)
+    except ValueError:
+        return
+    if not reference.exists():
+        return
+
+    if reference.is_dir():
+        source_item = reference
+        target_item = target_root / reference.relative_to(source_root)
+    elif reference.parent == source_root:
+        source_item = reference
+        target_item = target_root / reference.relative_to(source_root)
+    else:
+        source_item = reference.parent
+        target_item = target_root / source_item.relative_to(source_root)
+
+    if source_item in mirrored:
+        return
+    mirrored.add(source_item)
+
+    target_item.parent.mkdir(parents=True, exist_ok=True)
+    if source_item.is_dir():
+        shutil.copytree(source_item, target_item, dirs_exist_ok=True)
+    else:
+        shutil.copy2(source_item, target_item)
+
+
+def _absolute_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    return Path(os.path.abspath(os.fspath(expanded)))
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return _absolute_path(left) == _absolute_path(right)
+
+
 def _cleanup_private_child_runtime(path: Path, logger=None) -> None:  # type: ignore[no-untyped-def]
     try:
         shutil.rmtree(path)
@@ -1666,7 +1834,12 @@ def _cleanup_private_child_runtime(path: Path, logger=None) -> None:  # type: ig
             logger.warning("Failed to remove private child runtime %s: %s", path, exc)
 
 
-def _child_runtime_environment_overrides(artifacts: RunArtifacts, codex_home: Path) -> dict[str, str]:
+def _child_runtime_environment_overrides(
+    artifacts: RunArtifacts,
+    *,
+    codex_home: Path,
+    claude_config_dir: Path,
+) -> dict[str, str]:
     runtime_root = _ensure_artifact_subdirectory(artifacts.run_dir / "runtime", "child runtime directory")
     tmp_root = _ensure_artifact_subdirectory(runtime_root / "tmp", "child temp directory")
     cache_root = _ensure_artifact_subdirectory(runtime_root / "cache", "child cache directory")
@@ -1678,6 +1851,8 @@ def _child_runtime_environment_overrides(artifacts: RunArtifacts, codex_home: Pa
         "TMP": str(tmp_root),
         "TEMP": str(tmp_root),
         "CODEX_HOME": str(codex_home),
+        "CLAUDE_CONFIG_DIR": str(claude_config_dir),
+        "CLAUDE_CODE_DISABLE_CRON": "1",
         "UV_CACHE_DIR": str(uv_cache_root),
         "XDG_CACHE_HOME": str(xdg_cache_root),
         "PYTHONDONTWRITEBYTECODE": "1",
