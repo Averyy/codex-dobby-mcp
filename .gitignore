@@ -15,4 +15,6 @@ wheels/
 
 # Local scratch data
 .cache/
+.tmp-ghidra/
+notes/
 .notes/

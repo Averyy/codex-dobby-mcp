@@ -227,6 +227,58 @@ def test_runner_rejects_agents_for_non_review_tools(tmp_path: Path) -> None:
         )
 
 
+def test_runner_rejects_prompt_referencing_external_repo_without_repo_root(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    external_repo = tmp_path / "external"
+    external_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(external_repo)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    with pytest.raises(PathResolutionError, match="repo_root was not provided"):
+        runner._resolve(
+            ToolName.REVERSE_ENGINEER,
+            InvocationRequest(prompt=f"Investigate {external_repo}/src/main.rs"),
+        )
+
+
+def test_runner_allows_external_repo_when_repo_root_is_explicit(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    external_repo = tmp_path / "external"
+    external_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(external_repo)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    spec = runner._resolve(
+        ToolName.REVERSE_ENGINEER,
+        InvocationRequest(
+            prompt=f"Investigate {external_repo}/src/main.rs",
+            repo_root=str(external_repo),
+        ),
+    )
+
+    assert spec.repo_root == external_repo.resolve()
+
+
 def test_short_timeout_plan_uses_medium_reasoning_by_default(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

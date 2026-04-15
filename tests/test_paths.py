@@ -8,6 +8,7 @@ from codex_dobby_mcp.paths import (
     PathResolutionError,
     create_run_artifacts,
     private_runtime_root,
+    prompt_git_worktrees,
     resolve_extra_roots,
     resolve_repo_root,
     run_artifacts_for_task,
@@ -26,10 +27,12 @@ def test_resolve_repo_root_defaults_to_spawn_root(tmp_path: Path, monkeypatch: p
     init_git_repo(repo_root)
 
     def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        path = Path(args[0][2]).resolve()
+
         class Result:
-            returncode = 0
-            stdout = "true\n"
-            stderr = ""
+            returncode = 0 if path == repo_root.resolve() else 1
+            stdout = "true\n" if path == repo_root.resolve() else ""
+            stderr = "" if path == repo_root.resolve() else "fatal"
 
         return Result()
 
@@ -131,6 +134,34 @@ def test_resolve_extra_roots_rejects_relative_symlink_escape(tmp_path: Path) -> 
 
     with pytest.raises(PathResolutionError, match="resolves outside the base directory"):
         resolve_extra_roots(repo_root, ["external"])
+
+
+def test_prompt_git_worktrees_finds_repo_root_from_nested_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    init_git_repo(repo_root)
+    nested = repo_root / "src" / "module"
+    nested.mkdir(parents=True)
+    target_file = nested / "main.ts"
+    target_file.write_text("// test\n", encoding="utf-8")
+
+    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        path = Path(args[0][2]).resolve()
+
+        class Result:
+            returncode = 0 if path == repo_root.resolve() else 1
+            stdout = "true\n" if path == repo_root.resolve() else ""
+            stderr = "" if path == repo_root.resolve() else "fatal"
+
+        return Result()
+
+    monkeypatch.setattr("codex_dobby_mcp.paths.subprocess.run", fake_run)
+
+    prompt = f"Investigate `{target_file}:42` in detail."
+
+    assert prompt_git_worktrees(prompt) == [repo_root.resolve()]
 
 
 def test_write_json_replaces_existing_file_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -40,7 +40,9 @@ from codex_dobby_mcp.models import (
     WorkerResult,
 )
 from codex_dobby_mcp.paths import (
+    PathResolutionError,
     create_run_artifacts,
+    prompt_git_worktrees,
     private_runtime_root,
     public_file_label,
     resolve_extra_roots,
@@ -607,6 +609,22 @@ class CodexRunner:
 
         requested_timeout_seconds = request.timeout_seconds
         requested_review_agents = list(request.agents) if tool == ToolName.REVIEW else []
+        if request.repo_root is None:
+            hinted_repo_roots = [
+                repo
+                for repo in prompt_git_worktrees(
+                    "\n".join(part for part in (request.prompt, request.important_context or "") if part)
+                )
+                if repo != self.spawn_root
+            ]
+            if hinted_repo_roots:
+                hinted_roots_text = ", ".join(str(path) for path in hinted_repo_roots)
+                raise PathResolutionError(
+                    "Request references external git worktree(s) "
+                    f"{hinted_roots_text} but repo_root was not provided; "
+                    f"refusing to default to server cwd {self.spawn_root}. "
+                    "Pass repo_root explicitly or send repo metadata."
+                )
         repo_root = resolve_repo_root(self.spawn_root, request.repo_root)
         extra_roots = resolve_extra_roots(repo_root, request.extra_roots)
         gitignore_updated = False

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import uuid
@@ -12,6 +13,10 @@ from codex_dobby_mcp.models import CODEX_DOBBY_DIRNAME, RunArtifacts, ToolName
 
 class PathResolutionError(ValueError):
     pass
+
+
+_ABSOLUTE_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`()\[\]{}<>]+")
+_TRAILING_PATH_PUNCTUATION = ",.;:)]}>"
 
 
 def resolve_path(value: str, base_dir: Path) -> Path:
@@ -30,6 +35,29 @@ def resolve_repo_root(spawn_root: Path, explicit_root: str | None = None) -> Pat
     if not is_git_worktree(repo_root):
         raise PathResolutionError(f"Repo root is not inside a git worktree: {repo_root}")
     return repo_root
+
+
+def prompt_git_worktrees(text: str) -> list[Path]:
+    if not text.strip():
+        return []
+
+    discovered: list[Path] = []
+    seen: set[Path] = set()
+
+    for raw_token in _ABSOLUTE_PATH_TOKEN_RE.findall(text):
+        normalized = _normalize_prompt_path_token(raw_token)
+        if normalized is None:
+            continue
+        for candidate in _candidate_git_worktrees(Path(normalized).expanduser()):
+            if not is_git_worktree(candidate):
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            discovered.append(candidate)
+            break
+
+    return discovered
 
 
 def resolve_extra_roots(spawn_root: Path, extra_roots: list[str]) -> list[Path]:
@@ -53,6 +81,29 @@ def resolve_extra_roots(spawn_root: Path, extra_roots: list[str]) -> list[Path]:
         if path not in resolved:
             resolved.append(path)
     return resolved
+
+
+def _normalize_prompt_path_token(raw_token: str) -> str | None:
+    token = raw_token.rstrip(_TRAILING_PATH_PUNCTUATION)
+    line_match = re.match(r"^(?P<path>.+?):\d+$", token)
+    if line_match:
+        token = line_match.group("path")
+    return token or None
+
+
+def _candidate_git_worktrees(path: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for candidate in (path, *path.parents):
+        if not candidate.exists():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir():
+            continue
+        candidates.append(resolved)
+    return candidates
 
 
 def reverse_engineer_default_writable_roots() -> list[Path]:
