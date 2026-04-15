@@ -47,7 +47,11 @@ uv sync
 uv run codex-dobby-mcp
 ```
 
-Target repo is resolved in this order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repoRoot`, `workingDirectory`, `cwd`) → server cwd. If your client sends working-directory metadata, that is enough. Otherwise wrap the launch with `cd`:
+Target repo is resolved in this order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repoRoot`, `workingDirectory`, `cwd`) → server cwd. If your client sends working-directory metadata, that is enough. Otherwise wrap the launch with `cd`.
+
+Safety guard: if `repo_root` is omitted and the prompt clearly references an absolute path inside a different git worktree, Dobby now fails fast instead of silently defaulting to the server cwd. The caller should retry with explicit `repo_root` or correct working-directory metadata.
+
+Example launch:
 
 ```json
 {
