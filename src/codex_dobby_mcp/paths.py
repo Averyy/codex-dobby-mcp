@@ -159,6 +159,16 @@ def _candidate_git_worktrees(path: Path) -> list[Path]:
     return candidates
 
 
+def mcp_server_is_enabled(server_name: str, *, repo_root: Path | None = None) -> bool:
+    config = _merged_mcp_server_config(server_name, repo_root=repo_root)
+    if config is None:
+        return False
+    enabled = config.get("enabled")
+    if isinstance(enabled, bool):
+        return enabled
+    return True
+
+
 def reverse_engineer_default_writable_roots(repo_root: Path | None = None) -> list[Path]:
     roots: list[Path] = []
     seen: set[Path] = set()
@@ -235,6 +245,16 @@ def _mcp_server_configs(server_name: str, *, repo_root: Path | None = None) -> l
         if server_config is not None:
             configs.append(server_config)
     return configs
+
+
+def _merged_mcp_server_config(server_name: str, *, repo_root: Path | None = None) -> dict[object, object] | None:
+    merged: dict[object, object] | None = None
+    for config_path in _codex_config_paths(repo_root=repo_root):
+        server_config = _load_mcp_server_config(config_path, server_name)
+        if server_config is None:
+            continue
+        merged = dict(server_config) if merged is None else {**merged, **server_config}
+    return merged
 
 
 def _codex_config_paths(*, repo_root: Path | None = None) -> list[Path]:

@@ -50,6 +50,12 @@ def test_prompt_loader_expands_includes_and_renders_context() -> None:
     assert "/extra" in rendered
     assert "Danger mode: `true`" not in rendered
     assert "Danger mode: true" in rendered
+    assert "startup and inspection calls in this workflow are explicitly allowed" in rendered
+    assert "do not count as forbidden edits or note-writing" in rendered
+    assert "Do not detour into helper-repo source inspection" in rendered
+    assert "Do not broaden scope just to prove extra bridge internals" in rendered
+    assert "prefer the mounted `bridge_mcp_ghidra.py` helper as a fallback" in rendered
+    assert "immediately run the mounted helper against the connected bridge" in rendered
 
 
 def test_review_prompt_renders_selected_agents() -> None:
@@ -229,7 +235,11 @@ def test_research_and_brainstorm_prompts_include_external_research_rules() -> No
     assert "fetchaller" in research
     assert "Sandbox-accessible roots:" in research
     assert "Writable roots:\n(none)" in research
-    assert "Requested extra roots are hints only here." in research
+    assert "Optional MCP integrations visible to this run:" in research
+    assert "- fetchaller: no" in research
+    assert "- ghidra: no" in research
+    assert "Requested extra roots are read-only context only here." in research
+    assert "Trust the sandbox-accessible roots and advisory read-only roots lists above" in research
     assert "In read-only roles, prefer static inspection" in research
     assert "Hard timeout budget: 600 seconds" in research
     assert "Leave enough time to emit the final JSON before the hard timeout" in research

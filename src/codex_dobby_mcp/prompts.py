@@ -30,6 +30,9 @@ class PromptLoader:
         advisory_read_only_roots: list[Path],
         model: str,
         reasoning_effort: str,
+        *,
+        fetchaller_available: bool = False,
+        ghidra_available: bool = False,
     ) -> str:
         tool_prompt = self.load(f"{tool.value}.md").strip()
         if tool == ToolName.REVIEW:
@@ -95,10 +98,12 @@ class PromptLoader:
             task_prompt=request.prompt.strip(),
             extra_roots=self._format_list(request.extra_roots),
             extra_root_access_note=(
-                "Requested extra roots are hints only here. In read-only mode, Codex usually only sees the working root unless a requested path is already inside it."
+                "Requested extra roots are read-only context only here. Trust the sandbox-accessible roots and advisory read-only roots lists above for what is actually mounted."
                 if tool in READ_ONLY_TOOLS
                 else "Requested extra roots listed above are writable only when also present in the writable roots section."
             ),
+            fetchaller_available="yes" if fetchaller_available else "no",
+            ghidra_available="yes" if ghidra_available else "no",
             danger_mode="true" if request.danger else "false",
             timeout_seconds=request.timeout_seconds,
             read_only_short_timeout_mode="yes" if read_only_budget["short_timeout_mode"] else "no",

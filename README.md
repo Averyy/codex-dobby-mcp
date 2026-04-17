@@ -1,10 +1,8 @@
-# codex-dobby-mcp
+# Codex Dobby MCP
 
-`codex-dobby-mcp` is a local stdio MCP server that turns high-level MCP requests into scoped `codex exec` runs with structured results, persistent artifacts, and guardrails around filesystem access, review fan-out, and reverse-engineering workflows.
+A local stdio MCP server that lets Claude delegate scoped work to Codex with structured results, persistent artifacts, and guardrails around filesystem access, review fan-out, and reverse-engineering workflows.
 
-It gives Claude a sharper tool surface than a raw shell handoff: planning stays read-only, builds stay scoped, reviews can require specialist subagents, and every run leaves behind inspectable logs and outputs.
-
-This README is the source of truth for repo behavior, defaults, and safety rules.
+It gives Claude a sharper tool surface than a raw shell handoff: planning stays read-only, builds stay scoped, reviews can require specialist subagents, and every run leaves behind inspectable logs and outputs. It's especially useful for long-running analysis, Ghidra sessions, and deeper code review passes.
 
 ## Tools
 
@@ -35,23 +33,55 @@ Some tools work best (or only work) when specific MCP servers are available in t
 - **`research` and `brainstorm`**: [fetchaller-mcp](https://github.com/Averyy/fetchaller-mcp) MCP server for web search, URL fetching, and Reddit browsing. Without it, these tools fall back to codebase-only analysis.
 - **`reverse_engineer`**: [ghidra-mcp](https://github.com/bethington/ghidra-mcp) bridge for binary analysis via Ghidra. Without it, reverse engineering is limited to whatever other tools are available in the sandbox.
 
+Dobby auto-detects these integrations from the active Codex MCP config. If an integration is not installed or not configured for the run, Dobby does not try to use it: the worker prompt explicitly tells Codex not to call it and to continue with the best non-integration path available.
+
 ## Install
+
+Recommended local tool install:
+
+```bash
+uv tool install .
+codex-dobby-mcp
+```
+
+One-off local execution without installing:
+
+```bash
+uvx --from . codex-dobby-mcp
+```
+
+When this package is published to PyPI, replace `.` with `codex-dobby-mcp`.
+
+Development checkout:
 
 ```bash
 uv sync
 ```
 
-## Run
+## Run From Source Checkout
 
 ```bash
 uv run codex-dobby-mcp
 ```
 
-Target repo is resolved in this order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repoRoot`, `workingDirectory`, `cwd`) → server cwd. If your client sends working-directory metadata, that is enough. Otherwise wrap the launch with `cd`.
+Target repo is resolved in this order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repo_root`, `repoRoot`, `working_directory`, `workingDirectory`, `cwd`) → server cwd. If your client sends working-directory metadata, that is enough. Otherwise wrap the launch with `cd`.
 
-Safety guard: if `repo_root` is omitted and the prompt clearly references an absolute path inside a different git worktree, Dobby now fails fast instead of silently defaulting to the server cwd. The caller should retry with explicit `repo_root` or correct working-directory metadata.
+Safety guard: if `repo_root` is omitted and the prompt clearly references an absolute path inside a different git worktree, Dobby fails fast instead of silently defaulting to the server cwd. It also refuses to guess when the request only names relative files that do not exist under the server cwd. The caller should retry with explicit `repo_root` or correct working-directory metadata.
 
-Example launch:
+Example launch with an installed tool:
+
+```json
+{
+  "mcpServers": {
+    "codex-dobby": {
+      "command": "sh",
+      "args": ["-lc", "cd /ABSOLUTE/PATH/TO/TARGET-REPO && codex-dobby-mcp"]
+    }
+  }
+}
+```
+
+Example launch from a source checkout:
 
 ```json
 {
@@ -95,17 +125,17 @@ For clients with a hard `tools/call` timeout around 120 seconds, prefer `start_r
 
 ## Defaults
 
-Default model `gpt-5.4`. Minimum timeout 300s.
+Default model is `gpt-5.4`, except `review`: single-agent review defaults to `gpt-5.4-mini`, while multi-agent review keeps a `gpt-5.4` parent and injects `gpt-5.4-mini` review subagents. Any explicit `timeout_seconds` must be at least 300s.
 
 | Tool | Timeout | Reasoning | Sandbox |
 | --- | --- | --- | --- |
 | `plan` | 600s | high | read-only |
 | `research` | 1200s | medium | read-only |
 | `brainstorm` | 600s | high | read-only |
-| `review` | 600s (1200s multi) | high | read-only |
-| `validate` | 600s | medium | `--full-auto` |
-| `build` | 1200s | high | `--full-auto` |
-| `reverse_engineer` | 1800s | high | `--full-auto` |
+| `review` | 600s default, 1200s recommended for multi-agent | medium | read-only |
+| `validate` | 600s | medium | workspace-write via `--full-auto` |
+| `build` | 1200s | high | workspace-write via `--full-auto` |
+| `reverse_engineer` | 1800s | high | workspace-write via `--full-auto` |
 
 `build` and `reverse_engineer` switch to `danger-full-access` when `danger=true`.
 
@@ -113,19 +143,20 @@ Default model `gpt-5.4`. Minimum timeout 300s.
 
 ## Behavior
 
-- Child Codex runs inherit the parent's environment, but Dobby now seeds a private per-run `CODEX_HOME` under `${TMPDIR}/codex-dobby/<task-id>/codex-home` instead of pointing children at the user's global Codex home directly.
-- `research` prefers codebase evidence and uses fetchaller MCP tools when available.
-- `validate` runs with `--full-auto` to compile and run tests; it is instructed not to edit sources or commit.
-- `review` uses a direct single-lens path for one agent, or multi-agent orchestration (via `spawn_agent` over `codex exec --json`) for multiple. Review subagents default to `gpt-5.4-mini` at `medium` reasoning.
-- `reverse_engineer` includes a Ghidra MCP workflow and adds the configured Ghidra MCP helper repo as a writable helper root when Dobby can discover it from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`). When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run.
+- Child Codex runs inherit the parent's environment, but Dobby seeds a private per-run `CODEX_HOME` under the system temp directory (`.../codex-dobby/<task-id>/codex-home`) instead of pointing children at the user's global Codex home directly.
+- `research` prefers codebase evidence and uses fetchaller MCP tools when available. If fetchaller is not installed or not configured for the run, the worker is told not to call it and to continue without web MCP support.
+- `validate` runs in workspace-write `--full-auto` because validation often needs temp or cache writes; the worker prompt still forbids source edits and commits.
+- `review` uses a direct single-lens path for one agent, or multi-agent orchestration (via `spawn_agent` over `codex exec --json`) for multiple. Single-agent review defaults to `gpt-5.4-mini` at `medium` reasoning. Multi-agent review uses a `gpt-5.4` parent at `medium` reasoning and injects `gpt-5.4-mini` reviewer subagents, also at `medium` by default.
+- `reverse_engineer` includes a Ghidra MCP workflow only when Ghidra is installed and configured for the run. When Dobby can discover Ghidra from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`), it adds the configured Ghidra MCP helper repo as a writable helper root. When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run. If Ghidra is not installed or not configured, the worker is told not to call `mcp__ghidra__*`.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.
 - Result artifacts are replaced atomically, so `get_run` sees either the startup placeholder or the final persisted response instead of a partially written `result.json`.
 - Blocking tools like `review` and `research` still behave exactly as before. If a caller insists on waiting synchronously, that caller can still hit its own outer MCP timeout.
 
 ## Filesystem and Safety
 
-- Read-only tools: only the repo root is sandbox-visible; `extra_roots` are prompt hints.
-- Mutating tools: `extra_roots` are mounted writable via `--add-dir`.
+- Read-only tools run in Codex `read-only`. Dobby still mounts the per-run artifact directory plus any in-repo `extra_roots`; `extra_roots` outside the repo are exposed as additional read-only roots, not writable roots.
+- Mutating tools run in workspace-write and mount `extra_roots` writable via `--add-dir`.
+- Mutating tools also ensure `.codex-dobby/` is present in `.gitignore`. Unsafe `.gitignore` targets, such as symlinks or multiply-linked files, fail closed.
 - Child Codex runs no longer need write access to the parent `~/.codex/sessions`. Dobby seeds the child home from `CODEX_HOME/auth.json` and `CODEX_HOME/config.toml` when those files exist, mirrors referenced helper files from `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into a private runtime, then points the child at that private temp home. The server process therefore needs read access to the parent Codex and Claude config files plus read/write access to the temp runtime directory.
 - `CODEX_DOBBY_ACTIVE=1` is set on child runs and Dobby refuses to run if already set. Inherited `codex-dobby-mcp` entries are disabled so workers can't call back.
 - Commits are forbidden. A mutating worker that creates or moves a commit returns `status: "error"`.
@@ -135,13 +166,13 @@ Default model `gpt-5.4`. Minimum timeout 300s.
 
 Each run writes to `<target-root>/.codex-dobby/runs/<task-id>/`: `request.json`, `prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `result.json`, `output-schema.json`. Multi-agent `review` logs are JSONL. Treat `.codex-dobby/` as unredacted local logs.
 
-Worker-facing tools (`plan`, `research`, `brainstorm`, `build`, `validate`, `review`, `reverse_engineer`) return `task_id`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed` (this run only), `artifact_paths`, `sandbox_violations`, `warnings`, `model`, `reasoning_effort`, and `result_state`. `review` responses also include `review_details`, where `requested_review_agents` is the raw caller-supplied list and `effective_review_agents` is the normalized/defaulted list Dobby actually used.
+Worker-facing tools (`plan`, `research`, `brainstorm`, `build`, `validate`, `review`, `reverse_engineer`) return `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed` (this run only), `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, and `result_state`. `review` responses also include `review_details`, where `requested_review_agents` is the raw caller-supplied list and `effective_review_agents` is the normalized/defaulted list Dobby actually used.
 
 Async control tools return different structured payloads:
 
-- `start_run` returns an `AsyncRunHandle` with `task_id`, `state`, `summary`, `artifact_paths`, `model`, `reasoning_effort`
-- `get_run` returns a `RunLookupResponse` with `state`, optional `result_state`, optional final `result`, and artifact metadata
-- `list_runs` returns recent run summaries for a repo
+- `start_run` returns an `AsyncRunHandle` with `task_id`, `tool`, `state`, `summary`, `repo_root`, `artifact_paths`, `model`, and `reasoning_effort`
+- `get_run` returns a `RunLookupResponse` with `task_id`, `state`, `summary`, `repo_root`, optional `tool`, optional `status`, optional `result_state`, optional final `result`, artifact metadata, and warnings
+- `list_runs` returns the resolved `repo_root` plus recent run summaries for that repo
 
 ## Async Runs
 
@@ -186,6 +217,7 @@ Important limitation: live background tracking is in-process. If the server rest
 
 ```bash
 uv run pytest
+uv build --offline --no-build-isolation
 uv run mcp dev src/codex_dobby_mcp/server.py:app
 uv run python -m codex_dobby_mcp
 ```

@@ -42,6 +42,7 @@ from codex_dobby_mcp.models import (
 from codex_dobby_mcp.paths import (
     PathResolutionError,
     create_run_artifacts,
+    mcp_server_is_enabled,
     prompt_git_worktrees,
     prompt_referenced_relative_paths,
     private_runtime_root,
@@ -274,6 +275,8 @@ class CodexRunner:
             advisory_read_only_roots=spec.advisory_read_only_roots,
             model=spec.model,
             reasoning_effort=spec.reasoning_effort.value,
+            fetchaller_available=spec.fetchaller_available,
+            ghidra_available=spec.ghidra_available,
         )
         spec.artifacts.prompt_txt.write_text(prompt_text, encoding="utf-8")
         spec.artifacts.output_schema_json.write_text(self.worker_schema_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -668,6 +671,8 @@ class CodexRunner:
         sandbox_roots = [repo_root]
         writable_roots = [repo_root]
         advisory_read_only_roots: list[Path] = []
+        fetchaller_available = mcp_server_is_enabled("fetchaller", repo_root=repo_root)
+        ghidra_available = mcp_server_is_enabled("ghidra", repo_root=repo_root)
 
         if tool == ToolName.REVERSE_ENGINEER:
             for root in reverse_engineer_default_writable_roots(repo_root=repo_root):
@@ -717,6 +722,8 @@ class CodexRunner:
             sandbox_roots=sandbox_roots,
             writable_roots=writable_roots,
             advisory_read_only_roots=advisory_read_only_roots,
+            fetchaller_available=fetchaller_available,
+            ghidra_available=ghidra_available,
             artifacts=artifacts,
             gitignore_updated=gitignore_updated,
         )
@@ -739,6 +746,8 @@ class CodexRunner:
                 "sandbox_roots": [str(path) for path in spec.sandbox_roots],
                 "writable_roots": [str(path) for path in spec.writable_roots],
                 "advisory_read_only_roots": [str(path) for path in spec.advisory_read_only_roots],
+                "fetchaller_available": spec.fetchaller_available,
+                "ghidra_available": spec.ghidra_available,
             },
         }
         write_json(spec.artifacts.request_json, payload)

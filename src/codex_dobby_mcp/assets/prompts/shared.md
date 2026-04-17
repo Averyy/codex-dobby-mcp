@@ -27,6 +27,9 @@ Execution contract:
 - Extra root hints from Claude:
 {extra_roots}
 - Extra root access note: {extra_root_access_note}
+- Optional MCP integrations visible to this run:
+  - fetchaller: {fetchaller_available}
+  - ghidra: {ghidra_available}
 - Model override in effect: {model}
 - Reasoning effort in effect: {reasoning_effort}
 - Hard timeout budget: {timeout_seconds} seconds

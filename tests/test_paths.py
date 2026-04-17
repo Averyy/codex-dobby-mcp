@@ -7,6 +7,7 @@ import pytest
 from codex_dobby_mcp.paths import (
     PathResolutionError,
     create_run_artifacts,
+    mcp_server_is_enabled,
     private_runtime_root,
     prompt_git_worktrees,
     prompt_referenced_relative_paths,
@@ -191,6 +192,41 @@ def test_prompt_referenced_relative_paths_strips_line_suffix_and_punctuation() -
 
 def test_prompt_referenced_relative_paths_ignores_prose_without_extensions() -> None:
     assert prompt_referenced_relative_paths("look at the foo/bar system") == []
+
+
+def test_mcp_server_is_enabled_reads_home_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.fetchaller]\ncommand = "python"\nargs = ["-m", "fetchaller.main"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert mcp_server_is_enabled("fetchaller") is True
+    assert mcp_server_is_enabled("ghidra") is False
+
+
+def test_mcp_server_is_enabled_honors_repo_override_disable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.fetchaller]\ncommand = "python"\nargs = ["-m", "fetchaller.main"]\n',
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".codex").mkdir()
+    ((repo_root / ".codex") / "config.toml").write_text(
+        '[mcp_servers.fetchaller]\nenabled = false\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert mcp_server_is_enabled("fetchaller", repo_root=repo_root) is False
 
 
 def test_write_json_replaces_existing_file_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

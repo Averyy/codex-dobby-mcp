@@ -269,6 +269,8 @@ class ResolvedInvocation(BaseModel):
     sandbox_roots: list[Path] = Field(default_factory=list)
     writable_roots: list[Path] = Field(default_factory=list)
     advisory_read_only_roots: list[Path] = Field(default_factory=list)
+    fetchaller_available: bool = False
+    ghidra_available: bool = False
     artifacts: RunArtifacts
     gitignore_updated: bool = False
 

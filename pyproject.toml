@@ -3,15 +3,33 @@ name = "codex-dobby-mcp"
 version = "0.1.0"
 description = "Local stdio MCP delegation server that routes Claude-orchestrated tasks through codex exec"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Avery Levitt", email = "avery23@gmail.com" }
+]
+keywords = ["mcp", "codex", "claude", "automation", "developer-tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.27.0",
     "pydantic>=2.12.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Averyy/codex-dobby-mcp"
+Repository = "https://github.com/Averyy/codex-dobby-mcp"
+Issues = "https://github.com/Averyy/codex-dobby-mcp/issues"
 
 [project.scripts]
 codex-dobby-mcp = "codex_dobby_mcp.server:main"
