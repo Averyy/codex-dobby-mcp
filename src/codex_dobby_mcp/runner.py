@@ -43,6 +43,7 @@ from codex_dobby_mcp.paths import (
     PathResolutionError,
     create_run_artifacts,
     prompt_git_worktrees,
+    prompt_referenced_relative_paths,
     private_runtime_root,
     public_file_label,
     resolve_extra_roots,
@@ -615,11 +616,12 @@ class CodexRunner:
         requested_timeout_seconds = request.timeout_seconds
         requested_review_agents = list(request.agents) if tool == ToolName.REVIEW else []
         if request.repo_root is None:
+            prompt_text = "\n".join(
+                part for part in (request.prompt, request.important_context or "") if part
+            )
             hinted_repo_roots = [
                 repo
-                for repo in prompt_git_worktrees(
-                    "\n".join(part for part in (request.prompt, request.important_context or "") if part)
-                )
+                for repo in prompt_git_worktrees(prompt_text)
                 if repo != self.spawn_root
             ]
             if hinted_repo_roots:
@@ -630,6 +632,33 @@ class CodexRunner:
                     f"refusing to default to server cwd {self.spawn_root}. "
                     "Pass repo_root explicitly or send repo metadata."
                 )
+
+            relative_candidates: list[str] = []
+            seen_relative: set[str] = set()
+            for candidate in list(request.files) + prompt_referenced_relative_paths(prompt_text):
+                token = candidate.strip()
+                if not token or token.startswith("/") or token.startswith("~"):
+                    continue
+                if token in seen_relative:
+                    continue
+                seen_relative.add(token)
+                relative_candidates.append(token)
+            if relative_candidates:
+                missing = [
+                    token
+                    for token in relative_candidates
+                    if not (self.spawn_root / token).exists()
+                ]
+                if missing and len(missing) == len(relative_candidates):
+                    missing_text = ", ".join(missing[:5])
+                    suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+                    raise PathResolutionError(
+                        "Request references relative file(s) "
+                        f"{missing_text}{suffix} that do not exist under server cwd "
+                        f"{self.spawn_root} and repo_root was not provided; "
+                        "refusing to default to the wrong repo. "
+                        "Pass repo_root explicitly or send repo metadata."
+                    )
         repo_root = resolve_repo_root(self.spawn_root, request.repo_root)
         extra_roots = resolve_extra_roots(repo_root, request.extra_roots)
         gitignore_updated = False

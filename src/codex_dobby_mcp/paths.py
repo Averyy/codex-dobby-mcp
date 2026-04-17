@@ -18,6 +18,9 @@ class PathResolutionError(ValueError):
 
 _ABSOLUTE_PATH_TOKEN_RE = re.compile(r"/[^\s'\"`()\[\]{}<>]+")
 _TRAILING_PATH_PUNCTUATION = ",.;:)]}>"
+_BACKTICK_TOKEN_RE = re.compile(r"`([^`\n]+)`")
+_BARE_RELATIVE_PATH_TOKEN_RE = re.compile(r"(?<![/\w.-])([\w.-]+(?:/[\w.-]+)+)")
+_FILENAME_EXT_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,6}$")
 _MACOS_GHIDRA_SOCKET_SCAN_ROOTS = (Path("/var/folders"), Path("/private/var/folders"))
 _MACOS_GHIDRA_SOCKET_SCAN_PATTERNS = ("*/*/T/ghidra-mcp-{user}", "*/*/*/T/ghidra-mcp-{user}")
 _GHIDRA_BRIDGE_SCRIPT = "bridge_mcp_ghidra.py"
@@ -62,6 +65,52 @@ def prompt_git_worktrees(text: str) -> list[Path]:
             break
 
     return discovered
+
+
+def prompt_referenced_relative_paths(text: str) -> list[str]:
+    """Extract relative file-path tokens referenced in prompt text.
+
+    Returns tokens that look like relative file paths (contain `/`, end in a
+    file-extension suffix, and do not start with `/` or `~`). Matches:
+      - backtick-quoted tokens: `native/mic-capture/src/win_capture.cpp`
+      - bare path tokens with at least one `/` and a file extension
+
+    Used to detect when a prompt references files that should resolve inside a
+    specific repo, so the runner can refuse to default to an unrelated cwd.
+    """
+    if not text.strip():
+        return []
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _accept(raw: str) -> None:
+        token = raw.strip()
+        if not token:
+            return
+        token = token.rstrip(_TRAILING_PATH_PUNCTUATION)
+        line_match = re.match(r"^(?P<path>.+?):\d+$", token)
+        if line_match:
+            token = line_match.group("path")
+        if not token or token.startswith("/") or token.startswith("~"):
+            return
+        if "/" not in token:
+            return
+        if any(ch.isspace() for ch in token):
+            return
+        if not _FILENAME_EXT_RE.search(token):
+            return
+        if token in seen:
+            return
+        seen.add(token)
+        tokens.append(token)
+
+    for match in _BACKTICK_TOKEN_RE.finditer(text):
+        _accept(match.group(1))
+    for match in _BARE_RELATIVE_PATH_TOKEN_RE.finditer(text):
+        _accept(match.group(1))
+
+    return tokens
 
 
 def resolve_extra_roots(spawn_root: Path, extra_roots: list[str]) -> list[Path]:

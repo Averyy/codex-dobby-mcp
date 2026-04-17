@@ -9,6 +9,7 @@ from codex_dobby_mcp.paths import (
     create_run_artifacts,
     private_runtime_root,
     prompt_git_worktrees,
+    prompt_referenced_relative_paths,
     resolve_extra_roots,
     resolve_repo_root,
     run_artifacts_for_task,
@@ -162,6 +163,34 @@ def test_prompt_git_worktrees_finds_repo_root_from_nested_path(
     prompt = f"Investigate `{target_file}:42` in detail."
 
     assert prompt_git_worktrees(prompt) == [repo_root.resolve()]
+
+
+def test_prompt_referenced_relative_paths_extracts_backtick_and_bare_tokens() -> None:
+    prompt = (
+        "Review `native/mic-capture/src/win_capture.cpp` and also "
+        "src/main/mic-capture/service.ts — ignore README.md and /abs/path/foo.ts."
+    )
+
+    tokens = prompt_referenced_relative_paths(prompt)
+
+    assert "native/mic-capture/src/win_capture.cpp" in tokens
+    assert "src/main/mic-capture/service.ts" in tokens
+    assert all(not token.startswith("/") for token in tokens)
+    assert "README.md" not in tokens  # no slash
+    assert "/abs/path/foo.ts" not in tokens  # absolute
+
+
+def test_prompt_referenced_relative_paths_strips_line_suffix_and_punctuation() -> None:
+    tokens = prompt_referenced_relative_paths(
+        "See `src/foo/bar.ts:42`, also check src/foo/baz.ts."
+    )
+
+    assert "src/foo/bar.ts" in tokens
+    assert "src/foo/baz.ts" in tokens
+
+
+def test_prompt_referenced_relative_paths_ignores_prose_without_extensions() -> None:
+    assert prompt_referenced_relative_paths("look at the foo/bar system") == []
 
 
 def test_write_json_replaces_existing_file_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

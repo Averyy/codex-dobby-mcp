@@ -137,6 +137,7 @@ def test_single_agent_review_uses_direct_review_defaults(tmp_path: Path) -> None
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -160,6 +161,7 @@ def test_multi_agent_review_uses_medium_parent_reasoning_by_default(tmp_path: Pa
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -183,6 +185,7 @@ def test_multi_agent_review_passes_timeout_and_agents_through_uncapped(tmp_path:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -211,6 +214,7 @@ def test_runner_rejects_agents_for_non_review_tools(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -232,6 +236,7 @@ def test_runner_rejects_prompt_referencing_external_repo_without_repo_root(tmp_p
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     external_repo = tmp_path / "external"
     external_repo.mkdir()
     subprocess.run(["git", "init", "-q", str(external_repo)], check=True)
@@ -252,10 +257,89 @@ def test_runner_rejects_prompt_referencing_external_repo_without_repo_root(tmp_p
         )
 
 
+def test_runner_rejects_relative_files_missing_from_spawn_root(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    with pytest.raises(PathResolutionError, match="do not exist under server cwd"):
+        runner._resolve(
+            ToolName.REVIEW,
+            _request(
+                prompt=(
+                    "Review `native/mic-capture/src/win_capture.cpp` and "
+                    "`src/main/mic-capture/service.ts`."
+                ),
+            ),
+        )
+
+
+def test_runner_rejects_relative_files_param_missing_from_spawn_root(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    with pytest.raises(PathResolutionError, match="do not exist under server cwd"):
+        runner._resolve(
+            ToolName.REVIEW,
+            _request(
+                prompt="Review the windows capture work.",
+                files=["native/mic-capture/src/win_capture.cpp"],
+            ),
+        )
+
+
+def test_runner_accepts_relative_files_present_in_spawn_root(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+    target = repo_root / "src" / "app.ts"
+    target.parent.mkdir(parents=True)
+    target.write_text("// present\n", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    spec = runner._resolve(
+        ToolName.REVIEW,
+        _request(prompt="Review `src/app.ts`."),
+    )
+
+    assert spec.repo_root == repo_root.resolve()
+
+
 def test_runner_allows_external_repo_when_repo_root_is_explicit(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     external_repo = tmp_path / "external"
     external_repo.mkdir()
     subprocess.run(["git", "init", "-q", str(external_repo)], check=True)
@@ -284,6 +368,7 @@ def test_short_timeout_plan_uses_medium_reasoning_by_default(tmp_path: Path) -> 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -307,6 +392,7 @@ def test_persist_request_keeps_requested_timeout_and_records_effective_timeout(t
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -338,6 +424,7 @@ def test_persist_request_preserves_requested_review_agents_before_normalization(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -371,6 +458,7 @@ async def test_multi_agent_review_uses_effective_timeout_for_process_budget(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -446,6 +534,7 @@ async def test_multi_agent_review_passes_all_requested_agents_through(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -523,6 +612,7 @@ async def test_multi_agent_review_run_renders_prompt_with_effective_timeout_budg
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -596,6 +686,7 @@ async def test_runner_cancellation_terminates_spawned_process(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -809,6 +900,7 @@ async def test_runner_preflights_unreadable_parent_codex_auth_before_spawning(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     blocked_home = tmp_path / "blocked-codex-home"
     (blocked_home / "sessions").mkdir(parents=True)
@@ -912,6 +1004,7 @@ def test_metadata_snapshot_detects_changes_to_existing_dirty_file(tmp_path: Path
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     dirty_file = repo_root / "dirty.txt"
     dirty_file.write_text("one", encoding="utf-8")
 
@@ -1739,6 +1832,7 @@ async def test_runner_writes_result_json_stub_on_cancellation(tmp_path: Path) ->
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -1780,6 +1874,7 @@ async def test_runner_returns_structured_error_when_worker_output_is_invalid(tmp
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -1823,6 +1918,7 @@ async def test_review_response_includes_review_details(tmp_path: Path, monkeypat
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -1877,6 +1973,7 @@ async def test_read_only_run_ignores_model_reported_file_changes_without_observe
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -1932,6 +2029,7 @@ async def test_read_only_run_flags_new_dirty_paths(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -1989,6 +2087,7 @@ async def test_runner_inherits_parent_environment_for_child_codex_process(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2081,6 +2180,7 @@ async def test_runner_surfaces_sandbox_violations_from_process_output(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2133,6 +2233,7 @@ async def test_runner_missing_parent_codex_auth_still_spawns_when_env_based_auth
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     parent_codex_home = tmp_path / "codex-home"
     (parent_codex_home / "sessions").mkdir(parents=True, exist_ok=True)
@@ -2190,6 +2291,7 @@ async def test_runner_promotes_codex_home_permission_failures_to_summary(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2246,6 +2348,7 @@ async def test_mutating_run_returns_error_if_git_head_changes(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2302,6 +2405,7 @@ async def test_mutating_run_reports_only_files_changed_by_this_run(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo_root), "config", "user.email", "smoke@example.com"], check=True)
     subprocess.run(["git", "-C", str(repo_root), "config", "user.name", "Smoke"], check=True)
     (repo_root / "already_dirty.txt").write_text("base\n", encoding="utf-8")
@@ -2368,6 +2472,7 @@ async def test_mutating_run_preserves_reported_changes_outside_repo(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     extra_root = tmp_path / "shared-data"
     extra_root.mkdir()
 
@@ -2428,6 +2533,7 @@ async def test_review_without_dirty_files_or_named_targets_defaults_to_full_repo
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo_root), "config", "user.email", "smoke@example.com"], check=True)
     subprocess.run(["git", "-C", str(repo_root), "config", "user.name", "Smoke"], check=True)
     (repo_root / "tracked.txt").write_text("clean\n", encoding="utf-8")
@@ -2504,6 +2610,7 @@ async def test_runner_returns_structured_timeout_when_baseline_snapshot_exceeds_
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2534,6 +2641,7 @@ async def test_review_run_salvages_completed_subagent_result_after_parent_timeou
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2722,6 +2830,7 @@ async def test_review_run_returns_partial_success_when_timeout_salvage_is_incomp
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -2887,6 +2996,7 @@ async def test_review_run_keeps_partial_parent_result_when_only_wait_coverage_is
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3048,6 +3158,7 @@ async def test_single_agent_review_returns_partial_success_when_timeout_has_usab
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3119,6 +3230,7 @@ async def test_runner_returns_structured_timeout_when_deadline_expires_before_st
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3188,6 +3300,7 @@ async def test_runner_warns_when_post_run_snapshot_times_out(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3259,6 +3372,7 @@ async def test_mutating_run_errors_when_post_run_snapshot_times_out(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3400,6 +3514,7 @@ def test_invalid_extra_roots_do_not_create_artifacts_or_gitignore(tmp_path: Path
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3421,6 +3536,7 @@ def test_gitignore_guard_failure_does_not_create_artifacts(tmp_path: Path) -> No
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
     (repo_root / ".gitignore").symlink_to(outside / "gitignore")
@@ -3444,6 +3560,7 @@ def test_read_only_tools_do_not_touch_gitignore(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
     (repo_root / ".gitignore").symlink_to(outside / "gitignore")
@@ -3598,6 +3715,7 @@ async def test_runner_rewrites_claude_config_references_into_private_runtime(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3688,6 +3806,7 @@ async def test_runner_rewrites_symlinked_claude_config_references_into_private_r
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
 
     project_root = Path(__file__).resolve().parents[1]
     assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
@@ -3781,6 +3900,7 @@ def test_runner_reverse_engineer_uses_repo_local_codex_config_for_helper_root(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
     (repo_root / ".codex").mkdir()
 
     codex_home = tmp_path / "codex-home"
