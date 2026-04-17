@@ -12,8 +12,11 @@ from codex_dobby_mcp.models import (
     AsyncRunHandle,
     AsyncRunState,
     Completeness,
+    GhidraDetails,
+    GhidraUsageMode,
     ResultArtifactState,
     ResolvedInvocation,
+    ReverseEngineerDetails,
     ReviewDetails,
     RunListResponse,
     RunLookupResponse,
@@ -192,6 +195,7 @@ class BackgroundRunManager:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             review_details=_review_details_for_spec(spec),
+            reverse_engineer_details=_reverse_engineer_details_for_background_failure(spec),
         )
 
     @staticmethod
@@ -230,4 +234,24 @@ def _review_details_for_spec(spec: ResolvedInvocation) -> ReviewDetails | None:
     return ReviewDetails(
         requested_review_agents=list(spec.requested_review_agents),
         effective_review_agents=effective_agents,
+    )
+
+
+def _reverse_engineer_details_for_background_failure(spec: ResolvedInvocation) -> ReverseEngineerDetails | None:
+    if spec.tool != ToolName.REVERSE_ENGINEER:
+        return None
+    if not spec.ghidra_available:
+        return ReverseEngineerDetails(
+            ghidra=GhidraDetails(
+                configured=False,
+                mode=GhidraUsageMode.NOT_CONFIGURED,
+                summary="Ghidra integration was not configured for this run.",
+            )
+        )
+    return ReverseEngineerDetails(
+        ghidra=GhidraDetails(
+            configured=True,
+            mode=GhidraUsageMode.PRELAUNCH_FAILURE,
+            summary="Ghidra was configured, but Dobby failed before any child Ghidra activity could run.",
+        )
     )

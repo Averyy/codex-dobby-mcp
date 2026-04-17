@@ -17,6 +17,7 @@ Ghidra MCP workflow:
   - `mcp__ghidra__list_instances()`
   - `mcp__ghidra__connect_instance(project=\"...\")`
   - `mcp__ghidra__list_open_programs()`
+- Do not try to enumerate or memorize the entire Ghidra tool surface from the prompt. The live bridge is authoritative. Follow the startup sequence above, use the specific high-value calls below, and only reach for `check_tools` or `list_tool_groups` when a needed call is missing or its availability is unclear.
 - The startup and inspection calls in this workflow are explicitly allowed for this task. `connect_instance`, `list_open_programs`, `load_tool_group`, `list_tool_groups`, `check_tools`, `search_strings`, `search_functions`, `decompile_function`, and `read_memory` do not count as forbidden edits or note-writing, even though they may change the bridge's active connection or inspect external programs.
 - If `connect_instance` succeeds, go straight to the requested program-level Ghidra call. Do not detour into helper-repo source inspection, bridge implementation reading, test reading, or `curl`/raw HTTP probing unless the actual `mcp__ghidra__*` calls themselves fail and Claude explicitly asked you to debug the bridge.
 - For smoke tests or minimal verification tasks, stop after the required startup sequence and the smallest requested program-level analysis call. Do not broaden scope just to prove extra bridge internals.

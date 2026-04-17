@@ -14,6 +14,7 @@ from codex_dobby_mcp.models import (
     Completeness,
     DEFAULT_REASONING_EFFORTS,
     DEFAULT_TIMEOUT_SECONDS,
+    GhidraUsageMode,
     InvocationRequest,
     RECURSION_GUARD_ENV,
     ResultArtifactState,
@@ -57,9 +58,12 @@ from codex_dobby_mcp.runner import (
     _execute_process_with_streaming_logs,
     _count_completed_spawn_agent_calls,
     _first_meaningful_output_line,
+    _ghidra_usage_mode,
     _git_status,
     _match_review_spawn_prompt,
     _path_fingerprint,
+    _reverse_engineer_details_for_run,
+    _reverse_engineer_failure_details,
     _review_orchestration_warnings,
     _salvaged_review_worker_result,
 )
@@ -101,6 +105,76 @@ def test_worker_schema_file_is_valid_json_schema() -> None:
 def test_default_reasoning_efforts_include_high_build_and_medium_validate() -> None:
     assert DEFAULT_REASONING_EFFORTS[ToolName.BUILD] == ReasoningEffort.HIGH
     assert DEFAULT_REASONING_EFFORTS[ToolName.VALIDATE] == ReasoningEffort.MEDIUM
+
+
+def test_ghidra_usage_mode_distinguishes_direct_helper_and_startup_only() -> None:
+    assert _ghidra_usage_mode(["list_instances", "connect_instance", "list_open_programs"], []) == GhidraUsageMode.DIRECT_MCP
+    assert _ghidra_usage_mode(["list_instances", "connect_instance"], ["list_open_programs", "search_strings"]) == GhidraUsageMode.HELPER_FALLBACK
+    assert _ghidra_usage_mode(["list_instances", "connect_instance", "check_tools"], []) == GhidraUsageMode.STARTUP_ONLY
+    assert _ghidra_usage_mode([], []) == GhidraUsageMode.NO_ACTIVITY
+
+
+def test_reverse_engineer_details_report_helper_fallback_calls(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+    spec = runner._resolve(ToolName.REVERSE_ENGINEER, InvocationRequest(prompt="inspect binary"))
+    spec = spec.model_copy(update={"ghidra_available": True})
+
+    details = _reverse_engineer_details_for_run(
+        spec,
+        stdout="",
+        stderr="\n".join(
+            [
+                "mcp: ghidra/list_instances started",
+                "mcp: ghidra/connect_instance started",
+                "mcp: ghidra/check_tools started",
+                "    open_programs = gh.dispatch_get('/list_open_programs')",
+                "        strings = gh.dispatch_get('/search_strings', params={'search_term': 'Dirac'})",
+            ]
+        ),
+    )
+
+    assert details is not None
+    assert details.ghidra is not None
+    assert details.ghidra.mode == GhidraUsageMode.HELPER_FALLBACK
+    assert details.ghidra.mcp_calls == ["list_instances", "connect_instance", "check_tools"]
+    assert details.ghidra.helper_calls == ["list_open_programs", "search_strings"]
+
+
+def test_reverse_engineer_failure_details_report_prelaunch_failure(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+    spec = runner._resolve(ToolName.REVERSE_ENGINEER, InvocationRequest(prompt="inspect binary"))
+    spec = spec.model_copy(update={"ghidra_available": True})
+
+    details = _reverse_engineer_failure_details(spec, prelaunch_failure=True)
+
+    assert details is not None
+    assert details.ghidra is not None
+    assert details.ghidra.mode == GhidraUsageMode.PRELAUNCH_FAILURE
+    assert details.ghidra.summary == "Ghidra was configured, but Dobby failed before any child Ghidra activity could run."
 
 
 def test_runner_requires_valid_structured_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1966,6 +2040,73 @@ async def test_review_response_includes_review_details(tmp_path: Path, monkeypat
     assert result.review_details is not None
     assert result.review_details.requested_review_agents == [ReviewAgent.CORRECTNESS]
     assert result.review_details.effective_review_agents == [ReviewAgent.CORRECTNESS]
+
+
+@pytest.mark.asyncio
+async def test_reverse_engineer_response_includes_ghidra_details(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+
+    codex_home = tmp_path / "codex-home"
+    (codex_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    (codex_home / "config.toml").write_text('[mcp_servers.ghidra]\ncommand = "uv"\nargs = ["run", "bridge_mcp_ghidra.py"]\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input: bytes | None = None) -> tuple[bytes, bytes]:
+            stdout = b""
+            stderr = (
+                b"mcp: ghidra/list_instances started\n"
+                b"mcp: ghidra/connect_instance started\n"
+                b"mcp: ghidra/check_tools started\n"
+                b"    open_programs = gh.dispatch_get('/list_open_programs')\n"
+                b"        strings = gh.dispatch_get('/search_strings', params={'search_term': 'Dirac'})\n"
+            )
+            return (stdout, stderr)
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "summary": "Ghidra helper fallback succeeded.",
+                    "completeness": "full",
+                    "important_facts": [],
+                    "next_steps": [],
+                    "files_changed": [],
+                    "warnings": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+
+    result = await runner.run(ToolName.REVERSE_ENGINEER, InvocationRequest(prompt="inspect binary"))
+
+    assert result.status == RunStatus.SUCCESS
+    assert result.reverse_engineer_details is not None
+    assert result.reverse_engineer_details.ghidra is not None
+    assert result.reverse_engineer_details.ghidra.mode == GhidraUsageMode.HELPER_FALLBACK
+    assert result.reverse_engineer_details.ghidra.mcp_calls == ["list_instances", "connect_instance", "check_tools"]
+    assert result.reverse_engineer_details.ghidra.helper_calls == ["list_open_programs", "search_strings"]
 
 
 @pytest.mark.asyncio

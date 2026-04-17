@@ -24,12 +24,15 @@ from codex_dobby_mcp.models import (
     Completeness,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORTS,
+    GhidraDetails,
+    GhidraUsageMode,
     InvocationRequest,
     MUTATING_TOOLS,
     READ_ONLY_TOOLS,
     RepoSnapshot,
     ResultArtifactState,
     ResolvedInvocation,
+    ReverseEngineerDetails,
     ReviewDetails,
     RunArtifacts,
     RunStatus,
@@ -79,6 +82,17 @@ _GLOBAL_CLAUDE_DIR = Path("~/.claude").expanduser()
 _GLOBAL_CODEX_DIR = Path("~/.codex").expanduser()
 _CONFIG_PATH_DELIMITERS = " \t\r\n\"',[](){}"
 _CONFIG_PATH_TRAILING_PUNCTUATION = ",.;:)]}>"
+_GHIDRA_MCP_CALL_RE = re.compile(r"^mcp: ghidra/([a-z_]+) started$", re.MULTILINE)
+_GHIDRA_HELPER_CALL_RE = re.compile(r"\bgh\.dispatch_(?:get|post)\('/([a-z_]+)'")
+_GHIDRA_STARTUP_ONLY_CALLS = frozenset(
+    {
+        "list_instances",
+        "connect_instance",
+        "list_tool_groups",
+        "load_tool_group",
+        "check_tools",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -525,6 +539,7 @@ class CodexRunner:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             review_details=_review_details_for_spec(spec),
+            reverse_engineer_details=_reverse_engineer_details_for_run(spec, stdout=stdout, stderr=stderr),
         )
         write_json(spec.artifacts.result_json, response.model_dump(mode="json"))
         return response
@@ -554,6 +569,7 @@ class CodexRunner:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             review_details=_review_details_for_spec(spec),
+            reverse_engineer_details=_reverse_engineer_failure_details(spec, prelaunch_failure=True),
         )
 
     @staticmethod
@@ -583,6 +599,7 @@ class CodexRunner:
             reasoning_effort=spec.reasoning_effort,
             result_state=ResultArtifactState.PLACEHOLDER,
             review_details=_review_details_for_spec(spec),
+            reverse_engineer_details=_reverse_engineer_failure_details(spec),
         )
         write_json(spec.artifacts.result_json, stub.model_dump(mode="json"))
 
@@ -608,6 +625,7 @@ class CodexRunner:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             review_details=_review_details_for_spec(spec),
+            reverse_engineer_details=_reverse_engineer_failure_details(spec),
         )
         write_json(spec.artifacts.result_json, response.model_dump(mode="json"))
         return response
@@ -829,6 +847,96 @@ def _review_details_for_spec(spec: ResolvedInvocation) -> ReviewDetails | None:
         requested_review_agents=list(spec.requested_review_agents),
         effective_review_agents=effective_agents,
     )
+
+
+def _reverse_engineer_details_for_run(
+    spec: ResolvedInvocation,
+    *,
+    stdout: str,
+    stderr: str,
+) -> ReverseEngineerDetails | None:
+    if spec.tool != ToolName.REVERSE_ENGINEER:
+        return None
+    if not spec.ghidra_available:
+        return ReverseEngineerDetails(
+            ghidra=GhidraDetails(
+                configured=False,
+                mode=GhidraUsageMode.NOT_CONFIGURED,
+                summary="Ghidra integration was not configured for this run.",
+            )
+        )
+
+    combined = "\n".join(part for part in (stderr, stdout) if part)
+    mcp_calls = _ordered_unique_regex_matches(_GHIDRA_MCP_CALL_RE, combined)
+    helper_calls = _ordered_unique_regex_matches(_GHIDRA_HELPER_CALL_RE, combined)
+    mode = _ghidra_usage_mode(mcp_calls, helper_calls)
+    return ReverseEngineerDetails(
+        ghidra=GhidraDetails(
+            configured=True,
+            mode=mode,
+            summary=_ghidra_usage_summary(mode),
+            mcp_calls=mcp_calls,
+            helper_calls=helper_calls,
+        )
+    )
+
+
+def _reverse_engineer_failure_details(
+    spec: ResolvedInvocation,
+    *,
+    prelaunch_failure: bool = False,
+) -> ReverseEngineerDetails | None:
+    if spec.tool != ToolName.REVERSE_ENGINEER:
+        return None
+    if not spec.ghidra_available:
+        return ReverseEngineerDetails(
+            ghidra=GhidraDetails(
+                configured=False,
+                mode=GhidraUsageMode.NOT_CONFIGURED,
+                summary="Ghidra integration was not configured for this run.",
+            )
+        )
+    mode = GhidraUsageMode.PRELAUNCH_FAILURE if prelaunch_failure else GhidraUsageMode.NO_ACTIVITY
+    return ReverseEngineerDetails(
+        ghidra=GhidraDetails(
+            configured=True,
+            mode=mode,
+            summary=_ghidra_usage_summary(mode),
+        )
+    )
+
+
+def _ghidra_usage_mode(mcp_calls: list[str], helper_calls: list[str]) -> GhidraUsageMode:
+    if helper_calls:
+        return GhidraUsageMode.HELPER_FALLBACK
+    if any(call not in _GHIDRA_STARTUP_ONLY_CALLS for call in mcp_calls):
+        return GhidraUsageMode.DIRECT_MCP
+    if mcp_calls:
+        return GhidraUsageMode.STARTUP_ONLY
+    return GhidraUsageMode.NO_ACTIVITY
+
+
+def _ghidra_usage_summary(mode: GhidraUsageMode) -> str:
+    if mode == GhidraUsageMode.NOT_CONFIGURED:
+        return "Ghidra integration was not configured for this run."
+    if mode == GhidraUsageMode.PRELAUNCH_FAILURE:
+        return "Ghidra was configured, but Dobby failed before any child Ghidra activity could run."
+    if mode == GhidraUsageMode.NO_ACTIVITY:
+        return "Ghidra was configured for this run, but no Ghidra activity was observed."
+    if mode == GhidraUsageMode.STARTUP_ONLY:
+        return "Ghidra startup calls were observed, but no program-level Ghidra analysis call was observed."
+    if mode == GhidraUsageMode.DIRECT_MCP:
+        return "Program-level Ghidra calls ran directly through MCP tools."
+    return "Ghidra startup used MCP, and program-level analysis used the mounted helper fallback."
+
+
+def _ordered_unique_regex_matches(pattern: re.Pattern[str], text: str) -> list[str]:
+    matches: list[str] = []
+    for match in pattern.finditer(text):
+        candidate = match.group(1)
+        if candidate not in matches:
+            matches.append(candidate)
+    return matches
 
 
 def _git_status(repo_root: Path) -> list[str]:

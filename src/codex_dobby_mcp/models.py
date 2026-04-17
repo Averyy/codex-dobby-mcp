@@ -174,6 +174,27 @@ class ReviewDetails(BaseModel):
     effective_review_agents: list[ReviewAgent] = Field(default_factory=list)
 
 
+class GhidraUsageMode(str, Enum):
+    NOT_CONFIGURED = "not_configured"
+    PRELAUNCH_FAILURE = "prelaunch_failure"
+    NO_ACTIVITY = "no_activity"
+    STARTUP_ONLY = "startup_only"
+    DIRECT_MCP = "direct_mcp"
+    HELPER_FALLBACK = "helper_fallback"
+
+
+class GhidraDetails(BaseModel):
+    configured: bool
+    mode: GhidraUsageMode
+    summary: str
+    mcp_calls: list[str] = Field(default_factory=list)
+    helper_calls: list[str] = Field(default_factory=list)
+
+
+class ReverseEngineerDetails(BaseModel):
+    ghidra: GhidraDetails | None = None
+
+
 class ToolResponse(BaseModel):
     task_id: str
     tool: ToolName
@@ -194,6 +215,7 @@ class ToolResponse(BaseModel):
     reasoning_effort: ReasoningEffort
     result_state: ResultArtifactState = ResultArtifactState.FINAL
     review_details: ReviewDetails | None = None
+    reverse_engineer_details: ReverseEngineerDetails | None = None
 
 
 class AsyncRunHandle(BaseModel):

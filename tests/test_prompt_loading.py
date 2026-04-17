@@ -52,6 +52,7 @@ def test_prompt_loader_expands_includes_and_renders_context() -> None:
     assert "Danger mode: true" in rendered
     assert "startup and inspection calls in this workflow are explicitly allowed" in rendered
     assert "do not count as forbidden edits or note-writing" in rendered
+    assert "Do not try to enumerate or memorize the entire Ghidra tool surface from the prompt" in rendered
     assert "Do not detour into helper-repo source inspection" in rendered
     assert "Do not broaden scope just to prove extra bridge internals" in rendered
     assert "prefer the mounted `bridge_mcp_ghidra.py` helper as a fallback" in rendered
