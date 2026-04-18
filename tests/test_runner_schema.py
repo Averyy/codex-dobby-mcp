@@ -2217,7 +2217,7 @@ async def test_read_only_run_flags_new_dirty_paths(tmp_path: Path) -> None:
 
     assert result.status == RunStatus.ERROR
     assert "notes.txt" in result.files_changed
-    assert "Read-only tool changed files outside wrapper-managed artifacts" in result.warnings
+    assert "Read-only tool observed worktree changes during the run outside wrapper-managed artifacts" in result.warnings
 
 
 @pytest.mark.asyncio

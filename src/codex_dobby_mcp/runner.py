@@ -483,7 +483,10 @@ class CodexRunner:
 
         if tool in READ_ONLY_TOOLS and detected_files:
             status = RunStatus.ERROR
-            read_only_warning = "Read-only tool changed files outside wrapper-managed artifacts"
+            read_only_warning = (
+                "Read-only tool observed worktree changes during the run "
+                "outside wrapper-managed artifacts"
+            )
             warnings.append(read_only_warning)
             error_reasons.append(read_only_warning)
         if tool in MUTATING_TOOLS and post_run_snapshot_incomplete:
