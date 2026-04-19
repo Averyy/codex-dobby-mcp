@@ -8,6 +8,10 @@ from typing import Annotated
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BeforeValidator, Field
 
+from codex_dobby_mcp.mcp_spec_patches import apply_spec_patches
+
+apply_spec_patches()
+
 from codex_dobby_mcp.background_runs import BackgroundRunManager
 from codex_dobby_mcp.models import (
     AsyncRunHandle,

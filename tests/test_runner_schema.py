@@ -66,6 +66,10 @@ from codex_dobby_mcp.runner import (
     _reverse_engineer_failure_details,
     _review_orchestration_warnings,
     _salvaged_review_worker_result,
+    _salvage_exec_trace,
+    _salvage_worker_result_from_trace,
+    _stall_diagnostics,
+    _stall_threshold_for_effort,
 )
 
 
@@ -4191,3 +4195,99 @@ def test_reverse_engineer_default_writable_roots_fall_back_to_macos_socket_scan(
     )
 
     assert reverse_engineer_default_writable_roots() == [ghidra_root.resolve(), socket_dir.resolve()]
+
+
+def test_stall_threshold_for_effort_scales_with_effort() -> None:
+    assert _stall_threshold_for_effort(ReasoningEffort.LOW) == 180.0
+    assert _stall_threshold_for_effort(ReasoningEffort.MEDIUM) == 180.0
+    assert _stall_threshold_for_effort(ReasoningEffort.HIGH) == 300.0
+    assert _stall_threshold_for_effort(ReasoningEffort.XHIGH) == 300.0
+    assert _stall_threshold_for_effort(None) == 180.0
+
+
+def test_salvage_exec_trace_extracts_commands_with_outcomes() -> None:
+    stderr = (
+        "OpenAI Codex v0.121.0 (research preview)\n"
+        "--------\n"
+        "user\n"
+        "some prompt text\n"
+        "2026-04-19T00:00:00.000000Z TRACE codex_api::sse::responses: unhandled responses event: response.in_progress\n"
+        "exec\n"
+        "/bin/zsh -lc 'ls -la' in /repo\n"
+        " succeeded in 3ms:\n"
+        "total 0\n"
+        "exec\n"
+        "/bin/zsh -lc 'cat missing.txt' in /repo\n"
+        " failed in 1ms:\n"
+        "cat: missing.txt: No such file\n"
+        "exec\n"
+        "/bin/zsh -lc 'sleep 100' in /repo\n"
+    )
+    entries = _salvage_exec_trace(stderr)
+    assert len(entries) == 3
+    assert entries[0]["outcome"] == "succeeded"
+    assert entries[0]["cmd"].startswith("/bin/zsh -lc 'ls -la'")
+    assert entries[1]["outcome"] == "failed"
+    assert entries[2]["outcome"] == "in-flight"
+
+
+def test_salvage_worker_result_from_trace_builds_partial_result() -> None:
+    stderr = (
+        "response.in_progress\n"
+        "exec\n"
+        "/bin/zsh -lc 'rg foo' in /repo\n"
+        " succeeded in 5ms:\n"
+        "hit\n"
+        "response.in_progress\n"
+        "exec\n"
+        "/bin/zsh -lc 'node script.js' in /repo\n"
+    )
+    result = _salvage_worker_result_from_trace(
+        ToolName.BUILD, stderr, stall_hit=False, timeout_hit=True
+    )
+    assert result is not None
+    assert result.completeness == Completeness.PARTIAL
+    joined = "\n".join(result.important_facts)
+    assert "2 model turn(s)" in joined
+    assert "2 shell command(s)" in joined
+    assert "rg foo" in joined
+    assert any("salvaged" in w.lower() for w in result.warnings)
+
+
+def test_salvage_worker_result_skips_when_not_stalled_or_timed_out() -> None:
+    stderr = "exec\n/bin/zsh -lc 'ls' in /repo\n succeeded in 1ms:\n"
+    assert _salvage_worker_result_from_trace(
+        ToolName.BUILD, stderr, stall_hit=False, timeout_hit=False
+    ) is None
+
+
+def test_salvage_worker_result_skips_for_review_tool() -> None:
+    stderr = "exec\n/bin/zsh -lc 'ls' in /repo\n succeeded in 1ms:\nresponse.in_progress\n"
+    assert _salvage_worker_result_from_trace(
+        ToolName.REVIEW, stderr, stall_hit=False, timeout_hit=True
+    ) is None
+
+
+def test_salvage_worker_result_returns_none_when_trace_is_empty() -> None:
+    assert _salvage_worker_result_from_trace(
+        ToolName.BUILD, "", stall_hit=True, timeout_hit=False
+    ) is None
+
+
+def test_stall_diagnostics_includes_bytes_and_last_line() -> None:
+    stderr = (
+        "OpenAI Codex v0.121.0\n"
+        "2026-04-19T01:02:03.123456Z TRACE codex_api::sse::responses: unhandled responses event: response.in_progress\n"
+        "user\n"
+        "some task prompt line\n"
+    )
+    msg = _stall_diagnostics(stderr, "", 300.0)
+    assert "300 seconds" in msg
+    assert "stderr" in msg and "bytes" in msg
+    assert "2026-04-19T01:02:03" in msg
+    assert "some task prompt line" in msg
+
+
+def test_stall_diagnostics_flags_pre_stream_hang_when_stderr_empty() -> None:
+    msg = _stall_diagnostics("", "", 300.0)
+    assert "before the model opened its response stream" in msg

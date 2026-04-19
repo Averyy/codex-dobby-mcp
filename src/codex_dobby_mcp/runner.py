@@ -76,7 +76,10 @@ _POST_TIMEOUT_TERMINATE_GRACE_SECONDS = 1.0
 _POST_TIMEOUT_KILL_WAIT_SECONDS = 0.25
 _POST_TIMEOUT_IO_DRAIN_SECONDS = 1.0
 _CODEX_STALL_THRESHOLD_SECONDS = 180.0
+_CODEX_STALL_THRESHOLD_HIGH_EFFORT_SECONDS = 300.0
 _CODEX_STALL_CHECK_INTERVAL_SECONDS = 15.0
+_SALVAGE_EXEC_TAIL_COUNT = 8
+_SALVAGE_LINE_MAX_CHARS = 240
 _POST_RUN_SNAPSHOT_MIN_BUDGET_SECONDS = 20.0
 _GLOBAL_CLAUDE_DIR = Path("~/.claude").expanduser()
 _GLOBAL_CODEX_DIR = Path("~/.codex").expanduser()
@@ -322,6 +325,7 @@ class CodexRunner:
                 spec.artifacts.stdout_log,
                 spec.artifacts.stderr_log,
                 remaining,
+                stall_threshold_seconds=_stall_threshold_for_effort(spec.reasoning_effort),
             )
         except FileNotFoundError as exc:
             raise RunnerError(f"Codex executable not found: {self.codex_binary}") from exc
@@ -366,6 +370,17 @@ class CodexRunner:
                     else _review_salvage_complete(stdout, spec.request.agents)
                 )
                 worker_result_error = None
+        if worker_result is None:
+            salvaged = _salvage_worker_result_from_trace(
+                tool,
+                stderr,
+                stall_hit=stall_hit,
+                timeout_hit=timeout_hit,
+            )
+            if salvaged is not None:
+                worker_result = salvaged
+                worker_result_error = None
+                _write_salvage_last_message(spec.artifacts, salvaged)
         recovered_partial_review = (
             review_is_orchestrated
             and review_salvaged
@@ -442,10 +457,10 @@ class CodexRunner:
                 files_changed = _merge_preserving_order(files_changed, external_reported_files)
 
         if stall_hit:
-            stall_warning = (
-                f"Codex produced no stdout or stderr output for "
-                f"{int(_CODEX_STALL_THRESHOLD_SECONDS)} seconds and was killed as stalled. "
-                "This usually means the underlying model response hung before emitting any tokens."
+            stall_warning = _stall_diagnostics(
+                stderr,
+                stdout,
+                _stall_threshold_for_effort(spec.reasoning_effort),
             )
             warnings.append(stall_warning)
             status = RunStatus.ERROR
@@ -1585,6 +1600,169 @@ def _timeout_warning(spec: ResolvedInvocation, fallback_timeout_seconds: int | N
     return f"Codex run timed out after {effective_timeout} seconds"
 
 
+def _stall_threshold_for_effort(effort: ReasoningEffort | None) -> float:
+    if effort in (ReasoningEffort.HIGH, ReasoningEffort.XHIGH):
+        return _CODEX_STALL_THRESHOLD_HIGH_EFFORT_SECONDS
+    return _CODEX_STALL_THRESHOLD_SECONDS
+
+
+def _stall_diagnostics(stderr: str, stdout: str, threshold_seconds: float) -> str:
+    stderr_bytes = len(stderr.encode("utf-8")) if stderr else 0
+    stdout_bytes = len(stdout.encode("utf-8")) if stdout else 0
+    last_line = _last_non_trace_line(stderr)
+    last_line_ts = _last_trace_timestamp(stderr)
+    parts = [
+        f"Codex produced no stdout or stderr activity for {int(threshold_seconds)} seconds and was killed as stalled.",
+        f"Totals at kill: stderr {stderr_bytes} bytes, stdout {stdout_bytes} bytes.",
+    ]
+    if last_line_ts:
+        parts.append(f"Last trace timestamp: {last_line_ts}.")
+    if last_line:
+        snippet = last_line.strip()
+        if len(snippet) > _SALVAGE_LINE_MAX_CHARS:
+            snippet = snippet[:_SALVAGE_LINE_MAX_CHARS].rstrip() + "…"
+        parts.append(f"Last stderr non-trace line: {snippet!r}.")
+    if stderr_bytes == 0:
+        parts.append("No SSE activity was observed — the request likely stalled before the model opened its response stream.")
+    return " ".join(parts)
+
+
+def _last_non_trace_line(stderr: str) -> str | None:
+    if not stderr:
+        return None
+    for line in reversed(stderr.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "codex_api::" in stripped or " TRACE " in stripped or " DEBUG " in stripped:
+            continue
+        return stripped
+    return None
+
+
+_TRACE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
+
+
+def _last_trace_timestamp(stderr: str) -> str | None:
+    if not stderr:
+        return None
+    for line in reversed(stderr.splitlines()):
+        match = _TRACE_TS_RE.match(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _count_in_progress_events(stderr: str) -> int:
+    if not stderr:
+        return 0
+    return stderr.count("response.in_progress")
+
+
+def _salvage_exec_trace(stderr: str) -> list[dict[str, str]]:
+    """Extract the `exec <cmd>\\n<detail>\\n succeeded in ...` blocks codex exec emits for tool calls.
+
+    Each entry is {cmd, outcome} where outcome is "succeeded"/"failed"/"in-flight".
+    """
+    if not stderr:
+        return []
+    lines = stderr.splitlines()
+    results: list[dict[str, str]] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        if lines[i].rstrip() == "exec":
+            cmd_line = lines[i + 1].strip() if i + 1 < n else ""
+            outcome = "in-flight"
+            j = i + 2
+            scan_limit = min(n, j + 200)
+            while j < scan_limit:
+                stripped = lines[j].lstrip()
+                if stripped.startswith("succeeded in"):
+                    outcome = "succeeded"
+                    break
+                if stripped.startswith("failed") or stripped.startswith("exited "):
+                    outcome = "failed"
+                    break
+                if lines[j].rstrip() in ("exec", "codex", "tokens used"):
+                    break
+                j += 1
+            if cmd_line:
+                if len(cmd_line) > _SALVAGE_LINE_MAX_CHARS:
+                    cmd_line = cmd_line[:_SALVAGE_LINE_MAX_CHARS].rstrip() + "…"
+                results.append({"cmd": cmd_line, "outcome": outcome})
+            i = j + 1 if j > i + 1 else i + 1
+            continue
+        i += 1
+    return results
+
+
+def _salvage_worker_result_from_trace(
+    tool: ToolName,
+    stderr: str,
+    *,
+    stall_hit: bool,
+    timeout_hit: bool,
+) -> WorkerResult | None:
+    """Build a PARTIAL WorkerResult from the stderr trace when codex was killed without emitting its final JSON.
+
+    Intended for non-review tools where the existing review-salvage path does not apply.
+    """
+    if tool in (ToolName.REVIEW,):  # review has its own salvage
+        return None
+    if not (stall_hit or timeout_hit):
+        return None
+
+    exec_blocks = _salvage_exec_trace(stderr)
+    turn_count = _count_in_progress_events(stderr)
+
+    if not exec_blocks and turn_count == 0:
+        return None
+
+    tail = exec_blocks[-_SALVAGE_EXEC_TAIL_COUNT:]
+    succeeded = sum(1 for e in exec_blocks if e["outcome"] == "succeeded")
+    failed = sum(1 for e in exec_blocks if e["outcome"] == "failed")
+    in_flight = sum(1 for e in exec_blocks if e["outcome"] == "in-flight")
+
+    facts: list[str] = [
+        f"Salvaged partial progress from stderr trace: {turn_count} model turn(s) observed, "
+        f"{len(exec_blocks)} shell command(s) attempted ({succeeded} succeeded, {failed} failed, "
+        f"{in_flight} in-flight when killed).",
+    ]
+    if tail:
+        facts.append("Most recent shell commands before kill:")
+        for entry in tail:
+            facts.append(f"  [{entry['outcome']}] {entry['cmd']}")
+
+    cause = "stalled" if stall_hit else "timed out"
+    summary = (
+        f"Codex {cause} before writing its final JSON; wrapper salvaged {turn_count} turn(s) "
+        f"and {len(exec_blocks)} tool call(s) from the stderr trace."
+    )
+    warnings = [
+        "Result was salvaged from the stderr trace after codex was killed; no structured worker JSON was produced."
+    ]
+    return WorkerResult(
+        summary=summary,
+        completeness=Completeness.PARTIAL,
+        important_facts=facts,
+        next_steps=[],
+        files_changed=[],
+        warnings=warnings,
+    )
+
+
+def _write_salvage_last_message(artifacts: RunArtifacts, worker_result: WorkerResult) -> None:
+    path = artifacts.last_message_txt
+    if path.exists() and path.read_bytes().strip():
+        return
+    try:
+        payload = worker_result.model_dump(mode="json")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        return
+
+
 def _seconds_remaining(deadline: float) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -2040,7 +2218,11 @@ async def _execute_process_with_streaming_logs(
     stdout_log: Path,
     stderr_log: Path,
     timeout: float,
+    stall_threshold_seconds: float | None = None,
 ) -> tuple[int | None, bool, bool]:
+    effective_stall_threshold = (
+        stall_threshold_seconds if stall_threshold_seconds is not None else _CODEX_STALL_THRESHOLD_SECONDS
+    )
     if not _supports_streaming_process_io(process):
         timeout_hit = False
         try:
@@ -2067,7 +2249,7 @@ async def _execute_process_with_streaming_logs(
         stdout_task = asyncio.create_task(_pump_process_stream(process.stdout, stdout_handle, tracker))
         stderr_task = asyncio.create_task(_pump_process_stream(process.stderr, stderr_handle, tracker))
         stall_task = asyncio.create_task(
-            _monitor_process_stall(process, tracker, _CODEX_STALL_THRESHOLD_SECONDS, stall_flag)
+            _monitor_process_stall(process, tracker, effective_stall_threshold, stall_flag)
         )
         cleanup_timeout: float | None = None
         try:
