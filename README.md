@@ -17,6 +17,7 @@ It gives Claude a sharper tool surface than a raw shell handoff: planning stays 
 | `reverse_engineer` | Use reverse-engineering tooling and broader roots to investigate binaries. |
 | `start_run` | Start any Dobby tool in the background and return immediately with a task id. |
 | `get_run` | Fetch the status or final result for a background run by task id. |
+| `wait_run` | Block until one or more background runs finish (or a timeout elapses), then return the first result. |
 | `list_runs` | List recent runs for a repo so you can recover task ids and results after timeouts. |
 
 ## Requirements
@@ -106,7 +107,7 @@ Offload grunt work — build/test, code review, research, planning, implementati
 - Give focused prompts with a concrete outcome. One task per call — if you have multiple things to ask, make multiple Dobby calls (in parallel when independent) instead of bundling them into one vague prompt.
 - Call `mcp__codex-dobby__*` directly. Never wrap them in a general-purpose Agent/Task subagent.
 - Don't lower `timeout_seconds` below the default. Err too long — a short timeout kills the run; a long one costs nothing because Dobby returns as soon as it's ready.
-- If your MCP client has a short `tools/call` timeout, start long work with `mcp__codex-dobby__start_run` and then poll `mcp__codex-dobby__get_run`.
+- For long work, start it with `mcp__codex-dobby__start_run` and then either block on `mcp__codex-dobby__wait_run` (parent sleeps in the tool call) or poll `mcp__codex-dobby__get_run` (parent keeps working). On Claude Code, `/loop` or `ScheduleWakeup` can schedule the polls for you so the parent is free between checks.
 ```
 
 ## Requests
@@ -119,9 +120,11 @@ Common params: `prompt`, `repo_root`, `files`, `important_context`, `timeout_sec
 
 `get_run` params: `task_id`, optional `repo_root`.
 
+`wait_run` params: optional `task_id` (single run), optional `task_ids` (list — first-to-finish wins), optional `repo_root`, `timeout_seconds` (default 540s / 9 min, clamped to `[1, 100_000]` / ~27.8 hours — matching Claude Code's `MCP_TOOL_TIMEOUT` default of `100000000` ms). Omit both `task_id` and `task_ids` to wait on every currently-live run for the repo. Passing both is rejected; an empty `task_ids` list is rejected. On timeout returns a `running` lookup whose `pending_task_ids` lists the ids still outstanding, and whose `summary` instructs the caller to re-call `wait_run` with that list until one finishes. Pick `timeout_seconds` below your MCP client's own `tools/call` ceiling — Claude Code defaults to ~28 hours (so the full clamp is usable); Codex CLI defaults to 60s per `[mcp_servers.<id>].tool_timeout_sec` (so raise that in `~/.codex/config.toml` before using long waits from Codex); Claude Desktop / Cursor / Cline / Continue vary and may cap low.
+
 `list_runs` params: optional `repo_root`, optional `limit`.
 
-For clients with a hard `tools/call` timeout around 120 seconds, prefer `start_run` + `get_run`/`list_runs` for long `review`, `research`, `build`, `validate`, or `reverse_engineer` work.
+For clients with a short `tools/call` ceiling (Claude Desktop ~60s, unconfigured Codex CLI 60s), prefer `start_run` + `get_run`/`list_runs` for long `review`, `research`, `build`, `validate`, or `reverse_engineer` work. Where the ceiling is raised (Claude Code defaults to ~28h, Codex CLI with `tool_timeout_sec` overridden), `start_run` + `wait_run` is usually fewer round-trips than polling.
 
 ## Defaults
 
@@ -139,7 +142,7 @@ Default model is `gpt-5.4`, except `review`: single-agent review defaults to `gp
 
 `build` and `reverse_engineer` switch to `danger-full-access` when `danger=true`.
 
-`start_run`, `get_run`, and `list_runs` are control-plane tools and return immediately. `start_run` uses the selected target tool's timeout budget.
+`start_run`, `get_run`, and `list_runs` are control-plane tools and return immediately. `start_run` uses the selected target tool's timeout budget. `wait_run` is also a control-plane tool, but it intentionally blocks up to its own `timeout_seconds` (capped at 100_000s / ~27.8h, matching Claude Code's `MCP_TOOL_TIMEOUT` default) waiting for a background run to finish.
 
 ## Behavior
 
@@ -150,8 +153,10 @@ Default model is `gpt-5.4`, except `review`: single-agent review defaults to `gp
 - `reverse_engineer` includes a Ghidra MCP workflow only when Ghidra is installed and configured for the run. When Dobby can discover Ghidra from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`), it adds the configured Ghidra MCP helper repo as a writable helper root. When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run. If Ghidra is not installed or not configured, the worker is told not to call `mcp__ghidra__*`.
 - `reverse_engineer` responses include `reverse_engineer_details.ghidra`, which reports whether Ghidra was configured, whether the run used direct MCP calls or the mounted helper fallback, and which Ghidra calls were observed.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.
+- `wait_run` awaits the same live in-memory task via `asyncio.wait_for` with `asyncio.shield`, so if the caller is cancelled (client disconnect, outer MCP timeout) the underlying background run keeps going and can still be recovered with `get_run`/`wait_run`. If the task isn't in the live registry — e.g. the server restarted — `wait_run` falls through to the on-disk artifact lookup without polling.
+- Multi-task `wait_run` (`task_ids=[...]` or no ids → all-live) uses `asyncio.wait(..., return_when=FIRST_COMPLETED)` over shielded futures and returns the first run to finish. The response's `pending_task_ids` lists the still-outstanding ids; callers should re-call `wait_run(task_ids=pending_task_ids)` until it's empty. On timeout the primary entry is the first id in the input list; `pending_task_ids` holds every id still waiting.
 - Result artifacts are replaced atomically, so `get_run` sees either the startup placeholder or the final persisted response instead of a partially written `result.json`.
-- Blocking tools like `review` and `research` still behave exactly as before. If a caller insists on waiting synchronously, that caller can still hit its own outer MCP timeout.
+- Synchronous worker tool calls (`review`, `research`, etc.) can still hit the caller's outer `tools/call` ceiling. Prefer `start_run` + `wait_run` / `get_run` when that's a concern.
 
 ## Filesystem and Safety
 
@@ -173,6 +178,7 @@ Async control tools return different structured payloads:
 
 - `start_run` returns an `AsyncRunHandle` with `task_id`, `tool`, `state`, `summary`, `repo_root`, `artifact_paths`, `model`, and `reasoning_effort`
 - `get_run` returns a `RunLookupResponse` with `task_id`, `state`, `summary`, `repo_root`, optional `tool`, optional `status`, optional `result_state`, optional final `result`, artifact metadata, and warnings
+- `wait_run` returns the same `RunLookupResponse` shape as `get_run` plus an optional `pending_task_ids` list (populated whenever the caller passed `task_ids` or used the all-live mode). On timeout `state` is `running` and `result` is unset, on completion `state` is `finished` with the final `result` populated
 - `list_runs` returns the resolved `repo_root` plus recent run summaries for that repo
 
 ## Async Runs
@@ -205,7 +211,33 @@ This returns quickly with a `task_id`. Then poll or recover the result:
 
 If you lost the id because a previous blocking call timed out, `list_runs` reads `.codex-dobby/runs/` and shows recent task ids and summaries.
 
-States reported by `get_run`:
+If you'd rather block than poll, call `wait_run`:
+
+```json
+{
+  "tool": "wait_run",
+  "arguments": {
+    "task_id": "<task-id>",
+    "repo_root": "/ABSOLUTE/PATH/TO/TARGET-REPO"
+  }
+}
+```
+
+To be woken by whichever of several runs finishes first, pass `task_ids` instead:
+
+```json
+{
+  "tool": "wait_run",
+  "arguments": {
+    "task_ids": ["<task-id-1>", "<task-id-2>", "<task-id-3>"],
+    "repo_root": "/ABSOLUTE/PATH/TO/TARGET-REPO"
+  }
+}
+```
+
+Omit both `task_id` and `task_ids` to wait on every currently-live run for the repo. On completion / timeout semantics, see the `wait_run` params in [Requests](#requests) — the short version: the response's `pending_task_ids` tells you what to re-call `wait_run` with.
+
+States reported by `get_run` and `wait_run`:
 
 - `running`: the server still has the run alive in memory
 - `finished`: a final `ToolResponse` is available and `result_state` is `final`

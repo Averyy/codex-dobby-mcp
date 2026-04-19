@@ -119,7 +119,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
     background_runs = BackgroundRunManager(runner)
     server = FastMCP(
         "codex-dobby-mcp",
-        instructions="Delegate scoped work to codex exec and return concise structured results. Important: short timeouts cause failures. Always use a longer timeout_seconds than you think is needed — the default (900s) is a safe choice. Do not override it lower unless you have a specific reason. If the MCP client itself has a short tools/call timeout, prefer start_run plus get_run/list_runs for long review, research, build, validate, or reverse_engineer work.",
+        instructions="Delegate scoped work to codex exec and return concise structured results. Important: short timeouts cause failures. Always use a longer timeout_seconds than you think is needed — the default (900s) is a safe choice. Do not override it lower unless you have a specific reason. For long review, research, build, validate, or reverse_engineer work, prefer start_run plus wait_run (wait_run blocks until done or until its own timeout_seconds elapses, then re-call). If the caller is Claude Code and you want the parent to keep working on other things instead of blocking in wait_run, schedule a poll of get_run via /loop or ScheduleWakeup — the parent wakes itself periodically to check without holding a tool call open. Use get_run/list_runs for a non-blocking peek or to recover a task id after a caller-side timeout.",
     )
 
     @server.tool(name="plan", structured_output=True)
@@ -318,7 +318,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         danger: bool = False,
         ctx: Context | None = None,
     ) -> AsyncRunHandle:
-        """Start a Dobby tool in the background and return immediately with a task id. Use get_run/list_runs to fetch the final result. Recommended when your MCP client enforces short tools/call timeouts."""
+        """Start a Dobby tool in the background and return immediately with a task id. Follow up with wait_run(task_id=...) to block on one run, or call start_run several times and then wait_run(task_ids=[...]) to be woken by whichever finishes first. get_run/list_runs remain available for a non-blocking peek. Recommended when your MCP client enforces short tools/call timeouts."""
         effective_timeout_seconds = timeout_seconds or DEFAULT_TOOL_TIMEOUT_SECONDS[tool]
         request = _request_from_params(
             prompt=prompt,
@@ -344,6 +344,24 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         """Get the status or final ToolResponse for a Dobby run by task id. This can recover results from .codex-dobby/runs even after a blocking tools/call timed out."""
         resolved_repo_root = _resolved_repo_root(runner, repo_root, ctx)
         return background_runs.get(resolved_repo_root, task_id)
+
+    @server.tool(name="wait_run", structured_output=True)
+    async def wait_run(
+        task_id: str | None = None,
+        task_ids: list[str] | None = None,
+        repo_root: str | None = None,
+        timeout_seconds: int = 540,
+        ctx: Context | None = None,
+    ) -> RunLookupResponse:
+        """Call after start_run to block until a background run finishes. Pass task_id for one run, task_ids=[...] to wait for whichever of several finishes FIRST, or omit both to wait on every currently-live run for the repo. On completion returns the winning run's final ToolResponse (pending_task_ids lists any still-running siblings); on timeout returns a RUNNING lookup whose summary says to keep calling wait_run with pending_task_ids until one finishes. Background tasks are shielded from waiter cancellation, so re-calling never loses work. Default 540s (9 min); clamped to [1, 100_000s / ~27.8h], matching Claude Code's MCP_TOOL_TIMEOUT default. Pick timeout_seconds below your own MCP client's tools/call ceiling — Claude Code defaults to ~28h (the full clamp is usable); Codex CLI defaults to 60s per [mcp_servers.<id>].tool_timeout_sec (raise that first); Claude Desktop / Cursor / Cline / Continue vary."""
+        resolved_repo_root = _resolved_repo_root(runner, repo_root, ctx)
+        clamped = max(1, min(int(timeout_seconds), 100_000))
+        return await background_runs.wait(
+            resolved_repo_root,
+            task_id=task_id,
+            task_ids=task_ids,
+            timeout_seconds=clamped,
+        )
 
     @server.tool(name="list_runs", structured_output=True)
     async def list_runs(

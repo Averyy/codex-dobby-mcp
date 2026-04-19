@@ -9,7 +9,7 @@ from codex_dobby_mcp.models import ReviewAgent
 from codex_dobby_mcp.server import _caller_repo_root, create_server
 
 
-def test_server_exposes_exactly_ten_tools() -> None:
+def test_server_exposes_exactly_eleven_tools() -> None:
     server = create_server()
     tools = sorted(server._tool_manager.list_tools(), key=lambda tool: tool.name)
     tool_names = [tool.name for tool in tools]
@@ -25,6 +25,7 @@ def test_server_exposes_exactly_ten_tools() -> None:
         "review",
         "start_run",
         "validate",
+        "wait_run",
     ]
     assert all(tool.description for tool in tools)
     assert all(getattr(tool, "outputSchema", None) or getattr(tool, "output_schema", None) for tool in tools)

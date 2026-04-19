@@ -39,7 +39,7 @@ class BackgroundRunEntry:
 class BackgroundRunManager:
     def __init__(self, runner: CodexRunner):
         self._runner = runner
-        self._entries: dict[tuple[str, str], BackgroundRunEntry] = {}
+        self._entries: dict[tuple[object, str], BackgroundRunEntry] = {}
 
     def start(self, spec: ResolvedInvocation) -> AsyncRunHandle:
         task_id = spec.artifacts.run_dir.name
@@ -77,6 +77,153 @@ class BackgroundRunManager:
                 return self._lookup_from_result(repo_root, entry.spec.tool, entry.task.result())
 
         return self._lookup_from_artifacts(repo_root, task_id)
+
+    async def wait(
+        self,
+        repo_root: Path,
+        task_id: str | None,
+        task_ids: list[str] | None,
+        timeout_seconds: float,
+    ) -> RunLookupResponse:
+        if task_id is not None and task_ids is not None:
+            raise ValueError("Pass either task_id or task_ids, not both.")
+        if task_ids is not None and len(task_ids) == 0:
+            raise ValueError("task_ids must be non-empty; omit the param to wait on all live runs.")
+
+        if task_id is not None:
+            ids: list[str] = [task_id]
+        elif task_ids is not None:
+            seen: set[str] = set()
+            ids = []
+            for tid in task_ids:
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+        else:
+            ids = self._live_task_ids_for_repo(repo_root)
+            if not ids:
+                return RunLookupResponse(
+                    task_id="",
+                    state=AsyncRunState.NOT_FOUND,
+                    summary="No live background runs found for this repo.",
+                    repo_root=str(repo_root),
+                )
+
+        if len(ids) == 1:
+            return await self._wait_single(repo_root, ids[0], timeout_seconds)
+        return await self._wait_multi(repo_root, ids, timeout_seconds)
+
+    async def _wait_single(
+        self, repo_root: Path, task_id: str, timeout_seconds: float
+    ) -> RunLookupResponse:
+        entry = self._entries.get(self._key(repo_root, task_id))
+        if entry is None:
+            return self._lookup_from_artifacts(repo_root, task_id)
+
+        if not entry.task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(entry.task), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                return RunLookupResponse(
+                    task_id=task_id,
+                    state=AsyncRunState.RUNNING,
+                    summary=(
+                        f"{entry.spec.tool.value} run is still active after waiting "
+                        f"{timeout_seconds:.0f}s. Keep calling wait_run with the same task_id "
+                        "until state is finished (the background task is shielded, so nothing "
+                        "is lost by re-calling)."
+                    ),
+                    repo_root=str(repo_root),
+                    tool=entry.spec.tool,
+                    artifact_paths=entry.spec.artifacts.as_public_dict(),
+                    pending_task_ids=[task_id],
+                )
+
+        with suppress(asyncio.CancelledError):
+            return self._lookup_from_result(repo_root, entry.spec.tool, entry.task.result())
+        return self._lookup_from_artifacts(repo_root, task_id)
+
+    async def _wait_multi(
+        self, repo_root: Path, task_ids: list[str], timeout_seconds: float
+    ) -> RunLookupResponse:
+        still_running: dict[str, BackgroundRunEntry] = {}
+        for tid in task_ids:
+            entry = self._entries.get(self._key(repo_root, tid))
+            if entry is None:
+                continue
+            if entry.task.done():
+                with suppress(asyncio.CancelledError):
+                    lookup = self._lookup_from_result(repo_root, entry.spec.tool, entry.task.result())
+                    return lookup.model_copy(
+                        update={"pending_task_ids": [t for t in task_ids if t != tid]}
+                    )
+            else:
+                still_running[tid] = entry
+
+        for tid in task_ids:
+            if tid in still_running:
+                continue
+            artifact_lookup = self._lookup_from_artifacts(repo_root, tid)
+            if artifact_lookup.state == AsyncRunState.FINISHED:
+                return artifact_lookup.model_copy(
+                    update={"pending_task_ids": [t for t in task_ids if t != tid]}
+                )
+
+        if not still_running:
+            tid = task_ids[0]
+            return self._lookup_from_artifacts(repo_root, tid).model_copy(
+                update={"pending_task_ids": [t for t in task_ids if t != tid]}
+            )
+
+        shielded = {asyncio.shield(entry.task): tid for tid, entry in still_running.items()}
+        try:
+            done, _ = await asyncio.wait(
+                shielded.keys(),
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for fut in shielded:
+                if not fut.done():
+                    fut.cancel()
+
+        if done:
+            winning_future = next(iter(done))
+            winning_id = shielded[winning_future]
+            entry = still_running[winning_id]
+            with suppress(asyncio.CancelledError):
+                lookup = self._lookup_from_result(repo_root, entry.spec.tool, entry.task.result())
+                return lookup.model_copy(
+                    update={"pending_task_ids": [t for t in task_ids if t != winning_id]}
+                )
+            return self._lookup_from_artifacts(repo_root, winning_id).model_copy(
+                update={"pending_task_ids": [t for t in task_ids if t != winning_id]}
+            )
+
+        primary = next(iter(still_running))
+        primary_entry = still_running[primary]
+        return RunLookupResponse(
+            task_id=primary,
+            state=AsyncRunState.RUNNING,
+            summary=(
+                f"{len(still_running)} of {len(task_ids)} runs still active after waiting "
+                f"{timeout_seconds:.0f}s. Keep calling wait_run with "
+                "task_ids=pending_task_ids until one finishes (background tasks are shielded, "
+                "so nothing is lost by re-calling). Or use get_run per id for a non-blocking peek."
+            ),
+            repo_root=str(repo_root),
+            tool=primary_entry.spec.tool,
+            artifact_paths=primary_entry.spec.artifacts.as_public_dict(),
+            pending_task_ids=list(still_running.keys()),
+        )
+
+    def _live_task_ids_for_repo(self, repo_root: Path) -> list[str]:
+        target = self._repo_key(repo_root)
+        return [
+            entry.spec.artifacts.run_dir.name
+            for (root, _task_id), entry in self._entries.items()
+            if root == target and not entry.task.done()
+        ]
 
     def list(self, repo_root: Path, limit: int = 10) -> RunListResponse:
         try:
@@ -199,8 +346,17 @@ class BackgroundRunManager:
         )
 
     @staticmethod
-    def _key(repo_root: Path, task_id: str) -> tuple[str, str]:
-        return (str(repo_root.resolve()), task_id)
+    def _repo_key(repo_root: Path) -> object:
+        resolved = repo_root.resolve()
+        try:
+            stat = resolved.stat()
+        except OSError:
+            return str(resolved)
+        return (stat.st_dev, stat.st_ino)
+
+    @staticmethod
+    def _key(repo_root: Path, task_id: str) -> tuple[object, str]:
+        return (BackgroundRunManager._repo_key(repo_root), task_id)
 
     @staticmethod
     def _load_result(path: Path) -> ToolResponse | None:

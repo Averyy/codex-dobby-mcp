@@ -1,0 +1,151 @@
+# codex-dobby-mcp
+
+Local stdio MCP server. Delegates scoped work to Codex CLI, returns structured results + persistent artifacts. Use when you want to offload long analysis, builds, reviews, research, or reverse-engineering without burning context in the parent session.
+
+## Tools
+
+Worker tools (do real work, return a ToolResponse):
+
+- `plan` — read-only. Break a task into a scoped plan. No file edits.
+- `research` — read-only. Investigate code/docs. Uses fetchaller-mcp when available.
+- `brainstorm` — read-only. Evaluate an idea, scope an MVP.
+- `build` — workspace-write. Implement a change + run focused verification.
+- `validate` — workspace-write. Run existing repo validation (build/test/lint). Forbidden from editing source.
+- `review` — read-only. One agent by default; pass `agents=[...]` for multi-agent fan-out.
+- `reverse_engineer` — workspace-write. Binary RE. Uses ghidra-mcp when configured.
+
+Control-plane tools (return immediately unless noted):
+
+- `start_run(tool, ...)` — start any worker tool in the background. Returns `task_id`.
+- `get_run(task_id)` — non-blocking status/result lookup. Recovers from disk if server restarted.
+- `wait_run(task_id | task_ids | neither, timeout_seconds=540)` — blocks until done. See patterns below.
+- `list_runs(repo_root?, limit=10)` — recover task ids after caller timeout.
+
+## Call patterns
+
+Short work (≤ default timeout, and caller `tools/call` ceiling is generous): call the worker tool directly. Simplest.
+
+Long work or short caller ceiling:
+
+1. `start_run(tool="...", prompt="...", ...)` → `task_id`
+2. Then one of:
+   - `wait_run(task_id=...)` — blocks the parent inside the tool call until done. Default 540s, clamp `[1, 100_000s / ~27.8h]`. On timeout returns `state: "running"` + `pending_task_ids`; just re-call.
+   - `get_run(task_id)` — non-blocking peek. Use when the parent should keep doing other work.
+   - On Claude Code: schedule `get_run` polls via `ScheduleWakeup` or `/loop` so the parent is free between checks.
+
+Multiple runs:
+
+- Fan out with several `start_run` calls in parallel (independent tasks only).
+- `wait_run(task_ids=[a, b, c])` returns when the FIRST finishes; response includes `pending_task_ids` for the rest. Re-call with `task_ids=pending_task_ids` until empty.
+- `wait_run()` with no ids waits on every currently-live run for the repo (snapshot at call time; new runs started after don't join).
+- Passing both `task_id` and `task_ids` → rejected. Empty `task_ids` → rejected.
+
+Background tasks are shielded from waiter cancellation. An outer MCP timeout or client disconnect kills the `wait_run` call but NOT the underlying run — re-call or `get_run` to recover.
+
+## Defaults
+
+Per-tool `timeout_seconds`:
+
+| Tool | Default | Sandbox |
+| --- | --- | --- |
+| `plan` | 600 | read-only |
+| `research` | 1200 | read-only |
+| `brainstorm` | 600 | read-only |
+| `review` | 600 (1200 recommended for multi-agent) | read-only |
+| `validate` | 600 | workspace-write |
+| `build` | 1200 | workspace-write |
+| `reverse_engineer` | 1800 | workspace-write |
+
+- Any explicit `timeout_seconds` must be ≥ 300s. Lower → rejected.
+- Default model: `gpt-5.4`. Single-agent `review` uses `gpt-5.4-mini`. Multi-agent review: `gpt-5.4` parent + `gpt-5.4-mini` reviewers.
+- `danger=true` on `build` / `reverse_engineer` escalates to `danger-full-access`.
+
+## Rules
+
+Do:
+
+- One task per call. Multiple unrelated asks → multiple calls (parallel when independent).
+- Always pass a concrete, scoped `prompt` with a clear outcome. Vague prompts get vague results.
+- Err long on `timeout_seconds`. Defaults are fine. Dobby returns as soon as it's ready.
+- Pass `repo_root` if the client doesn't send working-directory metadata.
+- Use `start_run` + `wait_run` / `get_run` for anything over a few minutes.
+
+Don't:
+
+- Don't wrap dobby tools in a general-purpose Agent/Task subagent. Call them directly.
+- Don't lower `timeout_seconds` below the default "to be safe" — a short timeout kills the run.
+- Don't pass `agents` to non-`review` tools — validation error.
+- Don't rely on commits from worker tools. Commits are forbidden; a mutating worker that commits returns `status: "error"`.
+- Don't treat `pending_task_ids` as a queue — it's just "what's still running from your last wait_run call."
+
+## Caller-side ceilings (MCP tools/call timeout)
+
+`wait_run`'s clamp is `[1, 100_000s]`, matching Claude Code's `MCP_TOOL_TIMEOUT` default of 100,000,000 ms (~27.8h). The actual effective ceiling is set by the CALLER's MCP client:
+
+- **Claude Code CLI**: default ~28h via `MCP_TOOL_TIMEOUT` env var. Full clamp usable.
+- **Codex CLI**: default **60s** per `[mcp_servers.<id>].tool_timeout_sec`. Must raise in `~/.codex/config.toml` before long waits land:
+  ```toml
+  [mcp_servers.codex-dobby]
+  command = "uv"
+  args = ["--directory", "/ABSOLUTE/PATH/TO/codex-dobby-mcp", "run", "codex-dobby-mcp"]
+  tool_timeout_sec = 100000
+  ```
+- **Claude Desktop**: hardcoded ~60s, not configurable.
+- **Cursor / Continue / Cline**: vary; check per-server `timeout` field.
+
+If the client chops off a `wait_run`, the run keeps going — recover with `get_run(task_id)` or another `wait_run`.
+
+## Repo root resolution
+
+Order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repo_root`, `repoRoot`, `working_directory`, `workingDirectory`, `cwd`) → server cwd.
+
+If `repo_root` is omitted and the prompt references an absolute path inside a different git worktree, Dobby fails fast. Also fails fast if the prompt names relative files that don't exist under the server cwd. Fix: pass `repo_root` explicitly.
+
+## Artifacts
+
+Every run writes to `<repo_root>/.codex-dobby/runs/<task-id>/`:
+
+- `request.json`, `prompt.txt` — inputs
+- `stdout.log`, `stderr.log`, `last_message.txt` — codex exec output
+- `result.json` — final ToolResponse (atomic replace; placeholder during run)
+- `output-schema.json` — schema used for the run
+- Multi-agent `review` logs are JSONL
+
+Treat `.codex-dobby/` as unredacted local logs. Mutating tools ensure `.codex-dobby/` is in `.gitignore`.
+
+## Return shapes
+
+Worker tools return `ToolResponse` with: `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed`, `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`. `review` adds `review_details`. `reverse_engineer` adds `reverse_engineer_details.ghidra`.
+
+Control-plane tools:
+
+- `start_run` → `AsyncRunHandle` (`task_id`, `tool`, `state`, `summary`, `repo_root`, `artifact_paths`, `model`, `reasoning_effort`).
+- `get_run` / `wait_run` → `RunLookupResponse` (adds `state`, optional `result`, `pending_task_ids`).
+- `list_runs` → `RunListResponse` (recent run summaries).
+
+States (`get_run` / `wait_run`): `running`, `finished`, `unknown`, `not_found`.
+
+`unknown` with `result_state: "placeholder"` → only the startup placeholder was written; no final result persisted.
+
+## Integrations (auto-detected from active Codex MCP config)
+
+- **fetchaller-mcp** — enables web/docs access for `research` and `brainstorm`. Absent → codebase-only.
+- **ghidra-mcp** — enables Ghidra workflow for `reverse_engineer`. Absent → worker told not to call `mcp__ghidra__*`.
+
+If Dobby can't discover the integration, the worker prompt explicitly tells Codex not to call it.
+
+## Safety / failure modes
+
+- `CODEX_DOBBY_ACTIVE=1` is set on child runs. Dobby refuses to launch if already set (no recursive self-calls).
+- Inherited `codex-dobby-mcp` entries in child configs are disabled.
+- Read-only tools mount `extra_roots` read-only. Mutating tools mount them writable via `--add-dir`.
+- Symlinked artifact roots, symlinked `.gitignore` targets, multiply-linked targets, path-traversal `task_id` values → fail closed.
+- Server restart loses live in-memory tracking. Completed runs stay recoverable via `get_run` / `list_runs`.
+
+## Gotchas
+
+- Blocking `review` / `research` etc. still exist; they'll hit the caller's `tools/call` ceiling if it's short. Prefer `start_run` + `wait_run` for anything non-trivial.
+- `wait_run` timeout summaries tell the LLM explicitly to re-call with `pending_task_ids`. Follow that — it's the intended pattern.
+- The multi-wait primitive is first-completed, not all-completed. For "wait until all done," call `wait_run` in a loop with remaining ids until `pending_task_ids` is empty.
+- `wait_run()` with no ids only sees runs started BEFORE the call. New runs don't join.
+- Don't mix dobby model/reasoning overrides with `agents=[...]` unless you know what you're doing; multi-agent review has its own model split.

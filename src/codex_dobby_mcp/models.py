@@ -240,6 +240,7 @@ class RunLookupResponse(BaseModel):
     artifact_paths: dict[str, str] = Field(default_factory=dict)
     result: ToolResponse | None = None
     warnings: list[str] = Field(default_factory=list)
+    pending_task_ids: list[str] = Field(default_factory=list)
 
 
 class RunSummary(BaseModel):
