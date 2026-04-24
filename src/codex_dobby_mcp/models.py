@@ -98,7 +98,7 @@ def parse_review_agents_input(value: object) -> list[ReviewAgent] | None:
     return parsed
 
 
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-5.5"
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_TOOL_TIMEOUT_SECONDS: dict["ToolName", int] = {}  # populated after ToolName definition
 CODEX_DOBBY_DIRNAME = ".codex-dobby"

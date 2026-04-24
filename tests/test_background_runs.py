@@ -30,7 +30,7 @@ def _spec(repo_root: Path, task_id: str) -> ResolvedInvocation:
         request=InvocationRequest(prompt="review it"),
         requested_timeout_seconds=600,
         repo_root=repo_root,
-        model="gpt-5.4-mini",
+        model="gpt-5.5",
         reasoning_effort=ReasoningEffort.HIGH,
         sandbox_roots=[repo_root],
         writable_roots=[repo_root],

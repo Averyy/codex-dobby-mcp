@@ -40,7 +40,7 @@ def test_prompt_loader_expands_includes_and_renders_context() -> None:
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo"), Path("/extra")],
         advisory_read_only_roots=[Path("/ro")],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="high",
     )
 
@@ -72,7 +72,7 @@ def test_review_prompt_renders_selected_agents() -> None:
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="high",
     )
 
@@ -140,7 +140,7 @@ def test_review_prompt_marks_entire_repo_when_files_are_omitted() -> None:
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="medium",
     )
 
@@ -160,7 +160,7 @@ def test_single_agent_review_prompt_uses_direct_lens_mode() -> None:
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="high",
     )
 
@@ -197,7 +197,7 @@ def test_multi_agent_review_prompt_uses_early_soft_deadline_on_short_timeouts() 
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="high",
     )
 
@@ -220,7 +220,7 @@ def test_research_and_brainstorm_prompts_include_external_research_rules() -> No
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="medium",
     )
     brainstorm = loader.render(
@@ -229,7 +229,7 @@ def test_research_and_brainstorm_prompts_include_external_research_rules() -> No
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="high",
     )
 
@@ -260,7 +260,7 @@ def test_short_timeout_read_only_prompts_add_exploration_budget() -> None:
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="medium",
     )
 
@@ -282,7 +282,7 @@ def test_validate_prompt_renders_validation_role() -> None:
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
         advisory_read_only_roots=[],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort="medium",
     )
 

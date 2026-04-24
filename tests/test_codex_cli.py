@@ -45,7 +45,7 @@ def make_spec(tmp_path: Path, tool: ToolName, *, danger: bool = False) -> Resolv
         request=InvocationRequest(prompt="do the thing", danger=danger),
         requested_timeout_seconds=900,
         repo_root=repo_root,
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort=ReasoningEffort.HIGH,
         sandbox_roots=[repo_root, extra_root],
         writable_roots=[repo_root, extra_root],
@@ -325,7 +325,7 @@ def test_review_tool_honors_explicit_parent_model_and_reasoning(tmp_path: Path) 
     spec.request = InvocationRequest(
         prompt="review the diff",
         agents=[ReviewAgent.SECURITY],
-        model="gpt-5.4",
+        model="gpt-5.5",
         reasoning_effort=ReasoningEffort.HIGH,
     )
 

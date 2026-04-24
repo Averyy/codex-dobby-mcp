@@ -57,7 +57,7 @@ Per-tool `timeout_seconds`:
 | `reverse_engineer` | 1800 | workspace-write |
 
 - Any explicit `timeout_seconds` must be ≥ 300s. Lower → rejected.
-- Default model: `gpt-5.4`. Single-agent `review` uses `gpt-5.4-mini`. Multi-agent review: `gpt-5.4` parent + `gpt-5.4-mini` reviewers.
+- Default model: `gpt-5.5` for all tools and review subagents.
 - `danger=true` on `build` / `reverse_engineer` escalates to `danger-full-access`.
 
 ## Rules

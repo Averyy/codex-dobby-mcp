@@ -128,7 +128,7 @@ For clients with a short `tools/call` ceiling (Claude Desktop ~60s, unconfigured
 
 ## Defaults
 
-Default model is `gpt-5.4`, except `review`: single-agent review defaults to `gpt-5.4-mini`, while multi-agent review keeps a `gpt-5.4` parent and injects `gpt-5.4-mini` review subagents. Any explicit `timeout_seconds` must be at least 300s.
+Default model is `gpt-5.5` for all tools and review subagents. Any explicit `timeout_seconds` must be at least 300s.
 
 | Tool | Timeout | Reasoning | Sandbox |
 | --- | --- | --- | --- |
@@ -149,7 +149,7 @@ Default model is `gpt-5.4`, except `review`: single-agent review defaults to `gp
 - Child Codex runs inherit the parent's environment, but Dobby seeds a private per-run `CODEX_HOME` under the system temp directory (`.../codex-dobby/<task-id>/codex-home`) instead of pointing children at the user's global Codex home directly.
 - `research` prefers codebase evidence and uses fetchaller MCP tools when available. If fetchaller is not installed or not configured for the run, the worker is told not to call it and to continue without web MCP support.
 - `validate` runs in workspace-write `--full-auto` because validation often needs temp or cache writes; the worker prompt still forbids source edits and commits.
-- `review` uses a direct single-lens path for one agent, or multi-agent orchestration (via `spawn_agent` over `codex exec --json`) for multiple. Single-agent review defaults to `gpt-5.4-mini` at `medium` reasoning. Multi-agent review uses a `gpt-5.4` parent at `medium` reasoning and injects `gpt-5.4-mini` reviewer subagents, also at `medium` by default.
+- `review` uses a direct single-lens path for one agent, or multi-agent orchestration (via `spawn_agent` over `codex exec --json`) for multiple. Single-agent review defaults to `gpt-5.5` at `medium` reasoning. Multi-agent review uses a `gpt-5.5` parent at `medium` reasoning and injects `gpt-5.5` reviewer subagents, also at `medium` by default.
 - `reverse_engineer` includes a Ghidra MCP workflow only when Ghidra is installed and configured for the run. When Dobby can discover Ghidra from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`), it adds the configured Ghidra MCP helper repo as a writable helper root. When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run. If Ghidra is not installed or not configured, the worker is told not to call `mcp__ghidra__*`.
 - `reverse_engineer` responses include `reverse_engineer_details.ghidra`, which reports whether Ghidra was configured, whether the run used direct MCP calls or the mounted helper fallback, and which Ghidra calls were observed.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.
