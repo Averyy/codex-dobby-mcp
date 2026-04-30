@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ToolName(str, Enum):
@@ -39,6 +39,27 @@ class AsyncRunState(str, Enum):
 class ResultArtifactState(str, Enum):
     PLACEHOLDER = "placeholder"
     FINAL = "final"
+
+
+class StopReason(str, Enum):
+    """Why a Dobby run ended.
+
+    The first five values mirror ACP's `StopReason` enum verbatim. The
+    remaining values are Dobby-specific extensions that surface failure
+    modes ACP doesn't model (codex was killed by the wrapper, hit a sandbox
+    block, etc.). Adopting ACP's vocabulary here means a future ACP bridge
+    can pass these through unchanged for the overlapping cases.
+    """
+
+    END_TURN = "end_turn"
+    MAX_TOKENS = "max_tokens"
+    MAX_TURN_REQUESTS = "max_turn_requests"
+    REFUSAL = "refusal"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+    STALL = "stall"
+    SANDBOX_VIOLATION = "sandbox_violation"
+    ERROR = "error"
 
 
 class Completeness(str, Enum):
@@ -160,6 +181,23 @@ class InvocationRequest(BaseModel):
         return cleaned
 
 
+class FileDiff(BaseModel):
+    """A single file change captured for a Dobby run.
+
+    Field names mirror ACP's `diff` content shape: `path` is absolute, and
+    `old_text`/`new_text` are `None` for new and deleted files respectively.
+    Serialized with camelCase aliases (`oldText`/`newText`) so downstream
+    ACP consumers can pass the payload through unchanged.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    path: str
+    old_text: str | None = Field(default=None, alias="oldText")
+    new_text: str | None = Field(default=None, alias="newText")
+    truncated: bool = False
+
+
 class WorkerResult(BaseModel):
     summary: str = Field(..., min_length=1)
     completeness: Completeness
@@ -167,6 +205,8 @@ class WorkerResult(BaseModel):
     next_steps: list[str]
     files_changed: list[str]
     warnings: list[str]
+    refused: bool = False
+    file_diffs: list[FileDiff] = Field(default_factory=list)
 
 
 class ReviewDetails(BaseModel):
@@ -204,6 +244,7 @@ class ToolResponse(BaseModel):
     important_facts: list[str] = Field(default_factory=list)
     next_steps: list[str] = Field(default_factory=list)
     files_changed: list[str] = Field(default_factory=list)
+    file_diffs: list[FileDiff] = Field(default_factory=list)
     artifact_paths: dict[str, str]
     sandbox_violations: list[str] = Field(default_factory=list)
     repo_root: str
@@ -214,6 +255,7 @@ class ToolResponse(BaseModel):
     model: str
     reasoning_effort: ReasoningEffort
     result_state: ResultArtifactState = ResultArtifactState.FINAL
+    stop_reason: StopReason | None = None
     review_details: ReviewDetails | None = None
     reverse_engineer_details: ReverseEngineerDetails | None = None
 
@@ -237,6 +279,7 @@ class RunLookupResponse(BaseModel):
     tool: ToolName | None = None
     status: RunStatus | None = None
     result_state: ResultArtifactState | None = None
+    stop_reason: StopReason | None = None
     artifact_paths: dict[str, str] = Field(default_factory=dict)
     result: ToolResponse | None = None
     warnings: list[str] = Field(default_factory=list)
@@ -251,6 +294,7 @@ class RunSummary(BaseModel):
     tool: ToolName | None = None
     status: RunStatus | None = None
     result_state: ResultArtifactState | None = None
+    stop_reason: StopReason | None = None
 
 
 class RunListResponse(BaseModel):
@@ -267,6 +311,7 @@ class RunArtifacts(BaseModel):
     last_message_txt: Path
     result_json: Path
     output_schema_json: Path
+    events_jsonl: Path
 
     def as_public_dict(self) -> dict[str, str]:
         return {
@@ -278,6 +323,7 @@ class RunArtifacts(BaseModel):
             "last_message_txt": str(self.last_message_txt),
             "result_json": str(self.result_json),
             "output_schema_json": str(self.output_schema_json),
+            "events_jsonl": str(self.events_jsonl),
         }
 
 

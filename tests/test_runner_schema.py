@@ -103,7 +103,16 @@ def test_worker_schema_file_is_valid_json_schema() -> None:
 
     assert payload["type"] == "object"
     assert payload["additionalProperties"] is False
-    assert payload["required"] == ["summary", "completeness", "important_facts", "next_steps", "files_changed", "warnings"]
+    assert payload["required"] == [
+        "summary",
+        "completeness",
+        "important_facts",
+        "next_steps",
+        "files_changed",
+        "warnings",
+        "refused",
+        "file_diffs",
+    ]
 
 
 def test_default_reasoning_efforts_include_high_build_and_medium_validate() -> None:
@@ -2219,9 +2228,15 @@ async def test_read_only_run_flags_new_dirty_paths(tmp_path: Path) -> None:
     finally:
         monkeypatch.undo()
 
-    assert result.status == RunStatus.ERROR
+    # External worktree changes during a read-only run are NOT a sandbox
+    # violation — codex's OS-level read-only sandbox blocks codex writes,
+    # so anything we observe is the user editing in another terminal or
+    # another process touching files. Surface as warning, do not error.
+    assert result.status == RunStatus.SUCCESS
     assert "notes.txt" in result.files_changed
-    assert "Read-only tool observed worktree changes during the run outside wrapper-managed artifacts" in result.warnings
+    assert any(
+        "External worktree changes observed during the run" in w for w in result.warnings
+    ), result.warnings
 
 
 @pytest.mark.asyncio

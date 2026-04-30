@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -22,6 +23,7 @@ from codex_dobby_mcp.models import (
     RunLookupResponse,
     RunStatus,
     RunSummary,
+    StopReason,
     ToolName,
     ToolResponse,
 )
@@ -30,10 +32,15 @@ from codex_dobby_mcp.review_agents import selected_review_agents
 from codex_dobby_mcp.runner import CodexRunner
 
 
+SubscriberQueue = "asyncio.Queue[tuple[dict, int] | None]"
+WaitRunSink = Callable[[dict, int, str], Awaitable[None]]
+
+
 @dataclass
 class BackgroundRunEntry:
     spec: ResolvedInvocation
     task: asyncio.Task[ToolResponse]
+    subscribers: list["asyncio.Queue"] = field(default_factory=list)
 
 
 class BackgroundRunManager:
@@ -44,11 +51,32 @@ class BackgroundRunManager:
     def start(self, spec: ResolvedInvocation) -> AsyncRunHandle:
         task_id = spec.artifacts.run_dir.name
         key = self._key(spec.repo_root, task_id)
+
+        # Sink resolves the entry from the manager registry at call time,
+        # avoiding the chicken-and-egg between entry, task, and sink. The
+        # task can't run before the synchronous code below registers the
+        # entry under ``key``, so the lookup is always populated when the
+        # sink fires.
+        async def broadcast_sink(event: dict, count: int) -> None:
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            for queue in list(entry.subscribers):
+                try:
+                    queue.put_nowait((event, count))
+                except asyncio.QueueFull:
+                    # Drop on full queue rather than blocking the run; the
+                    # subscriber can fall back to events.jsonl for the missed
+                    # events.
+                    pass
+
         task = asyncio.create_task(
-            self._run_in_background(spec),
+            self._run_in_background(spec, event_sink=broadcast_sink),
             name=f"codex-dobby:{spec.tool.value}:{task_id}",
         )
-        self._entries[key] = BackgroundRunEntry(spec=spec, task=task)
+        entry = BackgroundRunEntry(spec=spec, task=task)
+        self._entries[key] = entry
+        task.add_done_callback(lambda _t, _e=entry: self._notify_subscribers_done(_e))
         return AsyncRunHandle(
             task_id=task_id,
             tool=spec.tool,
@@ -84,6 +112,8 @@ class BackgroundRunManager:
         task_id: str | None,
         task_ids: list[str] | None,
         timeout_seconds: float,
+        *,
+        event_sink: WaitRunSink | None = None,
     ) -> RunLookupResponse:
         if task_id is not None and task_ids is not None:
             raise ValueError("Pass either task_id or task_ids, not both.")
@@ -110,41 +140,71 @@ class BackgroundRunManager:
                 )
 
         if len(ids) == 1:
-            return await self._wait_single(repo_root, ids[0], timeout_seconds)
-        return await self._wait_multi(repo_root, ids, timeout_seconds)
+            return await self._wait_single(repo_root, ids[0], timeout_seconds, event_sink=event_sink)
+        return await self._wait_multi(repo_root, ids, timeout_seconds, event_sink=event_sink)
 
     async def _wait_single(
-        self, repo_root: Path, task_id: str, timeout_seconds: float
+        self,
+        repo_root: Path,
+        task_id: str,
+        timeout_seconds: float,
+        *,
+        event_sink: WaitRunSink | None = None,
     ) -> RunLookupResponse:
         entry = self._entries.get(self._key(repo_root, task_id))
         if entry is None:
             return self._lookup_from_artifacts(repo_root, task_id)
 
-        if not entry.task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(entry.task), timeout=timeout_seconds)
-            except asyncio.TimeoutError:
-                return RunLookupResponse(
-                    task_id=task_id,
-                    state=AsyncRunState.RUNNING,
-                    summary=(
-                        f"{entry.spec.tool.value} run is still active after waiting "
-                        f"{timeout_seconds:.0f}s. Keep calling wait_run with the same task_id "
-                        "until state is finished (the background task is shielded, so nothing "
-                        "is lost by re-calling)."
-                    ),
-                    repo_root=str(repo_root),
-                    tool=entry.spec.tool,
-                    artifact_paths=entry.spec.artifacts.as_public_dict(),
-                    pending_task_ids=[task_id],
-                )
+        forward_task: asyncio.Task | None = None
+        subscriber_queue: asyncio.Queue | None = None
+        if event_sink is not None and not entry.task.done():
+            subscriber_queue = asyncio.Queue(maxsize=1024)
+            entry.subscribers.append(subscriber_queue)
+            forward_task = asyncio.create_task(
+                _forward_events_until_done(subscriber_queue, event_sink, task_id),
+                name=f"codex-dobby-wait-forward:{task_id}",
+            )
 
-        with suppress(asyncio.CancelledError):
-            return self._lookup_from_result(repo_root, entry.spec.tool, entry.task.result())
-        return self._lookup_from_artifacts(repo_root, task_id)
+        try:
+            if not entry.task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(entry.task), timeout=timeout_seconds)
+                except asyncio.TimeoutError:
+                    return RunLookupResponse(
+                        task_id=task_id,
+                        state=AsyncRunState.RUNNING,
+                        summary=(
+                            f"{entry.spec.tool.value} run is still active after waiting "
+                            f"{timeout_seconds:.0f}s. Keep calling wait_run with the same task_id "
+                            "until state is finished (the background task is shielded, so nothing "
+                            "is lost by re-calling)."
+                        ),
+                        repo_root=str(repo_root),
+                        tool=entry.spec.tool,
+                        artifact_paths=entry.spec.artifacts.as_public_dict(),
+                        pending_task_ids=[task_id],
+                    )
+
+            with suppress(asyncio.CancelledError):
+                return self._lookup_from_result(repo_root, entry.spec.tool, entry.task.result())
+            return self._lookup_from_artifacts(repo_root, task_id)
+        finally:
+            if subscriber_queue is not None and entry is not None and subscriber_queue in entry.subscribers:
+                entry.subscribers.remove(subscriber_queue)
+                with suppress(asyncio.QueueFull):
+                    subscriber_queue.put_nowait(None)
+            if forward_task is not None and not forward_task.done():
+                forward_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await forward_task
 
     async def _wait_multi(
-        self, repo_root: Path, task_ids: list[str], timeout_seconds: float
+        self,
+        repo_root: Path,
+        task_ids: list[str],
+        timeout_seconds: float,
+        *,
+        event_sink: WaitRunSink | None = None,
     ) -> RunLookupResponse:
         still_running: dict[str, BackgroundRunEntry] = {}
         for tid in task_ids:
@@ -175,6 +235,20 @@ class BackgroundRunManager:
                 update={"pending_task_ids": [t for t in task_ids if t != tid]}
             )
 
+        forward_tasks: list[asyncio.Task] = []
+        subscriber_queues: list[tuple[BackgroundRunEntry, asyncio.Queue]] = []
+        if event_sink is not None:
+            for tid, run_entry in still_running.items():
+                queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
+                run_entry.subscribers.append(queue)
+                subscriber_queues.append((run_entry, queue))
+                forward_tasks.append(
+                    asyncio.create_task(
+                        _forward_events_until_done(queue, event_sink, tid),
+                        name=f"codex-dobby-wait-forward:{tid}",
+                    )
+                )
+
         shielded = {asyncio.shield(entry.task): tid for tid, entry in still_running.items()}
         try:
             done, _ = await asyncio.wait(
@@ -186,6 +260,16 @@ class BackgroundRunManager:
             for fut in shielded:
                 if not fut.done():
                     fut.cancel()
+            for run_entry, queue in subscriber_queues:
+                if queue in run_entry.subscribers:
+                    run_entry.subscribers.remove(queue)
+                with suppress(asyncio.QueueFull):
+                    queue.put_nowait(None)
+            for forward_task in forward_tasks:
+                if not forward_task.done():
+                    forward_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await forward_task
 
         if done:
             winning_future = next(iter(done))
@@ -250,21 +334,44 @@ class BackgroundRunManager:
                     tool=lookup.tool,
                     status=lookup.status,
                     result_state=lookup.result_state,
+                    stop_reason=lookup.stop_reason,
                 )
             )
         return RunListResponse(repo_root=str(repo_root), runs=runs)
 
-    async def _run_in_background(self, spec: ResolvedInvocation) -> ToolResponse:
+    async def _run_in_background(
+        self,
+        spec: ResolvedInvocation,
+        *,
+        event_sink=None,
+    ) -> ToolResponse:
         try:
-            return await self._runner.run_resolved(spec)
+            return await self._runner.run_resolved(spec, event_sink=event_sink)
         except asyncio.CancelledError:
-            response = self._background_failure_response(spec, "Background run was cancelled before completion.")
-            write_json(spec.artifacts.result_json, response.model_dump(mode="json"))
+            response = self._background_failure_response(
+                spec,
+                "Background run was cancelled before completion.",
+                stop_reason=StopReason.CANCELLED,
+            )
+            write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
             return response
         except Exception as exc:
-            response = self._background_failure_response(spec, f"Background run failed: {exc}")
-            write_json(spec.artifacts.result_json, response.model_dump(mode="json"))
+            response = self._background_failure_response(
+                spec,
+                f"Background run failed: {exc}",
+                stop_reason=StopReason.ERROR,
+            )
+            write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
             return response
+
+    @staticmethod
+    def _notify_subscribers_done(entry: BackgroundRunEntry) -> None:
+        for queue in list(entry.subscribers):
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+        entry.subscribers.clear()
 
     def _lookup_from_artifacts(self, repo_root: Path, task_id: str) -> RunLookupResponse:
         try:
@@ -319,12 +426,19 @@ class BackgroundRunManager:
             tool=tool,
             status=result.status,
             result_state=result.result_state,
+            stop_reason=result.stop_reason,
             artifact_paths=result.artifact_paths,
             result=result,
             warnings=list(result.warnings),
         )
 
-    def _background_failure_response(self, spec: ResolvedInvocation, summary: str) -> ToolResponse:
+    def _background_failure_response(
+        self,
+        spec: ResolvedInvocation,
+        summary: str,
+        *,
+        stop_reason: StopReason = StopReason.ERROR,
+    ) -> ToolResponse:
         return ToolResponse(
             task_id=spec.artifacts.run_dir.name,
             tool=spec.tool,
@@ -341,6 +455,7 @@ class BackgroundRunManager:
             raw_output_available=False,
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
+            stop_reason=stop_reason,
             review_details=_review_details_for_spec(spec),
             reverse_engineer_details=_reverse_engineer_details_for_background_failure(spec),
         )
@@ -381,6 +496,31 @@ class BackgroundRunManager:
         with suppress(ValueError):
             return ToolName(raw_tool)
         return None
+
+
+async def _forward_events_until_done(
+    queue: "asyncio.Queue",
+    sink: WaitRunSink,
+    task_id: str,
+) -> None:
+    """Pull (event, count) tuples off ``queue`` and forward them to ``sink``.
+
+    Stops when a ``None`` sentinel arrives (run finished or wait_run unsubscribed)
+    or the surrounding task is cancelled. Sink errors are swallowed so a
+    flaky client cannot kill the forwarder mid-run.
+    """
+    try:
+        while True:
+            payload = await queue.get()
+            if payload is None:
+                return
+            event, count = payload
+            try:
+                await sink(event, count, task_id)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        return
 
 
 def _review_details_for_spec(spec: ResolvedInvocation) -> ReviewDetails | None:

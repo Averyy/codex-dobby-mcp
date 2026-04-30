@@ -67,7 +67,7 @@ async def test_background_run_manager_returns_finished_result_for_live_entry(tmp
     spec = _spec(repo_root, "live-task")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             return _result(resolved, summary="live result")
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -94,7 +94,7 @@ def test_background_run_manager_can_recover_result_from_artifacts(tmp_path: Path
     write_json(spec.artifacts.result_json, result.model_dump(mode="json"))
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -116,7 +116,7 @@ def test_background_run_manager_treats_placeholder_result_as_unknown(tmp_path: P
     write_json(spec.artifacts.result_json, placeholder.model_dump(mode="json"))
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -136,7 +136,7 @@ async def test_background_run_manager_wait_returns_finished_result(tmp_path: Pat
     spec = _spec(repo_root, "wait-finish")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(0.05)
             return _result(resolved, summary="waited result")
 
@@ -159,7 +159,7 @@ async def test_background_run_manager_wait_returns_running_on_timeout(tmp_path: 
     spec = _spec(repo_root, "wait-timeout")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(5)
             return _result(resolved)
 
@@ -188,7 +188,7 @@ async def test_background_run_manager_wait_finds_entry_on_case_insensitive_fs(tm
     spec = _spec(repo_root, "case-mismatch")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(0.05)
             return _result(resolved, summary="case-insensitive waited")
 
@@ -212,7 +212,7 @@ async def test_background_run_manager_wait_falls_back_to_artifacts(tmp_path: Pat
     write_json(spec.artifacts.result_json, _result(spec, summary="on disk").model_dump(mode="json"))
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -233,7 +233,7 @@ async def test_background_run_manager_wait_multi_returns_first_to_finish(tmp_pat
     slow = _spec(repo_root, "slow")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             delay = 0.02 if resolved.artifacts.run_dir.name == "fast" else 5.0
             await asyncio.sleep(delay)
             return _result(resolved, summary=resolved.artifacts.run_dir.name)
@@ -260,7 +260,7 @@ async def test_background_run_manager_wait_multi_timeout_reports_all_pending(tmp
     b = _spec(repo_root, "beta")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(5)
             return _result(resolved)
 
@@ -287,7 +287,7 @@ async def test_background_run_manager_wait_all_live_defaults_to_running_runs(tmp
     slow = _spec(repo_root, "only-slow")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             delay = 0.02 if "fast" in resolved.artifacts.run_dir.name else 5.0
             await asyncio.sleep(delay)
             return _result(resolved, summary=resolved.artifacts.run_dir.name)
@@ -310,7 +310,7 @@ async def test_background_run_manager_wait_all_live_returns_not_found_when_empty
     repo_root.mkdir()
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -328,7 +328,7 @@ async def test_background_run_manager_wait_multi_skips_stale_ids_for_live_finish
     live = _spec(repo_root, "live-fast")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(0.02)
             return _result(resolved, summary="finished live")
 
@@ -358,7 +358,7 @@ async def test_background_run_manager_wait_multi_stale_with_artifact_wins_over_l
     live = _spec(repo_root, "live-slow")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(5)
             return _result(resolved)
 
@@ -388,7 +388,7 @@ async def test_background_run_manager_wait_multi_timeout_excludes_stale_from_pen
     live_a = _spec(repo_root, "live-a")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(5)
             return _result(resolved)
 
@@ -412,7 +412,7 @@ async def test_background_run_manager_wait_multi_all_stale_returns_first_artifac
     repo_root.mkdir()
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -432,7 +432,7 @@ async def test_background_run_manager_wait_dedupes_repeated_task_ids(tmp_path: P
     spec = _spec(repo_root, "dup-task")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(0.02)
             return _result(resolved, summary="dup-result")
 
@@ -456,7 +456,7 @@ async def test_background_run_manager_wait_survives_waiter_cancellation(tmp_path
     spec = _spec(repo_root, "shielded")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(0.2)
             return _result(resolved, summary="survived")
 
@@ -487,7 +487,7 @@ async def test_background_run_manager_wait_multi_survives_waiter_cancellation(tm
     b = _spec(repo_root, "multi-b")
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
             await asyncio.sleep(0.2)
             return _result(resolved, summary=resolved.artifacts.run_dir.name)
 
@@ -519,7 +519,7 @@ async def test_background_run_manager_wait_rejects_conflicting_inputs(tmp_path: 
     repo_root.mkdir()
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -536,7 +536,7 @@ def test_background_run_manager_treats_traversal_task_id_as_not_found(tmp_path: 
     outside.mkdir()
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -558,7 +558,7 @@ def test_background_run_manager_ignores_symlinked_runs_root_when_listing(tmp_pat
     (artifacts_root / "runs").symlink_to(outside, target_is_directory=True)
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
@@ -577,7 +577,7 @@ def test_background_run_manager_lists_recent_runs(tmp_path: Path) -> None:
     write_json(second.artifacts.result_json, _result(second, summary="second").model_dump(mode="json"))
 
     class FakeRunner:
-        async def run_resolved(self, resolved: ResolvedInvocation) -> ToolResponse:  # pragma: no cover
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:  # pragma: no cover
             return _result(resolved)
 
     manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]

@@ -58,7 +58,13 @@ def build_codex_command(
         if review_agents_root is None:
             raise RuntimeError("Review runs require an explicit review agents root")
         argv.extend(_review_agent_overrides(spec, review_agents_root))
-        argv.append("--json")
+
+    # Always emit JSONL events on stdout. The structured worker output still
+    # lands in last_message.txt via --output-last-message; --json layers
+    # streaming events on top so Dobby can map them to ACP-shaped progress
+    # notifications and a durable events.jsonl artifact. Multi-agent review
+    # already runs in --json mode for orchestration.
+    argv.append("--json")
 
     if spec.tool in READ_ONLY_TOOLS:
         argv.extend(["-s", "read-only"])
@@ -68,7 +74,7 @@ def build_codex_command(
             argv=argv + ["-"],
             uses_full_auto=False,
             sandbox_mode="read-only",
-            emits_json_events=review_uses_json_orchestrator,
+            emits_json_events=True,
         )
 
     if spec.request.danger:
@@ -91,7 +97,7 @@ def build_codex_command(
         argv=argv + ["-"],
         uses_full_auto=uses_full_auto,
         sandbox_mode=sandbox_mode,
-        emits_json_events=False,
+        emits_json_events=True,
     )
 
 

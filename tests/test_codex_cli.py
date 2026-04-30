@@ -32,6 +32,7 @@ def make_artifacts(tmp_path: Path) -> RunArtifacts:
         last_message_txt=run_dir / "last_message.txt",
         result_json=run_dir / "result.json",
         output_schema_json=run_dir / "output-schema.json",
+        events_jsonl=run_dir / "events.jsonl",
     )
 
 
@@ -66,7 +67,7 @@ def test_read_only_tool_maps_to_read_only_sandbox(tmp_path: Path) -> None:
 
     assert command.sandbox_mode == "read-only"
     assert command.uses_full_auto is False
-    assert command.emits_json_events is False
+    assert command.emits_json_events is True
     assert "--full-auto" not in command.argv
     assert ["-s", "read-only"] == command.argv[command.argv.index("-s") : command.argv.index("-s") + 2]
     add_dirs = [Path(command.argv[index + 1]) for index, value in enumerate(command.argv) if value == "--add-dir"]
@@ -124,7 +125,7 @@ def test_build_tool_maps_to_full_auto_and_extra_roots(tmp_path: Path) -> None:
 
     assert command.sandbox_mode == "workspace-write"
     assert command.uses_full_auto is True
-    assert command.emits_json_events is False
+    assert command.emits_json_events is True
     assert "--full-auto" in command.argv
     assert "--add-dir" in command.argv
     assert "approval_policy=\"never\"" in command.argv
@@ -142,7 +143,7 @@ def test_danger_mode_maps_to_danger_full_access(tmp_path: Path) -> None:
 
     assert command.sandbox_mode == "danger-full-access"
     assert command.uses_full_auto is False
-    assert command.emits_json_events is False
+    assert command.emits_json_events is True
     assert "--full-auto" not in command.argv
     assert ["-s", "danger-full-access"] == command.argv[command.argv.index("-s") : command.argv.index("-s") + 2]
 
@@ -297,8 +298,8 @@ def test_single_agent_review_runs_without_multi_agent_overrides(tmp_path: Path) 
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
     assert command.sandbox_mode == "read-only"
-    assert command.emits_json_events is False
-    assert "--json" not in command.argv
+    assert command.emits_json_events is True
+    assert "--json" in command.argv
     assert "features.multi_agent=true" not in config_values
     assert not any("agents.dobby_review_correctness.config_file=" in value for value in config_values)
 
@@ -315,8 +316,8 @@ def test_review_tool_default_single_generalist_is_not_orchestrated(tmp_path: Pat
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
     assert command.sandbox_mode == "read-only"
-    assert command.emits_json_events is False
-    assert "--json" not in command.argv
+    assert command.emits_json_events is True
+    assert "--json" in command.argv
     assert "features.multi_agent=true" not in config_values
 
 

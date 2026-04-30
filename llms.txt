@@ -106,16 +106,28 @@ If `repo_root` is omitted and the prompt references an absolute path inside a di
 Every run writes to `<repo_root>/.codex-dobby/runs/<task-id>/`:
 
 - `request.json`, `prompt.txt` — inputs
-- `stdout.log`, `stderr.log`, `last_message.txt` — codex exec output
+- `stdout.log`, `stderr.log`, `last_message.txt` — codex exec output (stdout is JSONL since codex always runs with `--json`)
 - `result.json` — final ToolResponse (atomic replace; placeholder during run)
+- `events.jsonl` — durable ACP-shaped progress event stream (one event per line)
 - `output-schema.json` — schema used for the run
-- Multi-agent `review` logs are JSONL
 
 Treat `.codex-dobby/` as unredacted local logs. Mutating tools ensure `.codex-dobby/` is in `.gitignore`.
 
+## Streaming progress
+
+When the MCP caller includes a `progressToken` in the `tools/call` `_meta`, every Dobby run forwards live ACP-shaped events as `notifications/progress`. The structured event lives in the notification's `_meta.acpEvent`; the numeric `progress` field is an event counter; `message` is a short human label. No token = no notifications, run continues normally.
+
+Events use ACP's `session/update` payload shapes: `agent_message_chunk`, `tool_call` / `tool_call_update` (`kind` ∈ `read|edit|delete|move|search|execute|think|fetch|other`), `plan`. Mapping from codex `--json` events lives in `src/codex_dobby_mcp/events.py`.
+
+`wait_run` forwards live events from the run it's blocking on (single id) or all live runs (multi/all-live mode). Each forwarded event is tagged with `_meta.taskId`. Pre-subscription events are not replayed — read `events.jsonl` for the full history.
+
 ## Return shapes
 
-Worker tools return `ToolResponse` with: `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed`, `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`. `review` adds `review_details`. `reverse_engineer` adds `reverse_engineer_details.ghidra`.
+Worker tools return `ToolResponse` with: `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed`, `file_diffs`, `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`, `stop_reason`. `review` adds `review_details`. `reverse_engineer` adds `reverse_engineer_details.ghidra`.
+
+`stop_reason` (ACP-borrowed enum + Dobby extensions): `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`, `timeout`, `stall`, `sandbox_violation`, `error`.
+
+`file_diffs[i]` for mutating tools: `{path, oldText, newText, truncated}` per changed file. ACP camelCase on the wire, in `result.json`, and in `events.jsonl` (Pydantic uses snake_case internally + alias-based serialization with `by_alias=True`). `oldText=null` for new files, `newText=null` for deleted files, `truncated=true` for files >2 MB or binary. Read-only tools always return `file_diffs: []`.
 
 Control-plane tools:
 
@@ -139,6 +151,7 @@ If Dobby can't discover the integration, the worker prompt explicitly tells Code
 - `CODEX_DOBBY_ACTIVE=1` is set on child runs. Dobby refuses to launch if already set (no recursive self-calls).
 - Inherited `codex-dobby-mcp` entries in child configs are disabled.
 - Read-only tools mount `extra_roots` read-only. Mutating tools mount them writable via `--add-dir`.
+- External worktree mutations during a read-only run (user editing in another terminal, parallel processes) are warning-only — codex's OS-level read-only sandbox blocks codex itself from writing, so wrapper-detected changes are by definition external. Run stays SUCCESS / `stop_reason: end_turn`. Only escalates to `stop_reason: sandbox_violation` when the worker self-reports modifying files the wrapper also observed.
 - Symlinked artifact roots, symlinked `.gitignore` targets, multiply-linked targets, path-traversal `task_id` values → fail closed.
 - Server restart loses live in-memory tracking. Completed runs stay recoverable via `get_run` / `list_runs`.
 

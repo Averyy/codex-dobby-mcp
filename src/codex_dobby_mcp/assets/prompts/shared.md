@@ -50,13 +50,15 @@ Extra context from Claude:
 Task:
 {task_prompt}
 
-Return a JSON object with exactly these fields:
+Return a JSON object with exactly these fields (all are required):
 - `summary`: string
 - `completeness`: one of `full`, `partial`, or `blocked`
 - `important_facts`: array of short strings
 - `next_steps`: array of short strings; use `[]` when none
 - `files_changed`: array of paths you changed or created; use `[]` when none
 - `warnings`: array of short strings; use `[]` when none
+- `refused`: boolean. Set to `true` ONLY when you are explicitly refusing to do the requested work — out of scope, policy block, or required permissions you do not have. Otherwise set to `false`. Do not use this for ordinary failures or partial completion; use `completeness: "blocked"` for those instead.
+- `file_diffs`: array. Use `[]` unless you specifically need to supply a diff the wrapper cannot reconstruct from the filesystem (e.g. you stashed a copy of a very large file before editing it). When non-empty, each item must be an object with all four fields: `path` (string), `oldText` (string or null — null for new files), `newText` (string or null — null for deleted files), `truncated` (boolean).
 
 Keep the summary concise and high signal. Do not add extra keys.
 Use `important_facts` for findings or evidence, and `next_steps` for concrete follow-up actions.

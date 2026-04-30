@@ -33,6 +33,37 @@
       "items": {
         "type": "string"
       }
+    },
+    "refused": {
+      "type": "boolean",
+      "description": "Set to true ONLY when you are explicitly refusing to do the requested work (out of scope, policy block, missing required permissions). Set false for ordinary failures or partial completion (use completeness=blocked for those)."
+    },
+    "file_diffs": {
+      "type": "array",
+      "description": "Per-file pre/post snippets for files you modified. Use [] when you did not modify any files or when the wrapper can capture diffs from the filesystem unaided.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute or repo-relative path of the modified file."
+          },
+          "oldText": {
+            "type": ["string", "null"],
+            "description": "Pre-run contents, or null for newly created files."
+          },
+          "newText": {
+            "type": ["string", "null"],
+            "description": "Post-run contents, or null for deleted files."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the file is too large or binary to faithfully represent."
+          }
+        },
+        "required": ["path", "oldText", "newText", "truncated"]
+      }
     }
   },
   "required": [
@@ -41,6 +72,8 @@
     "important_facts",
     "next_steps",
     "files_changed",
-    "warnings"
+    "warnings",
+    "refused",
+    "file_diffs"
   ]
 }

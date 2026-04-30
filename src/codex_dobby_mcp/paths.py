@@ -364,6 +364,7 @@ def run_artifacts_for_task(repo_root: Path, task_id: str) -> RunArtifacts:
         last_message_txt=run_dir / "last_message.txt",
         result_json=run_dir / "result.json",
         output_schema_json=run_dir / "output-schema.json",
+        events_jsonl=run_dir / "events.jsonl",
     )
 
 

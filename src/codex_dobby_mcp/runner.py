@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 import hashlib
@@ -18,12 +18,14 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from codex_dobby_mcp.codex_cli import build_codex_command
+from codex_dobby_mcp.events import map_codex_chunk
 from codex_dobby_mcp.gitignore import ensure_codex_dobby_ignored
 from codex_dobby_mcp.logging_utils import get_logger
 from codex_dobby_mcp.models import (
     Completeness,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORTS,
+    FileDiff,
     GhidraDetails,
     GhidraUsageMode,
     InvocationRequest,
@@ -38,6 +40,7 @@ from codex_dobby_mcp.models import (
     RunStatus,
     ReasoningEffort,
     ReviewAgent,
+    StopReason,
     ToolName,
     ToolResponse,
     WorkerResult,
@@ -96,6 +99,9 @@ _GHIDRA_STARTUP_ONLY_CALLS = frozenset(
         "check_tools",
     }
 )
+
+_FILE_DIFF_MAX_BYTES = 2 * 1024 * 1024  # per-file content cap for diff capture
+_FILE_DIFF_BINARY_SCAN_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -231,11 +237,22 @@ class CodexRunner:
         ensure_not_recursive()
         return self._resolve(tool, request)
 
-    async def run(self, tool: ToolName, request: InvocationRequest) -> ToolResponse:
+    async def run(
+        self,
+        tool: ToolName,
+        request: InvocationRequest,
+        *,
+        event_sink: EventSink | None = None,
+    ) -> ToolResponse:
         spec = self.prepare(tool, request)
-        return await self.run_resolved(spec)
+        return await self.run_resolved(spec, event_sink=event_sink)
 
-    async def run_resolved(self, spec: ResolvedInvocation) -> ToolResponse:
+    async def run_resolved(
+        self,
+        spec: ResolvedInvocation,
+        *,
+        event_sink: EventSink | None = None,
+    ) -> ToolResponse:
         started = time.monotonic()
         deadline = started + spec.request.timeout_seconds
         use_metadata_fingerprints = _snapshot_uses_metadata(spec.tool)
@@ -250,7 +267,7 @@ class CodexRunner:
             child_runtime = _prepare_child_runtime(spec.artifacts)
         except RunnerError as exc:
             preflight_response = self._preflight_response(spec, started, str(exc))
-            write_json(spec.artifacts.result_json, preflight_response.model_dump(mode="json"))
+            write_json(spec.artifacts.result_json, preflight_response.model_dump(mode="json", by_alias=True))
             return preflight_response
 
         try:
@@ -260,6 +277,7 @@ class CodexRunner:
                 deadline,
                 use_metadata_fingerprints,
                 child_runtime,
+                event_sink=event_sink,
             )
         finally:
             _cleanup_private_child_runtime(child_runtime.private_root, self.logger)
@@ -271,6 +289,8 @@ class CodexRunner:
         deadline: float,
         use_metadata_fingerprints: bool,
         child_runtime: ChildRuntimeContext,
+        *,
+        event_sink: EventSink | None = None,
     ) -> ToolResponse:
         tool = spec.tool
         request = spec.request
@@ -283,6 +303,18 @@ class CodexRunner:
             )
         except asyncio.TimeoutError:
             return self._timeout_response(spec, started, request.timeout_seconds)
+
+        # Reading file contents is blocking I/O. With many dirty files at
+        # baseline this could hold the event loop long enough to delay
+        # streaming events for OTHER concurrent runs, so push the work to
+        # a thread.
+        baseline_dirty_contents = (
+            await asyncio.to_thread(
+                _capture_pre_run_contents, spec.repo_root, baseline.dirty_files
+            )
+            if tool in MUTATING_TOOLS
+            else {}
+        )
 
         prompt_text = self.prompts.render(
             tool=tool,
@@ -326,6 +358,8 @@ class CodexRunner:
                 spec.artifacts.stderr_log,
                 remaining,
                 stall_threshold_seconds=_stall_threshold_for_effort(spec.reasoning_effort),
+                events_jsonl=spec.artifacts.events_jsonl,
+                event_sink=event_sink,
             )
         except FileNotFoundError as exc:
             raise RunnerError(f"Codex executable not found: {self.codex_binary}") from exc
@@ -419,6 +453,7 @@ class CodexRunner:
         files_changed = detected_files
 
         status = RunStatus.SUCCESS
+        stop_reason: StopReason | None = None
         warnings = list(worker_result.warnings if worker_result else [])
         error_reasons: list[str] = []
         sandbox_violations = _collect_sandbox_violations(stderr, stdout)
@@ -464,15 +499,18 @@ class CodexRunner:
             )
             warnings.append(stall_warning)
             status = RunStatus.ERROR
+            stop_reason = StopReason.STALL
             error_reasons.append(stall_warning)
         elif timeout_hit:
             timeout_warning = _timeout_warning(spec)
             warnings.append(timeout_warning)
+            stop_reason = StopReason.TIMEOUT
             if not timeout_with_usable_review:
                 status = RunStatus.ERROR
                 error_reasons.append(timeout_warning)
         elif exit_code != 0 and not recovered_partial_review:
             status = RunStatus.ERROR
+            stop_reason = StopReason.ERROR
         if codex_home_issue is not None:
             warnings.append(codex_home_issue)
             if exit_code not in (0, None) and not stall_hit and not timeout_hit:
@@ -481,6 +519,8 @@ class CodexRunner:
             status = RunStatus.ERROR
             warnings.append(worker_result_error)
             error_reasons.append(worker_result_error)
+            if stop_reason is None:
+                stop_reason = StopReason.ERROR
 
         recoverable_orchestration_only = False
         if review_diagnostics is not None:
@@ -497,25 +537,68 @@ class CodexRunner:
                     error_reasons.append(review_diagnostics.failure_summary())
 
         if tool in READ_ONLY_TOOLS and detected_files:
-            status = RunStatus.ERROR
-            read_only_warning = (
-                "Read-only tool observed worktree changes during the run "
-                "outside wrapper-managed artifacts"
-            )
-            warnings.append(read_only_warning)
-            error_reasons.append(read_only_warning)
+            # The wrapper-detected diff combines (a) anything codex actually
+            # wrote and (b) anything the user/another process changed in the
+            # repo while codex was running. Codex's OS-level read-only
+            # sandbox blocks (a) — Seatbelt on macOS, Landlock on Linux — so
+            # in practice (a) is rare and (b) happens any time the user is
+            # editing the repo from another terminal during a long research
+            # run. Treat those cases differently:
+            #   * Worker self-reported the same files → codex (or its
+            #     worker prompt) tried to bypass read-only. Real sandbox
+            #     violation, escalate to ERROR.
+            #   * Worker reported nothing for those paths → external
+            #     mutation. Surface as warning, do not error.
+            worker_attributable = [path for path in detected_files if path in reported_files]
+            if worker_attributable:
+                status = RunStatus.ERROR
+                worker_violation_warning = (
+                    "Read-only tool reported worktree changes the wrapper "
+                    "also observed: " + ", ".join(worker_attributable)
+                )
+                warnings.append(worker_violation_warning)
+                error_reasons.append(worker_violation_warning)
+                if stop_reason is None:
+                    stop_reason = StopReason.SANDBOX_VIOLATION
+            else:
+                external_preview = ", ".join(detected_files[:10])
+                overflow = (
+                    f" (+{len(detected_files) - 10} more)"
+                    if len(detected_files) > 10
+                    else ""
+                )
+                warnings.append(
+                    "External worktree changes observed during the run "
+                    "(not attributable to codex; codex's read-only sandbox "
+                    f"blocks writes). Affected paths: {external_preview}{overflow}"
+                )
         if tool in MUTATING_TOOLS and post_run_snapshot_incomplete:
             status = RunStatus.ERROR
             verification_warning = "Post-run repo snapshot timed out; mutating tool results could not be fully verified"
             warnings.append(verification_warning)
             error_reasons.append(verification_warning)
+            if stop_reason is None:
+                stop_reason = StopReason.ERROR
         if tool in MUTATING_TOOLS and current_head is not None and current_head != baseline.head_commit:
             status = RunStatus.ERROR
             commit_warning = "Mutating tool changed git history or references, which Dobby does not allow"
             warnings.append(commit_warning)
             error_reasons.append(commit_warning)
+            if stop_reason is None:
+                stop_reason = StopReason.SANDBOX_VIOLATION
         if tool in READ_ONLY_TOOLS and spec.gitignore_updated:
             warnings.append("Wrapper updated .gitignore to add .codex-dobby/ before running")
+        if stop_reason is None:
+            # Defaults applied last: any ERROR path that didn't pick a more
+            # specific reason (e.g. review orchestration warnings flipping
+            # status) lands on ERROR. Successful runs land on END_TURN unless
+            # the worker explicitly set ``refused: true``.
+            if status == RunStatus.ERROR:
+                stop_reason = StopReason.ERROR
+            elif worker_result is not None and worker_result.refused:
+                stop_reason = StopReason.REFUSAL
+            else:
+                stop_reason = StopReason.END_TURN
 
         summary = self._resolve_summary(
             worker_result,
@@ -538,6 +621,19 @@ class CodexRunner:
         important_facts = worker_result.important_facts if worker_result else []
         next_steps = worker_result.next_steps if worker_result else []
 
+        # Diff reconstruction shells out to ``git show`` and reads files
+        # off disk, so move it to a thread for the same reason as the
+        # baseline content capture above.
+        file_diffs = await asyncio.to_thread(
+            _file_diffs_for_run,
+            tool=tool,
+            repo_root=spec.repo_root,
+            files_changed=files_changed,
+            baseline_head=baseline.head_commit,
+            baseline_dirty_contents=baseline_dirty_contents,
+            worker_result=worker_result,
+        )
+
         response = ToolResponse(
             task_id=spec.artifacts.run_dir.name,
             tool=tool,
@@ -547,6 +643,7 @@ class CodexRunner:
             important_facts=important_facts,
             next_steps=next_steps,
             files_changed=files_changed,
+            file_diffs=file_diffs,
             artifact_paths=spec.artifacts.as_public_dict(),
             sandbox_violations=sandbox_violations,
             repo_root=str(spec.repo_root),
@@ -556,10 +653,11 @@ class CodexRunner:
             raw_output_available=True,
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
+            stop_reason=stop_reason,
             review_details=_review_details_for_spec(spec),
             reverse_engineer_details=_reverse_engineer_details_for_run(spec, stdout=stdout, stderr=stderr),
         )
-        write_json(spec.artifacts.result_json, response.model_dump(mode="json"))
+        write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
         return response
 
     @staticmethod
@@ -586,6 +684,7 @@ class CodexRunner:
             raw_output_available=False,
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
+            stop_reason=StopReason.ERROR,
             review_details=_review_details_for_spec(spec),
             reverse_engineer_details=_reverse_engineer_failure_details(spec, prelaunch_failure=True),
         )
@@ -616,10 +715,11 @@ class CodexRunner:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             result_state=ResultArtifactState.PLACEHOLDER,
+            stop_reason=StopReason.CANCELLED,
             review_details=_review_details_for_spec(spec),
             reverse_engineer_details=_reverse_engineer_failure_details(spec),
         )
-        write_json(spec.artifacts.result_json, stub.model_dump(mode="json"))
+        write_json(spec.artifacts.result_json, stub.model_dump(mode="json", by_alias=True))
 
     @staticmethod
     def _timeout_response(spec: ResolvedInvocation, started: float, timeout_seconds: int) -> ToolResponse:
@@ -642,10 +742,11 @@ class CodexRunner:
             raw_output_available=False,
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
+            stop_reason=StopReason.TIMEOUT,
             review_details=_review_details_for_spec(spec),
             reverse_engineer_details=_reverse_engineer_failure_details(spec),
         )
-        write_json(spec.artifacts.result_json, response.model_dump(mode="json"))
+        write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
         return response
 
     def _resolve(self, tool: ToolName, request: InvocationRequest) -> ResolvedInvocation:
@@ -844,6 +945,14 @@ class CodexRunner:
             return error_reasons[0]
         if worker_result and worker_result.summary.strip():
             return worker_result.summary.strip()
+        # Codex emits API failures (e.g. invalid response_format) as
+        # ``{"type":"error",...}`` / ``{"type":"turn.failed",...}`` events on
+        # stdout. Surface them before falling back to the (often noisy)
+        # stderr trace, otherwise the user sees the TRACE preamble instead
+        # of the actual model API error.
+        codex_error = _first_codex_stdout_error(stdout)
+        if codex_error:
+            return codex_error
         if timeout_hit:
             return "Codex run timed out before returning structured output"
         if worker_result_error:
@@ -1588,8 +1697,53 @@ def _first_meaningful_output_line(text: str) -> str | None:
         except json.JSONDecodeError:
             return stripped
         if isinstance(payload, dict) and payload.get("type"):
+            # Codex --json wraps API errors in events. Surface them so the
+            # final ToolResponse summary doesn't bury the actual reason in
+            # the events.jsonl artifact while showing only stderr trace
+            # noise to the caller.
+            payload_type = payload.get("type")
+            if payload_type in ("error", "turn.failed"):
+                extracted = _extract_codex_error_message(payload)
+                if extracted:
+                    return extracted
             continue
         return stripped
+    return None
+
+
+def _extract_codex_error_message(payload: dict) -> str | None:
+    candidate = payload.get("message")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    error_obj = payload.get("error")
+    if isinstance(error_obj, dict):
+        for key in ("message", "summary"):
+            value = error_obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    elif isinstance(error_obj, str) and error_obj.strip():
+        return error_obj.strip()
+    return None
+
+
+def _first_codex_stdout_error(stdout: str) -> str | None:
+    """Find the first codex top-level error event in JSONL stdout."""
+    if not stdout:
+        return None
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") in ("error", "turn.failed"):
+            extracted = _extract_codex_error_message(payload)
+            if extracted:
+                return extracted
     return None
 
 
@@ -1757,7 +1911,7 @@ def _write_salvage_last_message(artifacts: RunArtifacts, worker_result: WorkerRe
     if path.exists() and path.read_bytes().strip():
         return
     try:
-        payload = worker_result.model_dump(mode="json")
+        payload = worker_result.model_dump(mode="json", by_alias=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
     except OSError:
         return
@@ -2212,6 +2366,87 @@ class _StreamActivityTracker:
         self.last_activity = time.monotonic()
 
 
+EventSink = Callable[[dict, int], Awaitable[None]]
+
+
+class _EventEmitter:
+    """Funnel codex stdout chunks into ACP-shaped events.
+
+    For each chunk written to the codex stdout log, this also parses any
+    complete JSONL events, maps them to ACP-shaped payloads, appends them to
+    ``events.jsonl``, and forwards each one to an optional async sink (used
+    for live MCP progress notifications). Sink errors are swallowed —
+    streaming is best-effort and must never break the run.
+    """
+
+    def __init__(self, events_jsonl: Path, sink: EventSink | None) -> None:
+        self.events_jsonl = events_jsonl
+        self.sink = sink
+        self._carryover = b""
+        self._handle: BinaryIO | None = None
+        self._count = 0
+
+    def __enter__(self) -> "_EventEmitter":
+        # Truncate / create. ``ab`` would append on retried runs, but the run
+        # directory is freshly created per task_id so a fresh write is correct.
+        self._handle = self.events_jsonl.open("wb")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._handle is not None:
+            try:
+                self._handle.flush()
+            except OSError:
+                pass
+            self._handle.close()
+            self._handle = None
+
+    @property
+    def event_count(self) -> int:
+        return self._count
+
+    async def feed(self, chunk: bytes) -> None:
+        events, self._carryover = map_codex_chunk(chunk, carryover=self._carryover)
+        if not events:
+            return
+        for event in events:
+            self._count += 1
+            line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+            if self._handle is not None:
+                try:
+                    self._handle.write(line)
+                    self._handle.flush()
+                except OSError:
+                    # If the log file is gone we keep the in-memory pipeline
+                    # going; the durable artifact is best-effort too.
+                    pass
+            if self.sink is not None:
+                try:
+                    await self.sink(event, self._count)
+                except Exception:
+                    # Sink failure (e.g. client disconnected) must not abort
+                    # the underlying codex run.
+                    pass
+
+    def feed_sync(self, chunk: bytes) -> list[dict]:
+        """Variant for the non-streaming path: returns mapped events instead
+        of awaiting the sink. Caller is responsible for forwarding them.
+        """
+        events, self._carryover = map_codex_chunk(chunk, carryover=self._carryover)
+        if not events:
+            return []
+        for event in events:
+            self._count += 1
+            line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+            if self._handle is not None:
+                try:
+                    self._handle.write(line)
+                    self._handle.flush()
+                except OSError:
+                    pass
+        return events
+
+
 async def _execute_process_with_streaming_logs(
     process,
     stdin_payload: bytes,
@@ -2219,10 +2454,17 @@ async def _execute_process_with_streaming_logs(
     stderr_log: Path,
     timeout: float,
     stall_threshold_seconds: float | None = None,
+    *,
+    events_jsonl: Path | None = None,
+    event_sink: EventSink | None = None,
 ) -> tuple[int | None, bool, bool]:
     effective_stall_threshold = (
         stall_threshold_seconds if stall_threshold_seconds is not None else _CODEX_STALL_THRESHOLD_SECONDS
     )
+    emitter_cm = (
+        _EventEmitter(events_jsonl, event_sink) if events_jsonl is not None else None
+    )
+
     if not _supports_streaming_process_io(process):
         timeout_hit = False
         try:
@@ -2239,33 +2481,52 @@ async def _execute_process_with_streaming_logs(
                 stdout_bytes, stderr_bytes = b"", b""
         _write_log_bytes(stdout_log, stdout_bytes)
         _write_log_bytes(stderr_log, stderr_bytes)
+        if emitter_cm is not None and stdout_bytes:
+            with emitter_cm as emitter:
+                # Non-streaming branch: feed the whole captured stdout once.
+                # Forward any events to the async sink if configured.
+                events = emitter.feed_sync(stdout_bytes)
+                if event_sink is not None:
+                    base = emitter.event_count - len(events)
+                    for offset, event in enumerate(events, start=1):
+                        try:
+                            await event_sink(event, base + offset)
+                        except Exception:
+                            pass
         return process.returncode, timeout_hit, False
 
     timeout_hit = False
     stall_flag: list[bool] = [False]
     tracker = _StreamActivityTracker()
     with stdout_log.open("wb") as stdout_handle, stderr_log.open("wb") as stderr_handle:
-        stdin_task = asyncio.create_task(_write_process_stdin(process.stdin, stdin_payload))
-        stdout_task = asyncio.create_task(_pump_process_stream(process.stdout, stdout_handle, tracker))
-        stderr_task = asyncio.create_task(_pump_process_stream(process.stderr, stderr_handle, tracker))
-        stall_task = asyncio.create_task(
-            _monitor_process_stall(process, tracker, effective_stall_threshold, stall_flag)
-        )
-        cleanup_timeout: float | None = None
+        emitter_ctx = emitter_cm.__enter__() if emitter_cm is not None else None
         try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            timeout_hit = True
-            cleanup_timeout = _POST_TIMEOUT_IO_DRAIN_SECONDS
-            await _terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
-        finally:
-            stall_task.cancel()
-            if stall_flag[0] and cleanup_timeout is None:
-                cleanup_timeout = _POST_TIMEOUT_IO_DRAIN_SECONDS
-            await _gather_process_io_tasks(
-                [stdin_task, stdout_task, stderr_task, stall_task],
-                timeout=cleanup_timeout,
+            stdin_task = asyncio.create_task(_write_process_stdin(process.stdin, stdin_payload))
+            stdout_task = asyncio.create_task(
+                _pump_process_stream(process.stdout, stdout_handle, tracker, emitter_ctx)
             )
+            stderr_task = asyncio.create_task(_pump_process_stream(process.stderr, stderr_handle, tracker))
+            stall_task = asyncio.create_task(
+                _monitor_process_stall(process, tracker, effective_stall_threshold, stall_flag)
+            )
+            cleanup_timeout: float | None = None
+            try:
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                timeout_hit = True
+                cleanup_timeout = _POST_TIMEOUT_IO_DRAIN_SECONDS
+                await _terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
+            finally:
+                stall_task.cancel()
+                if stall_flag[0] and cleanup_timeout is None:
+                    cleanup_timeout = _POST_TIMEOUT_IO_DRAIN_SECONDS
+                await _gather_process_io_tasks(
+                    [stdin_task, stdout_task, stderr_task, stall_task],
+                    timeout=cleanup_timeout,
+                )
+        finally:
+            if emitter_cm is not None:
+                emitter_cm.__exit__(None, None, None)
     return process.returncode, timeout_hit, stall_flag[0]
 
 
@@ -2326,6 +2587,7 @@ async def _pump_process_stream(
     stream,  # type: ignore[no-untyped-def]
     handle: BinaryIO,
     tracker: _StreamActivityTracker | None = None,
+    emitter: "_EventEmitter | None" = None,
 ) -> None:
     if stream is None:
         return
@@ -2337,6 +2599,8 @@ async def _pump_process_stream(
         handle.flush()
         if tracker is not None:
             tracker.bump()
+        if emitter is not None:
+            await emitter.feed(chunk)
 
 
 def _supports_streaming_process_io(process) -> bool:  # type: ignore[no-untyped-def]
@@ -2380,3 +2644,159 @@ def _changed_status_files(before: RepoSnapshot, after: RepoSnapshot) -> list[str
         if before.path_fingerprints.get(path) != after.path_fingerprints.get(path):
             changed.append(path)
     return changed
+
+
+def _looks_binary(data: bytes) -> bool:
+    return b"\x00" in data[:_FILE_DIFF_BINARY_SCAN_BYTES]
+
+
+def _capture_pre_run_contents(repo_root: Path, dirty_files: list[str]) -> dict[str, str | None]:
+    """Read pre-run contents of files that were already dirty at baseline.
+
+    Files that were dirty before the run started lose their pre-run state once
+    codex modifies them again, so we read them off disk before launching the
+    worker. Files clean at baseline keep `git show HEAD:path` as their oldText
+    source. Stores ``None`` for files we cannot represent as text (binary,
+    over the size cap, or unreadable).
+    """
+    captured: dict[str, str | None] = {}
+    for relative_path in dirty_files:
+        if relative_path.startswith("/"):
+            # Absolute paths land here when the dirty file is outside repo_root
+            # (extra writable roots). We don't capture those for diffs — the
+            # worker is expected to keep mutations inside the repo.
+            continue
+        full_path = repo_root / relative_path
+        try:
+            if full_path.is_symlink() or not full_path.is_file():
+                continue
+            data = full_path.read_bytes()
+        except OSError:
+            continue
+        if len(data) > _FILE_DIFF_MAX_BYTES or _looks_binary(data):
+            captured[relative_path] = None
+            continue
+        captured[relative_path] = data.decode("utf-8", errors="replace")
+    return captured
+
+
+def _git_show_head_contents(repo_root: Path, head: str | None, relative_path: str) -> tuple[str | None, bool]:
+    """Return (text, truncated) for the file's contents at the baseline HEAD.
+
+    Returns ``(None, False)`` for paths not tracked at HEAD (new files), and
+    ``(None, True)`` when the file is too large or binary at HEAD.
+    """
+    if head is None:
+        return (None, False)
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{head}:{relative_path}"],
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return (None, False)
+    if result.returncode != 0:
+        # Untracked at HEAD (or path resolution failed). Treat as new file.
+        return (None, False)
+    data = result.stdout
+    if len(data) > _FILE_DIFF_MAX_BYTES or _looks_binary(data):
+        return (None, True)
+    return (data.decode("utf-8", errors="replace"), False)
+
+
+def _read_post_run_text(repo_root: Path, relative_path: str) -> tuple[str | None, bool]:
+    """Return (text, truncated) for the file's contents on disk after the run.
+
+    Returns ``(None, False)`` for files that no longer exist (deleted), and
+    ``(None, True)`` for binary files or files over the size cap.
+    """
+    full_path = repo_root / relative_path
+    try:
+        if full_path.is_symlink():
+            return (None, True)
+        if not full_path.exists():
+            return (None, False)
+        if not full_path.is_file():
+            return (None, True)
+        data = full_path.read_bytes()
+    except OSError:
+        return (None, True)
+    if len(data) > _FILE_DIFF_MAX_BYTES or _looks_binary(data):
+        return (None, True)
+    return (data.decode("utf-8", errors="replace"), False)
+
+
+def _file_diffs_for_run(
+    *,
+    tool: ToolName,
+    repo_root: Path,
+    files_changed: list[str],
+    baseline_head: str | None,
+    baseline_dirty_contents: dict[str, str | None],
+    worker_result: WorkerResult | None,
+) -> list[FileDiff]:
+    """Compute structured file diffs for a completed mutating run.
+
+    For files that were dirty at baseline, ``baseline_dirty_contents`` carries
+    their pre-run state. For files clean at baseline, the pre-run state is
+    recovered from the baseline HEAD via ``git show``. New files have
+    ``old_text=None``; deleted files have ``new_text=None``. Binary files,
+    files over the size cap, and unreadable files surface as
+    ``truncated=True`` with both texts ``None``.
+
+    Read-only tools and runs with no detected changes return an empty list,
+    even if the worker reported diffs (worker reports merge in only when the
+    wrapper observed a real change).
+    """
+    if tool not in MUTATING_TOOLS or not files_changed:
+        return []
+    worker_diff_index: dict[str, FileDiff] = {}
+    if worker_result is not None:
+        for entry in worker_result.file_diffs:
+            worker_diff_index.setdefault(entry.path, entry)
+
+    diffs: list[FileDiff] = []
+    for relative_path in files_changed:
+        # files_changed may include absolute paths when worker mutates outside
+        # the repo root via extra writable roots. Skip those — diffing
+        # arbitrary external files is out of scope for the snapshot model.
+        if relative_path.startswith("/"):
+            continue
+
+        if relative_path in baseline_dirty_contents:
+            old_text = baseline_dirty_contents[relative_path]
+            old_truncated = old_text is None
+        else:
+            old_text, old_truncated = _git_show_head_contents(
+                repo_root, baseline_head, relative_path
+            )
+
+        new_text, new_truncated = _read_post_run_text(repo_root, relative_path)
+        truncated = old_truncated or new_truncated
+
+        # Worker-supplied diff fills gaps the wrapper couldn't capture (e.g.
+        # the worker stashed pre-edit contents before applying a patch). We
+        # only consult the worker when the wrapper's own value is None — but
+        # we accept it regardless of the truncation flag, since a worker that
+        # took a snippet before mutating the file may have text the wrapper
+        # cannot recover from disk anymore.
+        full_path = str((repo_root / relative_path).resolve())
+        worker_entry = worker_diff_index.get(relative_path) or worker_diff_index.get(full_path)
+        if worker_entry is not None:
+            if old_text is None and worker_entry.old_text is not None:
+                old_text = worker_entry.old_text
+            if new_text is None and worker_entry.new_text is not None:
+                new_text = worker_entry.new_text
+
+        diffs.append(
+            FileDiff(
+                path=full_path,
+                old_text=old_text,
+                new_text=new_text,
+                truncated=truncated,
+            )
+        )
+    return diffs

@@ -163,6 +163,7 @@ Default model is `gpt-5.5` for all tools and review subagents. Any explicit `tim
 - Read-only tools run in Codex `read-only`. Dobby still mounts the per-run artifact directory plus any in-repo `extra_roots`; `extra_roots` outside the repo are exposed as additional read-only roots, not writable roots.
 - Mutating tools run in workspace-write and mount `extra_roots` writable via `--add-dir`.
 - Mutating tools also ensure `.codex-dobby/` is present in `.gitignore`. Unsafe `.gitignore` targets, such as symlinks or multiply-linked files, fail closed.
+- External worktree mutations during a read-only run (you editing files in another terminal, another process touching the repo) are surfaced as a warning, not an error. Codex's OS-level read-only sandbox blocks codex itself from writing, so detected changes are by definition external. The run still escalates to `stop_reason: sandbox_violation` only when the worker self-reports having modified files that the wrapper also observed.
 - Child Codex runs no longer need write access to the parent `~/.codex/sessions`. Dobby seeds the child home from `CODEX_HOME/auth.json` and `CODEX_HOME/config.toml` when those files exist, mirrors referenced helper files from `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into a private runtime, then points the child at that private temp home. The server process therefore needs read access to the parent Codex and Claude config files plus read/write access to the temp runtime directory.
 - `CODEX_DOBBY_ACTIVE=1` is set on child runs and Dobby refuses to run if already set. Inherited `codex-dobby-mcp` entries are disabled so workers can't call back.
 - Commits are forbidden. A mutating worker that creates or moves a commit returns `status: "error"`.
@@ -170,14 +171,60 @@ Default model is `gpt-5.5` for all tools and review subagents. Any explicit `tim
 
 ## Artifacts
 
-Each run writes to `<target-root>/.codex-dobby/runs/<task-id>/`: `request.json`, `prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `result.json`, `output-schema.json`. Multi-agent `review` logs are JSONL. Treat `.codex-dobby/` as unredacted local logs.
+Each run writes to `<target-root>/.codex-dobby/runs/<task-id>/`: `request.json`, `prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `result.json`, `output-schema.json`, `events.jsonl`. Multi-agent `review` logs are also JSONL inside `stdout.log`. `events.jsonl` is the durable record of streaming progress events for the run (one ACP-shaped event per line; see [Streaming progress](#streaming-progress) below). Treat `.codex-dobby/` as unredacted local logs.
 
-Worker-facing tools (`plan`, `research`, `brainstorm`, `build`, `validate`, `review`, `reverse_engineer`) return `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed` (this run only), `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, and `result_state`. `review` responses also include `review_details`, where `requested_review_agents` is the raw caller-supplied list and `effective_review_agents` is the normalized/defaulted list Dobby actually used. `reverse_engineer` responses also include `reverse_engineer_details.ghidra`, with `mode`, `summary`, and the observed `mcp_calls` and `helper_calls`.
+Worker-facing tools (`plan`, `research`, `brainstorm`, `build`, `validate`, `review`, `reverse_engineer`) return `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed` (this run only), `file_diffs` (mutating tools only — see [File diffs](#file-diffs)), `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`, and `stop_reason` (see [Stop reasons](#stop-reasons)). `review` responses also include `review_details`, where `requested_review_agents` is the raw caller-supplied list and `effective_review_agents` is the normalized/defaulted list Dobby actually used. `reverse_engineer` responses also include `reverse_engineer_details.ghidra`, with `mode`, `summary`, and the observed `mcp_calls` and `helper_calls`.
 
-Async control tools return different structured payloads:
+## Streaming progress
+
+Every run writes ACP-shaped events to `<run-dir>/events.jsonl`, regardless of whether anyone is listening. When the MCP caller passes a `progressToken` in the `tools/call` `_meta`, Dobby also forwards each event live as an MCP `notifications/progress`. The numeric `progress` field is an event counter, `message` is a short human-readable label (the tool title or event type), and the structured event lives in `_meta.acpEvent` for clients that want it. Clients that don't pass a token receive nothing — runs continue normally.
+
+Event vocabulary borrows ACP's `session/update` payload shapes: `agent_message_chunk` for streamed model text, `tool_call` / `tool_call_update` for tool invocations (with `kind` ∈ `read|edit|delete|move|search|execute|think|fetch|other`), and `plan` for worker outlines. The codex `--json` event types we map (and ignore) are documented in `src/codex_dobby_mcp/events.py`.
+
+For background runs (`start_run` + `wait_run`), live events are forwarded only to whichever `wait_run` caller is currently subscribed. The full history stays available in `events.jsonl` regardless.
+
+## Stop reasons
+
+Each `ToolResponse` carries a `stop_reason` that classifies why the run ended. The first five values mirror ACP's `StopReason` enum verbatim:
+
+- `end_turn` — model finished naturally (the typical success case)
+- `max_tokens` — reached the model's token budget (only when codex emits a usage signal)
+- `max_turn_requests` — exceeded the model's turn-request budget
+- `refusal` — worker explicitly refused the task (worker output set `refused: true`)
+- `cancelled` — Dobby was cancelled or killed before completion
+
+Plus four Dobby-specific extensions for failure modes ACP doesn't model:
+
+- `timeout` — run hit `timeout_seconds`
+- `stall` — codex went idle for too long and Dobby killed it
+- `sandbox_violation` — read-only tool tried to write, mutating tool tried to commit
+- `error` — codex exited non-zero or returned malformed output
+
+Legacy run artifacts written before this field existed are still readable; `stop_reason` is optional on `RunLookupResponse`.
+
+## File diffs
+
+Mutating tools (`build`, `validate`, `reverse_engineer`) populate a `file_diffs: list[FileDiff]` field with one entry per changed file:
+
+```jsonc
+{
+  "path": "/abs/repo/src/foo.py",
+  "oldText": "...",      // null for new files
+  "newText": "...",      // null for deleted files
+  "truncated": false     // true for files Dobby couldn't represent as text
+}
+```
+
+Field names use ACP's camelCase shape (`oldText`/`newText`) on the wire, in `result.json`, and in `events.jsonl`. The Pydantic model uses Pythonic snake_case fields internally with camelCase aliases, and every serialization path passes `by_alias=True` so on-disk and on-the-wire shapes match. Worker JSON also uses camelCase (the `oldText`/`newText` schema is enforced).
+
+Files larger than 2 MB or that look binary are reported with `truncated: true` and both texts left as `null`. Files outside the repo root are not diffed. The wrapper detects diffs from snapshot deltas; workers may also attach `file_diffs` in their structured output, which Dobby uses to fill in gaps the wrapper couldn't capture (e.g. a stashed snippet of a very large file).
+
+Read-only tools always have `file_diffs: []`.
+
+## Async control tool return shapes
 
 - `start_run` returns an `AsyncRunHandle` with `task_id`, `tool`, `state`, `summary`, `repo_root`, `artifact_paths`, `model`, and `reasoning_effort`
-- `get_run` returns a `RunLookupResponse` with `task_id`, `state`, `summary`, `repo_root`, optional `tool`, optional `status`, optional `result_state`, optional final `result`, artifact metadata, and warnings
+- `get_run` returns a `RunLookupResponse` with `task_id`, `state`, `summary`, `repo_root`, optional `tool`, optional `status`, optional `result_state`, optional `stop_reason`, optional final `result`, artifact metadata, and warnings
 - `wait_run` returns the same `RunLookupResponse` shape as `get_run` plus an optional `pending_task_ids` list (populated whenever the caller passed `task_ids` or used the all-live mode). On timeout `state` is `running` and `result` is unset, on completion `state` is `finished` with the final `result` populated
 - `list_runs` returns the resolved `repo_root` plus recent run summaries for that repo
 

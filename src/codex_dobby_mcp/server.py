@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Annotated
 
+from mcp import types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BeforeValidator, Field
 
@@ -118,6 +119,88 @@ def _resolved_repo_root(runner: CodexRunner, repo_root: str | None, ctx: Context
     return resolve_repo_root(runner.spawn_root, repo_root or _caller_repo_root(ctx))
 
 
+def _progress_token_from_ctx(ctx: Context | None) -> str | int | None:
+    if ctx is None or ctx._request_context is None:
+        return None
+    meta = ctx.request_context.meta
+    if meta is None:
+        return None
+    token = getattr(meta, "progressToken", None)
+    if token is None:
+        return None
+    return token
+
+
+def _build_event_sink(ctx: Context | None):
+    """Return an async sink that forwards ACP events as MCP progress notifications.
+
+    Returns ``None`` when there is no caller-side progressToken, which keeps
+    runs silent for clients that never asked for streaming. The full
+    structured event lives in ``_meta.acpEvent`` on each notification; the
+    short ``message`` field carries a human-readable summary so even clients
+    that ignore ``_meta`` see something useful.
+    """
+    progress_token = _progress_token_from_ctx(ctx)
+    if progress_token is None or ctx is None:
+        return None
+
+    session = ctx.request_context.session
+
+    async def sink(event: dict, count: int) -> None:
+        message = event.get("title") or event.get("type")
+        params = mcp_types.ProgressNotificationParams.model_validate(
+            {
+                "progressToken": progress_token,
+                "progress": float(count),
+                "message": message if isinstance(message, str) else None,
+                "_meta": {"acpEvent": event},
+            }
+        )
+        await session.send_notification(
+            mcp_types.ServerNotification(mcp_types.ProgressNotification(params=params))
+        )
+
+    return sink
+
+
+def _build_wait_event_sink(ctx: Context | None):
+    """Sink for ``wait_run`` — same shape as the worker sink, but tagged per task.
+
+    MCP requires ``progress`` to be strictly monotonic per ``progressToken``.
+    A single ``wait_run`` may forward events from multiple background runs,
+    each with its own per-run counter starting at 1, so we maintain a
+    wait-run-level counter that increments across every event regardless of
+    which task it came from.
+    """
+    progress_token = _progress_token_from_ctx(ctx)
+    if progress_token is None or ctx is None:
+        return None
+
+    session = ctx.request_context.session
+    counter = [0]
+
+    async def sink(event: dict, count: int, task_id: str) -> None:
+        counter[0] += 1
+        message = event.get("title") or event.get("type")
+        params = mcp_types.ProgressNotificationParams.model_validate(
+            {
+                "progressToken": progress_token,
+                "progress": float(counter[0]),
+                "message": message if isinstance(message, str) else None,
+                "_meta": {
+                    "acpEvent": event,
+                    "taskId": task_id,
+                    "perTaskCount": count,
+                },
+            }
+        )
+        await session.send_notification(
+            mcp_types.ServerNotification(mcp_types.ProgressNotification(params=params))
+        )
+
+    return sink
+
+
 def create_server(spawn_root: Path | None = None) -> FastMCP:
     runner = create_runner(spawn_root)
     background_runs = BackgroundRunManager(runner)
@@ -149,7 +232,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             model=model,
             reasoning_effort=reasoning_effort,
         )
-        return await runner.run(ToolName.PLAN, request)
+        return await runner.run(ToolName.PLAN, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="research", structured_output=True)
     async def research(
@@ -174,7 +257,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             model=model,
             reasoning_effort=reasoning_effort,
         )
-        return await runner.run(ToolName.RESEARCH, request)
+        return await runner.run(ToolName.RESEARCH, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="brainstorm", structured_output=True)
     async def brainstorm(
@@ -199,7 +282,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             model=model,
             reasoning_effort=reasoning_effort,
         )
-        return await runner.run(ToolName.BRAINSTORM, request)
+        return await runner.run(ToolName.BRAINSTORM, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="build", structured_output=True)
     async def build(
@@ -226,7 +309,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             reasoning_effort=reasoning_effort,
             danger=danger,
         )
-        return await runner.run(ToolName.BUILD, request)
+        return await runner.run(ToolName.BUILD, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="validate", structured_output=True)
     async def validate(
@@ -251,7 +334,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             model=model,
             reasoning_effort=reasoning_effort,
         )
-        return await runner.run(ToolName.VALIDATE, request)
+        return await runner.run(ToolName.VALIDATE, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="review", structured_output=True)
     async def review(
@@ -278,7 +361,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             reasoning_effort=reasoning_effort,
             agents=agents,
         )
-        return await runner.run(ToolName.REVIEW, request)
+        return await runner.run(ToolName.REVIEW, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="reverse_engineer", structured_output=True)
     async def reverse_engineer(
@@ -305,7 +388,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             reasoning_effort=reasoning_effort,
             danger=danger,
         )
-        return await runner.run(ToolName.REVERSE_ENGINEER, request)
+        return await runner.run(ToolName.REVERSE_ENGINEER, request, event_sink=_build_event_sink(ctx))
 
     @server.tool(name="start_run", structured_output=True)
     async def start_run(
@@ -365,6 +448,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
             task_id=task_id,
             task_ids=task_ids,
             timeout_seconds=clamped,
+            event_sink=_build_wait_event_sink(ctx),
         )
 
     @server.tool(name="list_runs", structured_output=True)
