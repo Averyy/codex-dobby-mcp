@@ -543,7 +543,7 @@ def test_background_run_manager_treats_traversal_task_id_as_not_found(tmp_path: 
     lookup = manager.get(repo_root, "../../outside")
 
     assert lookup.state == AsyncRunState.NOT_FOUND
-    assert lookup.summary == "Run not found."
+    assert lookup.summary.startswith("Run not found")
     assert lookup.result is None
 
 

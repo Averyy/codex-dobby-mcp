@@ -81,7 +81,12 @@ class BackgroundRunManager:
             task_id=task_id,
             tool=spec.tool,
             state=AsyncRunState.RUNNING,
-            summary=f"Started background {spec.tool.value} run. Use get_run(task_id=...) to fetch the result.",
+            summary=(
+                f"Started background {spec.tool.value} run {task_id}. "
+                f"Call wait_run(task_id='{task_id}') to block until it finishes, or "
+                f"get_run(task_id='{task_id}') for a non-blocking peek. This run is "
+                "managed only by the codex-dobby wait_run/get_run/list_runs tools."
+            ),
             repo_root=str(spec.repo_root),
             artifact_paths=spec.artifacts.as_public_dict(),
             model=spec.model,
@@ -96,7 +101,11 @@ class BackgroundRunManager:
                 return RunLookupResponse(
                     task_id=task_id,
                     state=AsyncRunState.RUNNING,
-                    summary=f"{entry.spec.tool.value} run is still active.",
+                    summary=(
+                        f"{entry.spec.tool.value} run {task_id} is still running. "
+                        f"Call wait_run(task_id='{task_id}') to block until it finishes, or "
+                        "get_run again later for another non-blocking check."
+                    ),
                     repo_root=str(repo_root),
                     tool=entry.spec.tool,
                     artifact_paths=entry.spec.artifacts.as_public_dict(),
@@ -135,7 +144,12 @@ class BackgroundRunManager:
                 return RunLookupResponse(
                     task_id="",
                     state=AsyncRunState.NOT_FOUND,
-                    summary="No live background runs found for this repo.",
+                    summary=(
+                        "No live background runs found for this repo. After a server "
+                        "restart, runs survive only as artifacts, not live tasks — call "
+                        "list_runs to see recent runs and get_run(task_id=...) to fetch "
+                        "one by id."
+                    ),
                     repo_root=str(repo_root),
                 )
 
@@ -380,14 +394,22 @@ class BackgroundRunManager:
             return RunLookupResponse(
                 task_id=task_id,
                 state=AsyncRunState.NOT_FOUND,
-                summary="Run not found.",
+                summary=(
+                    f"Run not found: could not resolve a runs directory for repo_root "
+                    f"{repo_root}. Lookups are keyed by repo_root + task_id; check the "
+                    "repo_root matches the one the run was started with."
+                ),
                 repo_root=str(repo_root),
             )
         if not artifacts.run_dir.exists():
             return RunLookupResponse(
                 task_id=task_id,
                 state=AsyncRunState.NOT_FOUND,
-                summary="Run not found.",
+                summary=(
+                    f"Run {task_id} not found under this repo. Lookups are keyed by "
+                    "repo_root + task_id — call list_runs to see recent runs for this "
+                    "repo, or check the repo_root matches the one the run was started with."
+                ),
                 repo_root=str(repo_root),
             )
 

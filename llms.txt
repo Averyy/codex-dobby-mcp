@@ -159,6 +159,7 @@ If Dobby can't discover the integration, the worker prompt explicitly tells Code
 
 - Blocking `review` / `research` etc. still exist; they'll hit the caller's `tools/call` ceiling if it's short. Prefer `start_run` + `wait_run` for anything non-trivial.
 - `wait_run` timeout summaries tell the LLM explicitly to re-call with `pending_task_ids`. Follow that — it's the intended pattern.
+- A background run is NOT a Claude Code subagent. Continue or check one with `wait_run`/`get_run` plus its `task_id` — never `SendMessage` (that resumes harness subagents, not Dobby runs) and never from inside a spawned subagent (where `SendMessage`/`/loop`/`ScheduleWakeup` aren't provisioned). A run takes no further input once started; to change course, let it finish or cancel and `start_run` again.
 - The multi-wait primitive is first-completed, not all-completed. For "wait until all done," call `wait_run` in a loop with remaining ids until `pending_task_ids` is empty.
 - `wait_run()` with no ids only sees runs started BEFORE the call. New runs don't join.
 - Don't mix dobby model/reasoning overrides with `agents=[...]` unless you know what you're doing; multi-agent review has its own model split.

@@ -108,6 +108,7 @@ Offload grunt work — build/test, code review, research, planning, implementati
 - Call `mcp__codex-dobby__*` directly. Never wrap them in a general-purpose Agent/Task subagent.
 - Don't lower `timeout_seconds` below the default. Err too long — a short timeout kills the run; a long one costs nothing because Dobby returns as soon as it's ready.
 - For long work, start it with `mcp__codex-dobby__start_run` and then either block on `mcp__codex-dobby__wait_run` (parent sleeps in the tool call) or poll `mcp__codex-dobby__get_run` (parent keeps working). On Claude Code, `/loop` or `ScheduleWakeup` can schedule the polls for you so the parent is free between checks.
+- To resume, continue, or check on a background run, call `wait_run`/`get_run` with its `task_id` — a Dobby run takes no further input once started, so to change course let it finish (or cancel) and `start_run` again.
 ```
 
 ## Requests
