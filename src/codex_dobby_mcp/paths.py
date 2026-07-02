@@ -428,7 +428,10 @@ def _ensure_safe_directory(path: Path, label: str) -> Path:
         if not path.is_dir():
             raise PathResolutionError(f"{label} is not a directory: {path}")
         return path
-    path.mkdir()
+    # 0700: the codex-dobby namespace and per-task runtime dirs hold mirrored
+    # auth.json / config.toml that can embed API keys. Keep them owner-only so
+    # other local users can't read secrets on multi-user machines.
+    path.mkdir(mode=0o700)
     return path
 
 

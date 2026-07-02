@@ -49,6 +49,7 @@ class BackgroundRunManager:
         self._entries: dict[tuple[object, str], BackgroundRunEntry] = {}
 
     def start(self, spec: ResolvedInvocation) -> AsyncRunHandle:
+        self._prune_finished_entries()
         task_id = spec.artifacts.run_dir.name
         key = self._key(spec.repo_root, task_id)
 
@@ -331,9 +332,17 @@ class BackgroundRunManager:
         if not runs_root.exists():
             return RunListResponse(repo_root=str(repo_root), runs=[])
 
+        def _mtime(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                # Run dir deleted/renamed concurrently; sort it last instead of
+                # raising out of list_runs.
+                return 0.0
+
         run_dirs = sorted(
             (path for path in runs_root.iterdir() if path.is_dir() and not path.is_symlink()),
-            key=lambda path: path.stat().st_mtime,
+            key=_mtime,
             reverse=True,
         )
         runs: list[RunSummary] = []
@@ -386,6 +395,19 @@ class BackgroundRunManager:
             except asyncio.QueueFull:
                 pass
         entry.subscribers.clear()
+
+    def _prune_finished_entries(self) -> None:
+        # Bound memory: a finished BackgroundRunEntry retains its ToolResponse
+        # (which can carry multi-MB file_diffs) for the server's lifetime.
+        # Drop finished entries opportunistically when new work starts.
+        # result.json is persisted before a task completes, so later
+        # get()/list()/wait() resolve via _lookup_from_artifacts, and in-flight
+        # waiters hold their own reference to the entry until they finish.
+        # Runs are kept until the next start() so an immediate post-completion
+        # get()/wait() still serves the result straight from memory.
+        stale = [key for key, entry in self._entries.items() if entry.task.done()]
+        for key in stale:
+            del self._entries[key]
 
     def _lookup_from_artifacts(self, repo_root: Path, task_id: str) -> RunLookupResponse:
         try:

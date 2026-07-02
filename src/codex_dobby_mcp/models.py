@@ -52,6 +52,9 @@ class StopReason(str, Enum):
     """
 
     END_TURN = "end_turn"
+    # Reserved: mirror ACP's vocabulary for a future bridge but are not yet
+    # emitted anywhere — codex does not surface a token/turn-budget signal the
+    # runner can map, so no run is currently classified with these.
     MAX_TOKENS = "max_tokens"
     MAX_TURN_REQUESTS = "max_turn_requests"
     REFUSAL = "refusal"

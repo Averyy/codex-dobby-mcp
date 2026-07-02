@@ -86,6 +86,38 @@ async def test_background_run_manager_returns_finished_result_for_live_entry(tmp
     assert lookup.result_state == ResultArtifactState.FINAL
 
 
+@pytest.mark.asyncio
+async def test_starting_new_run_prunes_finished_entries(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    class FakeRunner:
+        async def run_resolved(self, resolved: ResolvedInvocation, *, event_sink=None) -> ToolResponse:
+            return _result(resolved)
+
+    manager = BackgroundRunManager(FakeRunner())  # type: ignore[arg-type]
+
+    first = _spec(repo_root, "first-task")
+    manager.start(first)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # run_resolved persists result.json before the task completes; the fake
+    # runner doesn't, so write it here to model production.
+    write_json(first.artifacts.result_json, _result(first).model_dump(mode="json"))
+
+    first_key = manager._key(repo_root, first.artifacts.run_dir.name)
+    # Still retained immediately after completion so a post-done get() serves
+    # the result from memory.
+    assert first_key in manager._entries
+
+    # Starting new work prunes the finished entry so its ToolResponse isn't
+    # retained for the server's lifetime; the result stays resolvable via the
+    # persisted artifacts.
+    manager.start(_spec(repo_root, "second-task"))
+    assert first_key not in manager._entries
+    assert manager.get(repo_root, first.artifacts.run_dir.name).state == AsyncRunState.FINISHED
+
+
 def test_background_run_manager_can_recover_result_from_artifacts(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

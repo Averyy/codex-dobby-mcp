@@ -364,8 +364,11 @@ class CodexRunner:
         except FileNotFoundError as exc:
             raise RunnerError(f"Codex executable not found: {self.codex_binary}") from exc
         except asyncio.CancelledError:
+            # Backstop: the streaming helper already reaps on cancel, but if
+            # the process somehow survived, ensure it is killed before we
+            # unwind. Shielded so the escalation is not itself cancelled.
             if process is not None:
-                await _terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
+                await _shielded_terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
             raise
         except asyncio.TimeoutError:
             timeout_hit = True
@@ -608,6 +611,7 @@ class CodexRunner:
             timeout_hit,
             worker_result_error,
             error_reasons,
+            stall_hit=stall_hit,
         )
         completeness = worker_result.completeness if worker_result else Completeness.BLOCKED
         if status == RunStatus.ERROR:
@@ -940,7 +944,20 @@ class CodexRunner:
         timeout_hit: bool,
         worker_result_error: str | None,
         error_reasons: list[str],
+        stall_hit: bool = False,
     ) -> str:
+        # A genuine top-level codex failure (a ``{"type":"error"}`` /
+        # ``{"type":"turn.failed"}`` event on stdout) is the ROOT cause and
+        # must not be buried behind a derived diagnostic such as the review
+        # orchestrator's "completed 0/N subagents" summary — that message
+        # merely describes the symptom (no subagents ran) and sends callers
+        # chasing the wrong problem. Surface the real codex error first on a
+        # hard failure. Stalls and timeouts are excluded: they carry their
+        # own accurate, more specific reasons and (for a stall) never emit a
+        # turn-level error anyway.
+        codex_error = _first_codex_stdout_error(stdout)
+        if codex_error and not timeout_hit and not stall_hit and exit_code not in (0, None):
+            return _augment_codex_error(codex_error)
         if error_reasons:
             return error_reasons[0]
         if worker_result and worker_result.summary.strip():
@@ -950,9 +967,8 @@ class CodexRunner:
         # stdout. Surface them before falling back to the (often noisy)
         # stderr trace, otherwise the user sees the TRACE preamble instead
         # of the actual model API error.
-        codex_error = _first_codex_stdout_error(stdout)
         if codex_error:
-            return codex_error
+            return _augment_codex_error(codex_error)
         if timeout_hit:
             return "Codex run timed out before returning structured output"
         if worker_result_error:
@@ -1078,7 +1094,6 @@ def _git_status(repo_root: Path) -> list[str]:
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
-            "--ignored=matching",
         ],
         capture_output=True,
         text=False,
@@ -1101,12 +1116,18 @@ def _git_status(repo_root: Path) -> list[str]:
 
         status_code = entry[:2].decode("ascii", errors="replace")
         path = entry[3:].decode("utf-8", errors="surrogateescape")
-        files.append(path)
 
-        if any(code in {"R", "C"} for code in status_code):
-            index += 2
-            continue
-        index += 1
+        is_rename = any(code in {"R", "C"} for code in status_code)
+        # Skip ignored entries (``!!``): build artifacts and caches (.venv,
+        # dist, __pycache__, .pytest_cache, ...). Snapshotting them made
+        # mutating runs content-hash entire ignored trees twice per run and
+        # let artifact churn leak into files_changed / file_diffs. ``git
+        # status`` above no longer requests ``--ignored`` so this normally
+        # never fires; it stays as a guard against inherited config that
+        # re-enables ignored reporting.
+        if status_code != "!!":
+            files.append(path)
+        index += 2 if is_rename else 1
     return files
 
 
@@ -1711,6 +1732,46 @@ def _first_meaningful_output_line(text: str) -> str | None:
     return None
 
 
+# Substrings that identify a codex authentication/token failure in a
+# top-level error message. Codex surfaces these when the saved login can no
+# longer be used or refreshed (expired access token, rotated/"reused" refresh
+# token, 401 from the ChatGPT backend or the built-in ``codex_apps``
+# connector). None of these are recoverable by retrying — the user must
+# re-authenticate — so we attach an explicit, actionable hint.
+_AUTH_FAILURE_SIGNATURES = (
+    "refresh token",
+    "refresh_token_reused",
+    "access token",
+    "authentication token",
+    "token_expired",
+    "token expired",
+    "sign in again",
+    "signing in again",
+    "sign back in",
+    "log back in",
+    "not authenticated",
+    "401 unauthorized",
+)
+
+_CODEX_AUTH_HINT = (
+    "Codex authentication has expired and cannot be refreshed automatically — "
+    "run `codex logout && codex login` to re-authenticate, then retry."
+)
+
+
+def _augment_codex_error(message: str) -> str:
+    """Append an actionable re-login hint when a codex error is an auth failure.
+
+    ``codex login status`` reports "Logged in" even with a dead token, and a
+    spent refresh token cannot self-heal, so without this hint callers retry a
+    permanently failing run instead of re-authenticating.
+    """
+    lowered = message.lower()
+    if any(signature in lowered for signature in _AUTH_FAILURE_SIGNATURES):
+        return f"{message} [Dobby] {_CODEX_AUTH_HINT}"
+    return message
+
+
 def _extract_codex_error_message(payload: dict) -> str | None:
     candidate = payload.get("message")
     if isinstance(candidate, str) and candidate.strip():
@@ -2070,6 +2131,30 @@ async def _terminate_process(process, timeout: float | None = None) -> None:  # 
         return
 
 
+async def _shielded_terminate_process(process, timeout: float | None = None) -> None:  # type: ignore[no-untyped-def]
+    """Terminate a live process so the SIGTERM→SIGKILL escalation always finishes.
+
+    On client cancellation (Esc in Claude Code) the ambient cancel scope can be
+    *level-triggered* (anyio): every ``await`` in the unwind path re-raises
+    ``CancelledError``, which would abort ``_terminate_process`` mid-escalation
+    and orphan a codex that ignored SIGTERM — it keeps running, burning credits
+    and possibly still editing the repo. Run the escalation as a shielded task
+    and keep re-awaiting it through re-delivered cancels until it actually
+    reaps the process. Any pending cancellation still propagates once this
+    returns (we never swallow the caller's exception, only our own awaits).
+    """
+    if getattr(process, "returncode", None) is not None:
+        return
+    task = asyncio.ensure_future(_terminate_process(process, timeout=timeout))
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Re-delivered by a level-triggered cancel scope. The shielded task
+            # is unaffected and keeps running; loop until it has reaped.
+            continue
+
+
 def _prepare_child_runtime(
     artifacts: RunArtifacts,
     env: Mapping[str, str] | None = None,
@@ -2135,6 +2220,33 @@ def _prepare_child_runtime(
         ) from exc
 
 
+def _rewrite_path_prefix(text: str, prefix: str, replacement: str) -> str:
+    r"""Replace a path reference in ``text`` only when it ends at a path boundary.
+
+    A bare ``str.replace("~/.codex", ...)`` (or the absolute equivalent) also
+    rewrites unrelated sibling names such as ``~/.codex-backup`` →
+    ``<codex_home>-backup``, corrupting the mirrored child config. Anchor the
+    match so the next character is end-of-string or not a path-name character
+    (``[\w-]``). A function replacement keeps characters in ``replacement`` from
+    being interpreted as regex backreferences.
+    """
+    pattern = re.escape(prefix) + r"(?![\w-])"
+    return re.sub(pattern, lambda _match: replacement, text)
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` with owner-only (0600) permissions.
+
+    The mirrored child ``config.toml`` can embed MCP server env blocks holding
+    API keys. A plain ``write_text`` creates it 0644 under the default umask,
+    leaving secrets readable by other local users; force 0600 at creation.
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text)
+
+
 def _copy_codex_home_seed_file(source: Path, destination: Path, *, subject: str) -> None:
     if not source.exists():
         return
@@ -2191,17 +2303,15 @@ def _seed_child_codex_config(
             )
         ) from exc
 
-    rewritten = payload.replace(str(source_codex_home), str(codex_home)).replace(
-        str(source_claude_config),
-        str(claude_config_dir),
-    )
+    rewritten = _rewrite_path_prefix(payload, str(source_codex_home), str(codex_home))
+    rewritten = _rewrite_path_prefix(rewritten, str(source_claude_config), str(claude_config_dir))
     if _same_path(source_codex_home, _GLOBAL_CODEX_DIR):
-        rewritten = rewritten.replace("~/.codex", str(codex_home))
+        rewritten = _rewrite_path_prefix(rewritten, "~/.codex", str(codex_home))
     if _same_path(source_claude_config, _GLOBAL_CLAUDE_DIR):
-        rewritten = rewritten.replace("~/.claude", str(claude_config_dir))
+        rewritten = _rewrite_path_prefix(rewritten, "~/.claude", str(claude_config_dir))
 
     try:
-        destination.write_text(rewritten, encoding="utf-8")
+        _write_private_text(destination, rewritten)
     except OSError as exc:
         raise RunnerError(
             _codex_home_access_message(
@@ -2354,7 +2464,9 @@ def _ensure_artifact_subdirectory(path: Path, label: str) -> Path:
         if not path.is_dir():
             raise RunnerError(f"{label} is not a directory: {path}")
         return path
-    path.mkdir(parents=True)
+    # 0700: child codex-home / sessions / claude-config hold mirrored auth and
+    # config that can embed secrets; the runtime cache dirs are private too.
+    path.mkdir(parents=True, mode=0o700)
     return path
 
 
@@ -2468,17 +2580,26 @@ async def _execute_process_with_streaming_logs(
     if not _supports_streaming_process_io(process):
         timeout_hit = False
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(stdin_payload), timeout=timeout)
-        except asyncio.TimeoutError:
-            timeout_hit = True
-            await _terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=_POST_TIMEOUT_IO_DRAIN_SECONDS,
-                )
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(stdin_payload), timeout=timeout)
             except asyncio.TimeoutError:
-                stdout_bytes, stderr_bytes = b"", b""
+                timeout_hit = True
+                await _terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(),
+                        timeout=_POST_TIMEOUT_IO_DRAIN_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    stdout_bytes, stderr_bytes = b"", b""
+        finally:
+            # Reap on cancellation too (communicate() raises CancelledError
+            # without terminating); no-op on the normal/timeout paths where
+            # the child is already dead.
+            if getattr(process, "returncode", None) is None:
+                await _shielded_terminate_process(
+                    process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS
+                )
         _write_log_bytes(stdout_log, stdout_bytes)
         _write_log_bytes(stderr_log, stderr_bytes)
         if emitter_cm is not None and stdout_bytes:
@@ -2518,6 +2639,16 @@ async def _execute_process_with_streaming_logs(
                 await _terminate_process(process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS)
             finally:
                 stall_task.cancel()
+                # Reap the child before draining and closing its pipes. On a
+                # normal or timeout exit it is already dead; on client
+                # cancellation nothing else here terminates it, so without this
+                # the process is orphaned and the pump tasks leak writing to a
+                # live pipe. Shielded so the kill escalation survives a
+                # level-triggered cancel scope.
+                if getattr(process, "returncode", None) is None:
+                    await _shielded_terminate_process(
+                        process, timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS
+                    )
                 if stall_flag[0] and cleanup_timeout is None:
                     cleanup_timeout = _POST_TIMEOUT_IO_DRAIN_SECONDS
                 await _gather_process_io_tasks(

@@ -9,7 +9,9 @@ The mapper is intentionally conservative: codex events we don't recognize are
 dropped, so this module ships without exhaustive coverage. Extend the
 dispatcher rather than guessing on unknown event shapes.
 
-See ``notes/streaming-events.md`` for the full vocabulary.
+The recognized vocabulary is the dispatch in ``map_codex_event`` below and its
+``_map_*`` handlers; that is the source of truth for which codex events map to
+which ACP-shaped update.
 """
 
 from __future__ import annotations

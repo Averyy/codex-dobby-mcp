@@ -189,8 +189,8 @@ For background runs (`start_run` + `wait_run`), live events are forwarded only t
 Each `ToolResponse` carries a `stop_reason` that classifies why the run ended. The first five values mirror ACP's `StopReason` enum verbatim:
 
 - `end_turn` — model finished naturally (the typical success case)
-- `max_tokens` — reached the model's token budget (only when codex emits a usage signal)
-- `max_turn_requests` — exceeded the model's turn-request budget
+- `max_tokens` — *reserved*; defined for a future ACP bridge but not currently emitted (codex surfaces no token-budget signal the runner maps)
+- `max_turn_requests` — *reserved*; defined but not currently emitted
 - `refusal` — worker explicitly refused the task (worker output set `refused: true`)
 - `cancelled` — Dobby was cancelled or killed before completion
 

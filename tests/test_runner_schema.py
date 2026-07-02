@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,7 @@ from codex_dobby_mcp.review_agents import (
 from codex_dobby_mcp.runner import (
     CodexRunner,
     RunnerError,
+    _augment_codex_error,
     _build_repo_snapshot,
     _codex_home_permission_issue,
     _collect_sandbox_violations,
@@ -65,11 +67,14 @@ from codex_dobby_mcp.runner import (
     _reverse_engineer_details_for_run,
     _reverse_engineer_failure_details,
     _review_orchestration_warnings,
+    _rewrite_path_prefix,
     _salvaged_review_worker_result,
     _salvage_exec_trace,
     _salvage_worker_result_from_trace,
+    _shielded_terminate_process,
     _stall_diagnostics,
     _stall_threshold_for_effort,
+    _write_private_text,
 )
 
 
@@ -1053,11 +1058,99 @@ def test_resolve_summary_prefers_error_reason_over_worker_summary() -> None:
     )
 
 
-def test_git_status_uses_nul_delimited_porcelain_for_quoted_and_renamed_paths(
+_AUTH_ERROR_STDOUT = (
+    '{"type":"error","message":"Your access token could not be refreshed '
+    "because your refresh token was already used. Please log out and sign in "
+    'again."}\n'
+    '{"type":"turn.failed","error":{"message":"Your access token could not be '
+    'refreshed because your refresh token was already used."}}\n'
+)
+
+
+def test_resolve_summary_surfaces_codex_auth_error_over_orchestration_summary() -> None:
+    # The exact production bug: a codex auth failure kills the review parent
+    # before any subagent spawns, so the orchestrator reports "completed 0/N
+    # subagents" in error_reasons. The real, actionable codex error (sitting in
+    # stdout) must win and carry the re-login hint.
+    summary = CodexRunner._resolve_summary(
+        None,
+        stdout=_AUTH_ERROR_STDOUT,
+        stderr="",
+        exit_code=1,
+        timeout_hit=False,
+        worker_result_error=None,
+        error_reasons=[
+            "Review orchestration incomplete: completed 0/2 subagents; spawned 0/2 subagents."
+        ],
+    )
+
+    assert summary.startswith("Your access token could not be refreshed")
+    assert "completed 0/2 subagents" not in summary
+    assert "codex logout && codex login" in summary
+
+
+def test_resolve_summary_adds_hint_for_token_expired_variant() -> None:
+    stdout = (
+        '{"type":"error","message":"Provided authentication token is expired. '
+        'Please try signing in again."}\n'
+    )
+    summary = CodexRunner._resolve_summary(
+        None,
+        stdout=stdout,
+        stderr="",
+        exit_code=1,
+        timeout_hit=False,
+        worker_result_error=None,
+        error_reasons=[],
+    )
+
+    assert "authentication token is expired" in summary
+    assert "codex logout && codex login" in summary
+
+
+def test_resolve_summary_stall_reason_not_clobbered_by_codex_error_scan() -> None:
+    # A stall never emits a turn-level error, so the stall diagnostic (in
+    # error_reasons) must remain the summary even though stall_hit forces a
+    # non-zero exit.
+    stall_reason = "Codex produced no stdout or stderr activity for 300 seconds and was killed as stalled."
+    summary = CodexRunner._resolve_summary(
+        None,
+        stdout="",
+        stderr="",
+        exit_code=-15,
+        timeout_hit=False,
+        worker_result_error=None,
+        error_reasons=[stall_reason],
+        stall_hit=True,
+    )
+
+    assert summary == stall_reason
+
+
+def test_augment_codex_error_leaves_non_auth_errors_unchanged() -> None:
+    message = "Model returned invalid response_format: expected object, got array"
+    assert _augment_codex_error(message) == message
+
+
+def test_augment_codex_error_flags_refresh_token_reuse() -> None:
+    message = (
+        "Your access token could not be refreshed because your refresh token "
+        "was already used. Please log out and sign in again."
+    )
+    augmented = _augment_codex_error(message)
+    assert augmented.startswith(message)
+    assert "codex logout && codex login" in augmented
+
+
+def test_git_status_parses_quoted_renamed_and_filters_ignored_entries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    def fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+    captured_argv: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):  # type: ignore[no-untyped-def]
+        captured_argv.append(list(argv))
+
         class Result:
             returncode = 0
             stdout = (
@@ -1072,7 +1165,90 @@ def test_git_status_uses_nul_delimited_porcelain_for_quoted_and_renamed_paths(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert _git_status(tmp_path) == ["normal.py", 'weird name "quote".py', "renamed.py", "ignored.bin"]
+    # Ignored (``!!``) entries are filtered so build artifacts / caches never
+    # enter the snapshot; the rename keeps only its new path.
+    assert _git_status(tmp_path) == ["normal.py", 'weird name "quote".py', "renamed.py"]
+    # And we no longer ask git to enumerate ignored files at all.
+    assert not any("--ignored=matching" in argv for argv in captured_argv)
+
+
+def test_build_repo_snapshot_excludes_gitignored_paths(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / ".gitignore").write_text("build_out/\n", encoding="utf-8")
+    tracked = repo_root / "keep.py"
+    tracked.write_text("x = 1\n", encoding="utf-8")
+    ignored_dir = repo_root / "build_out"
+    ignored_dir.mkdir()
+    (ignored_dir / "artifact.bin").write_text("huge", encoding="utf-8")
+
+    # Mutating (content-fingerprint) snapshot is where the double-hash of
+    # ignored trees used to happen.
+    snapshot = _build_repo_snapshot(
+        repo_root,
+        include_head=False,
+        use_metadata_fingerprints=False,
+    )
+
+    assert "keep.py" in snapshot.dirty_files
+    assert not any(path.startswith("build_out") for path in snapshot.dirty_files)
+
+
+def test_rewrite_path_prefix_only_replaces_at_path_boundary() -> None:
+    text = 'x = "~/.codex/config.toml"\ny = "~/.codex-backup/keep"\nz = "~/.codex"\n'
+    out = _rewrite_path_prefix(text, "~/.codex", "/private/child-home")
+
+    assert '"/private/child-home/config.toml"' in out  # real reference rewritten
+    assert '"~/.codex-backup/keep"' in out  # sibling name left intact
+    assert '"/private/child-home"' in out  # bare reference (quote boundary) rewritten
+
+
+def test_write_private_text_creates_owner_only_file(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    _write_private_text(target, "[mcp_servers.x]\nkey = 'secret'\n")
+
+    assert target.read_text(encoding="utf-8") == "[mcp_servers.x]\nkey = 'secret'\n"
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_shielded_terminate_reaps_process_despite_outer_cancel() -> None:
+    class _StubbornProcess:
+        """A codex that ignores SIGTERM and only dies on SIGKILL."""
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminated = False
+            self.killed = False
+
+        def terminate(self) -> None:
+            self.terminated = True  # ignored: does not set returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            while self.returncode is None:
+                await asyncio.sleep(0.005)
+            return self.returncode
+
+    process = _StubbornProcess()
+
+    async def caller() -> None:
+        await _shielded_terminate_process(process, timeout=0.05)
+
+    task = asyncio.ensure_future(caller())
+    await asyncio.sleep(0)  # let the terminate escalation start
+    task.cancel()  # cancel the outer await mid-reap
+    with suppress(asyncio.CancelledError):
+        await task
+
+    # The escalation must still have completed and reaped the process.
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.returncode is not None
 
 
 def test_path_fingerprint_handles_directories(tmp_path: Path) -> None:

@@ -19,6 +19,15 @@ from codex_dobby_mcp.paths import (
 )
 
 
+def test_private_runtime_dirs_are_owner_only(tmp_path: Path) -> None:
+    task_root = private_runtime_root("task-perms", temp_root=tmp_path)
+
+    # The per-task runtime dir and its codex-dobby namespace parent hold
+    # mirrored auth/config that can embed secrets: keep them 0700.
+    assert task_root.stat().st_mode & 0o777 == 0o700
+    assert task_root.parent.stat().st_mode & 0o777 == 0o700
+
+
 def init_git_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / ".git").mkdir()
