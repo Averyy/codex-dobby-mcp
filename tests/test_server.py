@@ -1,12 +1,11 @@
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from codex_dobby_mcp import server as server_module
 from codex_dobby_mcp.models import ReviewAgent
-from codex_dobby_mcp.server import _caller_repo_root, create_server
+from codex_dobby_mcp.server import create_server
 
 
 def test_server_exposes_exactly_eleven_tools() -> None:
@@ -49,6 +48,37 @@ def test_review_and_start_run_document_supported_review_agents() -> None:
         ]
 
 
+def test_every_tool_requires_repo_root() -> None:
+    server = create_server()
+
+    for tool in server._tool_manager.list_tools():
+        assert "repo_root" in tool.parameters["required"], tool.name
+        repo_root_schema = tool.parameters["properties"]["repo_root"]
+        assert repo_root_schema["type"] == "string"
+        assert "Always pass the caller's active repository root" in repo_root_schema["description"]
+
+
+@pytest.mark.asyncio
+async def test_tool_boundary_rejects_missing_repo_root_before_creating_artifacts(
+    tmp_path: Path,
+) -> None:
+    server = create_server(tmp_path)
+    plan_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["plan"]
+
+    with pytest.raises(ToolError, match=r"repo_root\s+Field required"):
+        await plan_tool.run({"prompt": "plan it"})
+    assert not (tmp_path / ".codex-dobby").exists()
+
+
+@pytest.mark.asyncio
+async def test_tool_boundary_rejects_relative_repo_root() -> None:
+    server = create_server()
+    plan_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["plan"]
+
+    with pytest.raises(ToolError, match="repo_root must be an absolute path"):
+        await plan_tool.run({"prompt": "plan it", "repo_root": "../wrong-repo"})
+
+
 def test_create_runner_prefers_explicit_codex_binary_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -72,72 +102,19 @@ def test_create_runner_uses_packaged_assets() -> None:
     assert runner.review_agents_root == assets_root / "codex_agents"
 
 
-def test_caller_repo_root_prefers_repo_root_keys() -> None:
-    ctx = SimpleNamespace(
-        _request_context=object(),
-        request_context=SimpleNamespace(
-            meta=SimpleNamespace(
-                model_dump=lambda: {
-                    "cwd": "/tmp/cwd",
-                    "repoRoot": "/tmp/repo-root",
-                    "repo_root": "/tmp/repo-root-explicit",
-                }
-            )
-        ),
-    )
-
-    assert _caller_repo_root(ctx) == "/tmp/repo-root-explicit"
-
-
-def test_caller_repo_root_falls_back_to_cwd() -> None:
-    ctx = SimpleNamespace(
-        _request_context=object(),
-        request_context=SimpleNamespace(
-            meta=SimpleNamespace(
-                model_dump=lambda: {
-                    "cwd": "/tmp/cwd",
-                }
-            )
-        ),
-    )
-
-    assert _caller_repo_root(ctx) == "/tmp/cwd"
-
-
-def test_caller_repo_root_reads_nested_meta_keys() -> None:
-    ctx = SimpleNamespace(
-        _request_context=object(),
-        request_context=SimpleNamespace(
-            meta=SimpleNamespace(
-                model_dump=lambda: {
-                    "_meta": {
-                        "repo_root": "/tmp/nested-repo-root",
-                    }
-                }
-            )
-        ),
-    )
-
-    assert _caller_repo_root(ctx) == "/tmp/nested-repo-root"
-
-
-def test_caller_repo_root_returns_none_without_metadata() -> None:
-    assert _caller_repo_root(None) is None
-    ctx = SimpleNamespace(_request_context=object(), request_context=SimpleNamespace(meta=None))
-    assert _caller_repo_root(ctx) is None
-
-
 @pytest.mark.asyncio
-async def test_review_tool_boundary_rejects_invalid_agents() -> None:
+async def test_review_tool_boundary_rejects_invalid_agents(tmp_path: Path) -> None:
     server = create_server()
     review_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["review"]
 
     with pytest.raises(ToolError, match="Unsupported review agents: bogus"):
-        await review_tool.run({"prompt": "review it", "agents": ["bogus"]})
+        await review_tool.run(
+            {"prompt": "review it", "repo_root": str(tmp_path), "agents": ["bogus"]}
+        )
 
 
 @pytest.mark.asyncio
-async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools() -> None:
+async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools(tmp_path: Path) -> None:
     server = create_server()
     start_run_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["start_run"]
 
@@ -146,6 +123,7 @@ async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools() -> 
             {
                 "tool": "plan",
                 "prompt": "plan it",
+                "repo_root": str(tmp_path),
                 "agents": ["security"],
             }
         )

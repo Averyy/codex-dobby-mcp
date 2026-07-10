@@ -19,7 +19,7 @@ Control-plane tools (return immediately unless noted):
 - `start_run(tool, ...)` — start any worker tool in the background. Returns `task_id`.
 - `get_run(task_id)` — non-blocking status/result lookup. Recovers from disk if server restarted.
 - `wait_run(task_id | task_ids | neither, timeout_seconds=540)` — blocks until done. See patterns below.
-- `list_runs(repo_root?, limit=10)` — recover task ids after caller timeout.
+- `list_runs(repo_root, limit=10)` — recover task ids after caller timeout.
 
 ## Call patterns
 
@@ -66,8 +66,8 @@ Do:
 
 - One task per call. Multiple unrelated asks → multiple calls (parallel when independent).
 - Always pass a concrete, scoped `prompt` with a clear outcome. Vague prompts get vague results.
+- Always pass the absolute path of the caller's active git worktree as `repo_root` on every tool call.
 - Err long on `timeout_seconds`. Defaults are fine. Dobby returns as soon as it's ready.
-- Pass `repo_root` if the client doesn't send working-directory metadata.
 - Use `start_run` + `wait_run` / `get_run` for anything over a few minutes.
 
 Don't:
@@ -87,7 +87,7 @@ Don't:
   ```toml
   [mcp_servers.codex-dobby]
   command = "uv"
-  args = ["--directory", "/ABSOLUTE/PATH/TO/codex-dobby-mcp", "run", "codex-dobby-mcp"]
+  args = ["--project", "/ABSOLUTE/PATH/TO/codex-dobby-mcp", "run", "codex-dobby-mcp"]
   tool_timeout_sec = 100000
   ```
 - **Claude Desktop**: hardcoded ~60s, not configurable.
@@ -95,11 +95,9 @@ Don't:
 
 If the client chops off a `wait_run`, the run keeps going — recover with `get_run(task_id)` or another `wait_run`.
 
-## Repo root resolution
+## Repo root
 
-Order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repo_root`, `repoRoot`, `working_directory`, `workingDirectory`, `cwd`) → server cwd.
-
-If `repo_root` is omitted and the prompt references an absolute path inside a different git worktree, Dobby fails fast. Also fails fast if the prompt names relative files that don't exist under the server cwd. Fix: pass `repo_root` explicitly.
+Every tool requires an explicit absolute `repo_root`. Dobby deliberately does not infer it from MCP metadata or default it to the server cwd, because stdio clients do not reliably send their active workspace and launch commands can change cwd to Dobby's own checkout.
 
 ## Artifacts
 

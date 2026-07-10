@@ -774,7 +774,7 @@ class CodexRunner:
                     "Request references external git worktree(s) "
                     f"{hinted_roots_text} but repo_root was not provided; "
                     f"refusing to default to server cwd {self.spawn_root}. "
-                    "Pass repo_root explicitly or send repo metadata."
+                    "Pass repo_root explicitly."
                 )
 
             relative_candidates: list[str] = []
@@ -801,7 +801,7 @@ class CodexRunner:
                         f"{missing_text}{suffix} that do not exist under server cwd "
                         f"{self.spawn_root} and repo_root was not provided; "
                         "refusing to default to the wrong repo. "
-                        "Pass repo_root explicitly or send repo metadata."
+                        "Pass repo_root explicitly."
                     )
         repo_root = resolve_repo_root(self.spawn_root, request.repo_root)
         extra_roots = resolve_extra_roots(repo_root, request.extra_roots)

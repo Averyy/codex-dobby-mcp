@@ -65,9 +65,7 @@ uv sync
 uv run codex-dobby-mcp
 ```
 
-Target repo is resolved in this order: explicit `repo_root` arg → MCP metadata (`_meta.repo_root`, `repo_root`, `repoRoot`, `working_directory`, `workingDirectory`, `cwd`) → server cwd. If your client sends working-directory metadata, that is enough. Otherwise wrap the launch with `cd`.
-
-Safety guard: if `repo_root` is omitted and the prompt clearly references an absolute path inside a different git worktree, Dobby fails fast instead of silently defaulting to the server cwd. It also refuses to guess when the request only names relative files that do not exist under the server cwd. The caller should retry with explicit `repo_root` or correct working-directory metadata.
+Every tool requires an explicit absolute `repo_root`. Dobby does not use MCP metadata or the server process's cwd as an implicit target: stdio clients do not reliably transmit their active workspace, and source-checkout launchers often run from Dobby's own repo. Requiring the root prevents a request from silently running against the Dobby checkout or another unrelated worktree.
 
 Example launch with an installed tool:
 
@@ -75,8 +73,7 @@ Example launch with an installed tool:
 {
   "mcpServers": {
     "codex-dobby": {
-      "command": "sh",
-      "args": ["-lc", "cd /ABSOLUTE/PATH/TO/TARGET-REPO && codex-dobby-mcp"]
+      "command": "codex-dobby-mcp"
     }
   }
 }
@@ -88,8 +85,8 @@ Example launch from a source checkout:
 {
   "mcpServers": {
     "codex-dobby": {
-      "command": "sh",
-      "args": ["-lc", "cd /ABSOLUTE/PATH/TO/TARGET-REPO && uv --directory /ABSOLUTE/PATH/TO/codex-dobby-mcp run codex-dobby-mcp"]
+      "command": "uv",
+      "args": ["--project", "/ABSOLUTE/PATH/TO/codex-dobby-mcp", "run", "codex-dobby-mcp"]
     }
   }
 }
@@ -106,6 +103,7 @@ Offload grunt work — build/test, code review, research, planning, implementati
 
 - Give focused prompts with a concrete outcome. One task per call — if you have multiple things to ask, make multiple Dobby calls (in parallel when independent) instead of bundling them into one vague prompt.
 - Call `mcp__codex-dobby__*` directly. Never wrap them in a general-purpose Agent/Task subagent.
+- Always pass the absolute path of the current repository as `repo_root` on every Dobby call, including `get_run`, `wait_run`, and `list_runs`.
 - Don't lower `timeout_seconds` below the default. Err too long — a short timeout kills the run; a long one costs nothing because Dobby returns as soon as it's ready.
 - For long work, start it with `mcp__codex-dobby__start_run` and then either block on `mcp__codex-dobby__wait_run` (parent sleeps in the tool call) or poll `mcp__codex-dobby__get_run` (parent keeps working). On Claude Code, `/loop` or `ScheduleWakeup` can schedule the polls for you so the parent is free between checks.
 - To resume, continue, or check on a background run, call `wait_run`/`get_run` with its `task_id` — a Dobby run takes no further input once started, so to change course let it finish (or cancel) and `start_run` again.
@@ -113,17 +111,17 @@ Offload grunt work — build/test, code review, research, planning, implementati
 
 ## Requests
 
-Common params: `prompt`, `repo_root`, `files`, `important_context`, `timeout_seconds`, `extra_roots`, `model`, `reasoning_effort`. Tool-specific: `danger` (`build`, `reverse_engineer`), `agents` (`review`).
+Every tool requires `repo_root`, the absolute path to the target git worktree. Worker tools also take `prompt`; their other common params are `files`, `important_context`, `timeout_seconds`, `extra_roots`, `model`, and `reasoning_effort`. Tool-specific: `danger` (`build`, `reverse_engineer`), `agents` (`review`).
 
 `review` agents: `generalist` (default), `security`, `performance`, `architecture`, `correctness`, `ux`, `regression`. Pass multiple for multi-agent review.
 
 `start_run` takes the same params as the target tool, plus required `tool`. If `timeout_seconds` is omitted, it defaults to that target tool's normal timeout. Non-empty `agents` are only accepted when `tool` is `review`; other tools reject them with a validation error.
 
-`get_run` params: `task_id`, optional `repo_root`.
+`get_run` params: `task_id`, `repo_root`.
 
-`wait_run` params: optional `task_id` (single run), optional `task_ids` (list — first-to-finish wins), optional `repo_root`, `timeout_seconds` (default 540s / 9 min, clamped to `[1, 100_000]` / ~27.8 hours — matching Claude Code's `MCP_TOOL_TIMEOUT` default of `100000000` ms). Omit both `task_id` and `task_ids` to wait on every currently-live run for the repo. Passing both is rejected; an empty `task_ids` list is rejected. On timeout returns a `running` lookup whose `pending_task_ids` lists the ids still outstanding, and whose `summary` instructs the caller to re-call `wait_run` with that list until one finishes. Pick `timeout_seconds` below your MCP client's own `tools/call` ceiling — Claude Code defaults to ~28 hours (so the full clamp is usable); Codex CLI defaults to 60s per `[mcp_servers.<id>].tool_timeout_sec` (so raise that in `~/.codex/config.toml` before using long waits from Codex); Claude Desktop / Cursor / Cline / Continue vary and may cap low.
+`wait_run` params: `repo_root`, optional `task_id` (single run), optional `task_ids` (list — first-to-finish wins), `timeout_seconds` (default 540s / 9 min, clamped to `[1, 100_000]` / ~27.8 hours — matching Claude Code's `MCP_TOOL_TIMEOUT` default of `100000000` ms). Omit both `task_id` and `task_ids` to wait on every currently-live run for the repo. Passing both is rejected; an empty `task_ids` list is rejected. On timeout returns a `running` lookup whose `pending_task_ids` lists the ids still outstanding, and whose `summary` instructs the caller to re-call `wait_run` with that list until one finishes. Pick `timeout_seconds` below your MCP client's own `tools/call` ceiling — Claude Code defaults to ~28 hours (so the full clamp is usable); Codex CLI defaults to 60s per `[mcp_servers.<id>].tool_timeout_sec` (so raise that in `~/.codex/config.toml` before using long waits from Codex); Claude Desktop / Cursor / Cline / Continue vary and may cap low.
 
-`list_runs` params: optional `repo_root`, optional `limit`.
+`list_runs` params: `repo_root`, optional `limit`.
 
 For clients with a short `tools/call` ceiling (Claude Desktop ~60s, unconfigured Codex CLI 60s), prefer `start_run` + `get_run`/`list_runs` for long `review`, `research`, `build`, `validate`, or `reverse_engineer` work. Where the ceiling is raised (Claude Code defaults to ~28h, Codex CLI with `tool_timeout_sec` overridden), `start_run` + `wait_run` is usually fewer round-trips than polling.
 
