@@ -269,7 +269,7 @@ def test_multi_agent_review_uses_medium_parent_reasoning_by_default(tmp_path: Pa
         InvocationRequest(prompt="review it", agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]),
     )
 
-    assert spec.model == "gpt-5.5"
+    assert spec.model == "gpt-5.6-sol"
     assert spec.reasoning_effort == REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
 
 
@@ -476,7 +476,7 @@ def test_short_timeout_plan_uses_medium_reasoning_by_default(tmp_path: Path) -> 
         InvocationRequest(prompt="plan it", timeout_seconds=300),
     )
 
-    assert spec.model == "gpt-5.5"
+    assert spec.model == "gpt-5.6-sol"
     assert spec.reasoning_effort == ReasoningEffort.HIGH
 
 
