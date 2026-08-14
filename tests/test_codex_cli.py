@@ -603,3 +603,80 @@ def test_review_agent_config_falls_back_to_packaged_definition(tmp_path: Path) -
 
     packaged = (agents_root / "review-correctness.toml").resolve()
     assert f"agents.dobby_review_correctness.config_file={_toml_string(str(packaged))}" in command.argv
+
+
+def test_assigned_agent_config_refuses_to_drop_unknown_fields(tmp_path: Path) -> None:
+    """The per-run copy is rebuilt from named fields, so drops must be loud.
+
+    A key added to a packaged agent definition later — a new isolation setting,
+    say — would otherwise vanish from the copy the child actually loads.
+    """
+    from codex_dobby_mcp.codex_cli import _write_assigned_agent_config
+    from codex_dobby_mcp.prompts import ReviewAssignment
+
+    source = tmp_path / "review-correctness.toml"
+    source.write_text(
+        "\n".join(
+            [
+                'name = "dobby_review_correctness"',
+                'description = "d"',
+                'sandbox_mode = "read-only"',
+                "features.multi_agent_v2 = false",
+                "agents.enabled = false",
+                'network_access = true',
+                'developer_instructions = "review things"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assignment = ReviewAssignment(
+        task_name="dobby_review_correctness",
+        canonical_json='{"a":1}',
+        digest="0" * 64,
+        message="msg",
+    )
+
+    with pytest.raises(RuntimeError, match="would drop: network_access"):
+        _write_assigned_agent_config(source, tmp_path / "out", assignment)
+
+
+def test_assigned_agent_config_refuses_a_non_read_only_definition(tmp_path: Path) -> None:
+    from codex_dobby_mcp.codex_cli import _write_assigned_agent_config
+    from codex_dobby_mcp.prompts import ReviewAssignment
+
+    source = tmp_path / "review-correctness.toml"
+    source.write_text(
+        "\n".join(
+            [
+                'name = "dobby_review_correctness"',
+                'description = "d"',
+                'sandbox_mode = "workspace-write"',
+                "features.multi_agent_v2 = false",
+                "agents.enabled = false",
+                'developer_instructions = "review things"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assignment = ReviewAssignment(
+        task_name="dobby_review_correctness",
+        canonical_json="{}",
+        digest="0" * 64,
+        message="msg",
+    )
+
+    with pytest.raises(RuntimeError, match="not read-only"):
+        _write_assigned_agent_config(source, tmp_path / "out", assignment)
+
+
+def test_packaged_review_agents_only_use_fields_the_copy_preserves() -> None:
+    from codex_dobby_mcp.codex_cli import _ASSIGNED_AGENT_CONFIG_FIELDS
+
+    for definition in sorted(REVIEW_AGENTS_ROOT.glob("*.toml")):
+        parsed = tomllib.loads(definition.read_text(encoding="utf-8"))
+        assert set(parsed) <= _ASSIGNED_AGENT_CONFIG_FIELDS, definition.name
+        assert parsed["sandbox_mode"] == "read-only", definition.name
+        assert parsed["features"]["multi_agent_v2"] is False, definition.name
+        assert parsed["agents"]["enabled"] is False, definition.name

@@ -225,6 +225,12 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
+# Every field the per-run agent copy knows how to carry forward.
+_ASSIGNED_AGENT_CONFIG_FIELDS = frozenset(
+    {"name", "description", "sandbox_mode", "features", "agents", "developer_instructions"}
+)
+
+
 def _write_assigned_agent_config(
     source_config: Path,
     agent_config_dir: Path,
@@ -239,10 +245,23 @@ def _write_assigned_agent_config(
     """
     payload = source_config.read_text(encoding="utf-8")
     parsed = tomllib.loads(payload)
+    # The per-run copy is rebuilt from named fields, so a key added to a
+    # packaged definition later would be dropped silently — including, say, a
+    # new isolation setting. Fail loudly instead of quietly weakening a child.
+    unexpected = sorted(set(parsed) - _ASSIGNED_AGENT_CONFIG_FIELDS)
+    if unexpected:
+        raise RuntimeError(
+            f"Injected review agent definition {source_config} has fields the per-run "
+            f"copy would drop: {', '.join(unexpected)}"
+        )
     instructions = parsed.get("developer_instructions")
     if not isinstance(instructions, str):
         raise RuntimeError(
             f"Injected review agent definition has no developer_instructions: {source_config}"
+        )
+    if parsed.get("sandbox_mode") != "read-only":
+        raise RuntimeError(
+            f"Injected review agent definition {source_config} is not read-only"
         )
     assigned = instructions.rstrip() + "\n\n" + "\n".join(
         [
