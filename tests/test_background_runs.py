@@ -1,5 +1,7 @@
 import asyncio
+import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -17,6 +19,8 @@ from codex_dobby_mcp.models import (
     ToolResponse,
 )
 from codex_dobby_mcp.paths import create_run_artifacts, write_json
+from codex_dobby_mcp.runner import CodexRunner
+from codex_dobby_mcp.review_agents import review_agents_root
 
 
 def _artifacts(repo_root: Path, task_id: str) -> RunArtifacts:
@@ -617,3 +621,60 @@ def test_background_run_manager_lists_recent_runs(tmp_path: Path) -> None:
 
     assert listing.repo_root == str(repo_root)
     assert {run.task_id for run in listing.runs} == {"task-one", "task-two"}
+
+
+@pytest.mark.asyncio
+async def test_background_failure_keeps_the_runner_cleanup_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """start_run must not discard "credentials still on disk" reporting.
+
+    run_resolved persists the real cause and its cleanup warnings before the
+    exception reaches the background manager. Overwriting result.json with the
+    thinner background response dropped exactly that, on the path where the
+    artifact is the only record a caller ever sees.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+    manager = BackgroundRunManager(runner)
+
+    leak = (
+        "Failed to delete private runtime containing copied credentials and "
+        "session data at /tmp/private-runtime: resource busy"
+    )
+
+    async def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("codex exploded")
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", boom)
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._cleanup_private_child_runtime",
+        lambda path, logger=None: leak,
+    )
+
+    spec = runner.prepare(
+        ToolName.PLAN, InvocationRequest(prompt="inspect", repo_root=str(repo_root))
+    )
+    handle = manager.start(spec)
+    await manager.wait(repo_root, None, [handle.task_id], 30.0)
+
+    persisted = json.loads(
+        (repo_root / ".codex-dobby" / "runs" / handle.task_id / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert persisted["status"] == "error"
+    assert any(leak in warning for warning in persisted["warnings"])
+    assert any("codex exploded" in warning for warning in persisted["warnings"])

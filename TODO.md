@@ -109,18 +109,12 @@ reviewer reviews.
   The never-delivered and partial-failure shapes still rely on the synthetic
   `_write_review_rollouts` writer, which can drift from real Codex output.
   Capturing a real partial-failure rollout would close that gap.
-- When `_run_with_child_runtime` raises before returning a response (for
-  example `Codex executable not found`), the cleanup warnings are logged but
-  not surfaced, and `result.json` keeps the aborted stub that reports
-  `stop_reason: cancelled`, which misstates the cause.
+
 - A per-lens integrity failure returns `status: error` while the response still
   carries other lenses' verified `important_facts`. That content is
   independently verified, so it is deliberate, but it is worth stating in
   README alongside the integrity/coverage split.
 
-- python-sdk #3067: tool argument models default to `extra="ignore"`, so a
-  misspelled argument name is silently dropped rather than rejected. Upstream;
-  no local workaround applied.
 - Consider widening the ruff rule selection (import sorting, `UP`, `SIM`,
   `ASYNC`) in a dedicated change. `ASYNC240`/`ASYNC221` report ~130 findings
   that need individual judgement about which blocking calls are deliberate.

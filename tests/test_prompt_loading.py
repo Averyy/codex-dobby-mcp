@@ -1,4 +1,8 @@
+import hashlib
+import json
 from pathlib import Path
+
+import pytest
 
 from codex_dobby_mcp.models import DEFAULT_TIMEOUT_SECONDS, InvocationRequest, ReviewAgent, ToolName
 from codex_dobby_mcp.prompts import PromptLoader
@@ -404,3 +408,53 @@ def test_timeout_floor_keeps_short_timeout_budgets_unreachable() -> None:
             reasoning_effort="high",
         )
         assert "Short-timeout mode for this run: `yes`." not in rendered
+
+
+@pytest.mark.parametrize(
+    ("label", "prompt"),
+    [
+        ("line_separator", "review parser.py \u2028 carefully"),
+        ("paragraph_separator", "review parser.py \u2029 carefully"),
+        ("next_line", "review parser.py \u0085 carefully"),
+        ("astral", "review the \U0001f600 handling"),
+        ("backtick_fence", "review the ``` fence handling"),
+    ],
+)
+def test_canonical_assignment_survives_line_oriented_parsing(
+    label: str, prompt: str
+) -> None:
+    """Caller text must not be able to split the canonical assignment.
+
+    The assignment sits on one line of a line-oriented spawn message, and
+    ``str.splitlines()`` treats U+2028, U+2029, and U+0085 as line breaks. A
+    prompt containing one used to split the assignment across lines, so
+    validation could not reparse it and quarantined the entire review.
+    """
+    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
+
+    assignment = loader.review_subagent_assignments(
+        request=InvocationRequest(
+            prompt=prompt,
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        ),
+        repo_root=Path("/repo"),
+        sandbox_roots=[Path("/repo")],
+        advisory_read_only_roots=[],
+        fetchaller_available=False,
+        ghidra_available=False,
+    )["dobby_review_correctness"]
+
+    assert assignment.canonical_json.isascii(), label
+    # The assignment still occupies exactly one line of the spawn message.
+    marker = "Canonical assignment JSON: "
+    matches = [
+        line for line in assignment.message.splitlines() if line.startswith(marker)
+    ]
+    assert len(matches) == 1, label
+    assert json.loads(matches[0][len(marker) :])["task_prompt"] == prompt
+
+    # And the digest covers exactly that reparsable value.
+    assert (
+        hashlib.sha256(assignment.canonical_json.encode("utf-8")).hexdigest()
+        == assignment.digest
+    ), label

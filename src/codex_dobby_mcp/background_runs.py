@@ -372,18 +372,24 @@ class BackgroundRunManager:
         try:
             return await self._runner.run_resolved(spec, event_sink=event_sink)
         except asyncio.CancelledError:
-            response = self._background_failure_response(
+            response = self._with_persisted_failure_detail(
                 spec,
-                "Background run was cancelled before completion.",
-                stop_reason=StopReason.CANCELLED,
+                self._background_failure_response(
+                    spec,
+                    "Background run was cancelled before completion.",
+                    stop_reason=StopReason.CANCELLED,
+                ),
             )
             write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
             return response
         except Exception as exc:
-            response = self._background_failure_response(
+            response = self._with_persisted_failure_detail(
                 spec,
-                f"Background run failed: {exc}",
-                stop_reason=StopReason.ERROR,
+                self._background_failure_response(
+                    spec,
+                    f"Background run failed: {exc}",
+                    stop_reason=StopReason.ERROR,
+                ),
             )
             write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
             return response
@@ -476,6 +482,48 @@ class BackgroundRunManager:
             result=result,
             warnings=list(result.warnings),
         )
+
+    @staticmethod
+    def _with_persisted_failure_detail(
+        spec: ResolvedInvocation,
+        response: ToolResponse,
+    ) -> ToolResponse:
+        """Fold the runner's own failure artifact into the background response.
+
+        ``run_resolved`` persists the real cause and any runtime-cleanup
+        warnings — including a private runtime with copied credentials that
+        could not be deleted — before the exception reaches here. Overwriting
+        result.json with the thinner background response would discard exactly
+        that, and on the start_run path the artifact is the only record a
+        caller ever sees.
+        """
+        try:
+            persisted = json.loads(
+                spec.artifacts.result_json.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return response
+        if (
+            not isinstance(persisted, dict)
+            or persisted.get("status") != RunStatus.ERROR.value
+        ):
+            return response
+
+        carried: list[str] = []
+        summary = persisted.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            carried.append(summary.strip())
+        for warning in persisted.get("warnings") or []:
+            if isinstance(warning, str) and warning.strip():
+                carried.append(warning.strip())
+
+        merged = list(response.warnings)
+        for entry in carried:
+            if entry not in merged:
+                merged.append(entry)
+        if merged == list(response.warnings):
+            return response
+        return response.model_copy(update={"warnings": merged})
 
     def _background_failure_response(
         self,

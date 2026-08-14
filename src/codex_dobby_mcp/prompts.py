@@ -291,9 +291,16 @@ class PromptLoader:
             "review_lens": agent.label,
             "task_name": agent.codex_name,
         }
+        # ASCII-only on purpose. This value is embedded on a single line of a
+        # line-oriented spawn message and inside a TOML string in the per-run
+        # agent definition, and it is covered by the digest each child attests.
+        # Raw non-ASCII breaks both: str.splitlines() treats U+2028, U+2029,
+        # and U+0085 as line breaks, so a caller prompt containing one split
+        # the canonical assignment across lines and quarantined the whole
+        # review; and astral characters cannot be escaped into TOML at all.
         canonical_assignment = json.dumps(
             assignment,
-            ensure_ascii=False,
+            ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
         ).replace("`", r"\u0060")

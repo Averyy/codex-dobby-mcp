@@ -242,8 +242,40 @@ def _looks_like_live_socket_root(path: Path) -> bool:
         return False
 
 
+# TOML basic-string escapes with a short form. Everything else printable may
+# appear literally, including astral-plane characters.
+_TOML_SHORT_ESCAPES = {
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+    '"': '\\"',
+    "\\": "\\\\",
+}
+
+
 def _toml_string(value: str) -> str:
-    return json.dumps(value)
+    """Encode a Python string as a TOML basic string.
+
+    Deliberately not ``json.dumps``: it escapes astral-plane characters as
+    surrogate pairs (``\\ud83d\\ude00``), which TOML rejects because an escape
+    must denote a Unicode scalar value. Caller text reaches the per-run agent
+    definition, so a single emoji in a prompt would otherwise make that file
+    unparseable and kill the whole orchestrated review.
+    """
+    out = ['"']
+    for char in value:
+        escaped = _TOML_SHORT_ESCAPES.get(char)
+        if escaped is not None:
+            out.append(escaped)
+        elif char < " " or char == "\x7f":
+            # Control characters must be escaped; TOML has no literal form.
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
 
 
 # Every field the per-run agent copy knows how to carry forward.
