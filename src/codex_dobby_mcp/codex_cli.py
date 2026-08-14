@@ -326,8 +326,14 @@ def _write_assigned_agent_config(
             "",
         ]
     )
-    agent_config_dir.mkdir(parents=True, exist_ok=True)
+    # The assignment embeds the caller's task, files, and context, so keep the
+    # directory owner-only too rather than relying solely on the private
+    # runtime root above it.
+    agent_config_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    agent_config_dir.chmod(0o700)
     target = agent_config_dir / source_config.name
+    if target.is_symlink():
+        raise RuntimeError(f"Per-run agent config must not be a symlink: {target}")
     target.write_text(rendered, encoding="utf-8")
     target.chmod(0o600)
     return target

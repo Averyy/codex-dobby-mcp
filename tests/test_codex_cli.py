@@ -840,3 +840,39 @@ def test_assignment_content_cannot_break_out_of_the_agent_config(
         entry for entry in instructions.splitlines() if entry.startswith(marker)
     )
     assert json.loads(line[len(marker) :])["task_prompt"] == payload
+
+
+def test_assigned_agent_config_directory_is_owner_only(tmp_path: Path) -> None:
+    """The per-run copy embeds the caller's task, files, and context."""
+    from codex_dobby_mcp.codex_cli import _write_assigned_agent_config
+    from codex_dobby_mcp.prompts import ReviewAssignment
+
+    source = tmp_path / "review-correctness.toml"
+    source.write_text(
+        "\n".join(
+            [
+                'name = "dobby_review_correctness"',
+                'description = "d"',
+                'sandbox_mode = "read-only"',
+                "features.multi_agent_v2 = false",
+                "agents.enabled = false",
+                'developer_instructions = "review things"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    target_dir = tmp_path / "child-home" / "dobby-agents"
+    written = _write_assigned_agent_config(
+        source,
+        target_dir,
+        ReviewAssignment(
+            task_name="dobby_review_correctness",
+            canonical_json='{"important_context":"secret"}',
+            digest="0" * 64,
+            message="m",
+        ),
+    )
+
+    assert target_dir.stat().st_mode & 0o777 == 0o700
+    assert written.stat().st_mode & 0o777 == 0o600
