@@ -1,4 +1,5 @@
 import asyncio
+import codex_dobby_mcp.runner as runner_module
 from dataclasses import replace
 from contextlib import suppress
 import hashlib
@@ -6462,3 +6463,168 @@ async def test_failed_run_persists_the_real_cause_not_the_cancelled_stub(
     assert "cancelled or killed" not in persisted["summary"]
     # The child scratch tree is still cleaned up on the exception path.
     assert not (run_dirs[0] / "runtime").exists()
+
+
+@pytest.mark.asyncio
+async def test_failure_artifact_is_not_recorded_as_a_sandbox_violation(
+    tmp_path: Path,
+) -> None:
+    """An internal exception is not a sandbox boundary being crossed.
+
+    The failure artifact reused the preflight builder, which puts its message in
+    sandbox_violations. Any parse error or filesystem problem then looked like a
+    sandbox escape to anyone acting on that field.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+        codex_binary="/nonexistent/codex",
+    )
+
+    with pytest.raises(RunnerError):
+        await runner.run(ToolName.PLAN, InvocationRequest(prompt="inspect"))
+
+    run_dir = next(iter((repo_root / ".codex-dobby" / "runs").iterdir()))
+    persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+
+    assert persisted["status"] == "error"
+    assert "Codex executable not found" in persisted["summary"]
+    assert persisted["sandbox_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_failure_after_a_response_exists_still_persists_the_real_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If persisting a result is what failed, the artifact must say so.
+
+    The caller receives the exception rather than the response, so keying the
+    failure artifact on "no response was produced" left result.json claiming
+    the run was cancelled.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+            return (b"", b"")
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "summary": "planned",
+                    "completeness": "full",
+                    "important_facts": ["a fact"],
+                    "next_steps": [],
+                    "files_changed": [],
+                    "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    real_write_json = runner_module.write_json
+    calls = {"n": 0}
+
+    def flaky_write_json(path, payload):  # type: ignore[no-untyped-def]
+        # _finalize persists the result first and run_resolved persists it
+        # again. Fail only the second write, so the failure happens with a
+        # response already in hand — the case that previously left the aborted
+        # stub in place while the caller received an exception.
+        if path.name == "result.json" and payload.get("status") == "success":
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk full")
+        return real_write_json(path, payload)
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("codex_dobby_mcp.runner.write_json", flaky_write_json)
+
+    with pytest.raises(OSError, match="disk full"):
+        await runner.run(ToolName.PLAN, InvocationRequest(prompt="inspect"))
+
+    assert calls["n"] == 2
+    run_dir = next(iter((repo_root / ".codex-dobby" / "runs").iterdir()))
+    persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+
+    assert persisted["status"] == "error"
+    assert "disk full" in persisted["summary"]
+    assert "cancelled or killed" not in persisted["summary"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_run_still_reports_a_private_runtime_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation must not hide credentials left on disk.
+
+    The cancel path re-raises without producing a response, so a failed private
+    runtime deletion was only logged and result.json kept the generic cancelled
+    stub — while the copied auth and session data were still there.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    async def cancel_mid_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise asyncio.CancelledError()
+
+    def failing_private_cleanup(path, logger=None):  # type: ignore[no-untyped-def]
+        return (
+            "Failed to delete private runtime containing copied credentials and "
+            f"session data at {path}: resource busy"
+        )
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", cancel_mid_run)
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._cleanup_private_child_runtime", failing_private_cleanup
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(ToolName.PLAN, InvocationRequest(prompt="inspect"))
+
+    run_dir = next(iter((repo_root / ".codex-dobby" / "runs").iterdir()))
+    persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+
+    assert persisted["status"] == "error"
+    assert "copied credentials and session data" in persisted["summary"]
+    assert any("copied credentials" in warning for warning in persisted["warnings"])
+    # Not misreported as a sandbox violation.
+    assert persisted["sandbox_violations"] == []

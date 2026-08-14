@@ -31,6 +31,26 @@ from codex_dobby_mcp.review_agents import (
 REVIEW_AGENTS_ROOT = Path(__file__).resolve().parents[1] / "src" / "codex_dobby_mcp" / "assets" / "codex_agents"
 
 
+def make_review_assignments(spec) -> dict:
+    """Assignments for every selected reviewer, as the runner supplies them."""
+    from codex_dobby_mcp.prompts import ReviewAssignment
+    from codex_dobby_mcp.review_agents import selected_review_agent_definitions
+
+    return {
+        definition.codex_name: ReviewAssignment(
+            task_name=definition.codex_name,
+            canonical_json=json.dumps(
+                {"task_name": definition.codex_name}, separators=(",", ":")
+            ),
+            digest=f"{index:064d}",
+            message=f"message for {definition.codex_name}",
+        )
+        for index, definition in enumerate(
+            selected_review_agent_definitions(spec.request.agents)
+        )
+    }
+
+
 def make_artifacts(tmp_path: Path) -> RunArtifacts:
     run_dir = tmp_path / ".codex-dobby" / "runs" / "task-1"
     run_dir.mkdir(parents=True)
@@ -216,6 +236,8 @@ def test_review_tool_injects_selected_custom_agents(tmp_path: Path) -> None:
         "/opt/homebrew/bin/codex",
         spec.artifacts.output_schema_json,
         REVIEW_AGENTS_ROOT,
+        review_assignments=make_review_assignments(spec),
+        review_agent_config_dir=tmp_path / "child-agents",
     )
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
@@ -298,6 +320,8 @@ def test_multi_agent_review_children_inherit_explicit_parent_model_and_use_reque
         "/opt/homebrew/bin/codex",
         spec.artifacts.output_schema_json,
         REVIEW_AGENTS_ROOT,
+        review_assignments=make_review_assignments(spec),
+        review_agent_config_dir=tmp_path / "child-agents",
     )
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
@@ -577,33 +601,55 @@ def test_review_agent_config_carries_the_assignment_out_of_band(tmp_path: Path) 
     assert regression.digest not in instructions
 
 
-def test_review_agent_config_falls_back_to_packaged_definition(tmp_path: Path) -> None:
-    """Without assignments (or a target dir) the packaged asset is used as-is."""
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
-    assets_root = Path(__file__).resolve().parents[1] / "src" / "codex_dobby_mcp" / "assets"
-    agents_root = review_agents_root(assets_root)
-    runner = CodexRunner(
-        spawn_root=repo_root,
-        prompts_root=assets_root / "prompts",
-        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
-        review_agents_root=agents_root,
-    )
-    spec = runner.prepare(
-        ToolName.REVIEW,
-        InvocationRequest(
-            prompt="review the parser",
-            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
-        ),
-    )
+def test_orchestrated_review_fails_closed_without_out_of_band_assignments(
+    tmp_path: Path,
+) -> None:
+    """Missing assignments must fail the run, not revert to the old contract.
 
-    command = build_codex_command(
-        spec, "/usr/bin/codex", spec.artifacts.output_schema_json, agents_root, None
+    Falling back to the packaged, assignment-free definition would silently
+    restore parent-relayed scope — the exact weakness out-of-band delivery
+    exists to remove — while the review still appeared to run normally.
+    """
+    spec = make_spec(tmp_path, ToolName.REVIEW)
+    spec.request = InvocationRequest(
+        prompt="review the diff",
+        agents=[ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
     )
+    assignments = make_review_assignments(spec)
 
-    packaged = (agents_root / "review-correctness.toml").resolve()
-    assert f"agents.dobby_review_correctness.config_file={_toml_string(str(packaged))}" in command.argv
+    def build(**kwargs):
+        return build_codex_command(
+            spec,
+            "/opt/homebrew/bin/codex",
+            spec.artifacts.output_schema_json,
+            REVIEW_AGENTS_ROOT,
+            **kwargs,
+        )
+
+    # No target directory at all.
+    with pytest.raises(RuntimeError, match="private agent config directory"):
+        build(review_assignments=assignments)
+    with pytest.raises(RuntimeError, match="private agent config directory"):
+        build()
+
+    # A lens with no assignment.
+    with pytest.raises(RuntimeError, match="missing dobby_review_regression"):
+        build(
+            review_assignments={
+                "dobby_review_security": assignments["dobby_review_security"]
+            },
+            review_agent_config_dir=tmp_path / "child-agents",
+        )
+
+    # An assignment for a lens that was not selected.
+    with pytest.raises(RuntimeError, match="unexpected dobby_review_ux"):
+        build(
+            review_assignments={
+                **assignments,
+                "dobby_review_ux": assignments["dobby_review_security"],
+            },
+            review_agent_config_dir=tmp_path / "child-agents",
+        )
 
 
 def test_assigned_agent_config_refuses_to_drop_unknown_fields(tmp_path: Path) -> None:
@@ -672,12 +718,54 @@ def test_assigned_agent_config_refuses_a_non_read_only_definition(tmp_path: Path
         _write_assigned_agent_config(source, tmp_path / "out", assignment)
 
 
+def test_assigned_agent_config_refuses_to_drop_nested_fields(tmp_path: Path) -> None:
+    """A new key under features or agents must not slip past the guard.
+
+    The top-level tables are allowlisted wholesale but the copy reproduces only
+    features.multi_agent_v2 and agents.enabled, so a future nested isolation
+    control would be dropped from every child while the guard stayed silent.
+    """
+    from codex_dobby_mcp.codex_cli import _write_assigned_agent_config
+    from codex_dobby_mcp.prompts import ReviewAssignment
+
+    source = tmp_path / "review-correctness.toml"
+    source.write_text(
+        "\n".join(
+            [
+                'name = "dobby_review_correctness"',
+                'description = "d"',
+                'sandbox_mode = "read-only"',
+                "features.multi_agent_v2 = false",
+                "agents.enabled = false",
+                "agents.max_depth = 3",
+                'developer_instructions = "review things"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assignment = ReviewAssignment(
+        task_name="dobby_review_correctness",
+        canonical_json="{}",
+        digest="0" * 64,
+        message="m",
+    )
+
+    with pytest.raises(RuntimeError, match=r"would drop: agents\.max_depth"):
+        _write_assigned_agent_config(source, tmp_path / "out", assignment)
+
+
 def test_packaged_review_agents_only_use_fields_the_copy_preserves() -> None:
-    from codex_dobby_mcp.codex_cli import _ASSIGNED_AGENT_CONFIG_FIELDS
+    from codex_dobby_mcp.codex_cli import (
+        _ASSIGNED_AGENT_CONFIG_FIELDS,
+        _ASSIGNED_AGENT_NESTED_FIELDS,
+    )
 
     for definition in sorted(REVIEW_AGENTS_ROOT.glob("*.toml")):
         parsed = tomllib.loads(definition.read_text(encoding="utf-8"))
         assert set(parsed) <= _ASSIGNED_AGENT_CONFIG_FIELDS, definition.name
+        for table, allowed in _ASSIGNED_AGENT_NESTED_FIELDS.items():
+            assert set(parsed.get(table, {})) <= allowed, f"{definition.name}:{table}"
         assert parsed["sandbox_mode"] == "read-only", definition.name
         assert parsed["features"]["multi_agent_v2"] is False, definition.name
         assert parsed["agents"]["enabled"] is False, definition.name

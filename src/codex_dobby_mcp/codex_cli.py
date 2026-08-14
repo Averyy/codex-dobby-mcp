@@ -153,6 +153,29 @@ def _review_agent_overrides(
         )
     )
 
+    # Out-of-band assignment delivery is the control that stops a steered
+    # parent choosing what a reviewer reviews, so a missing assignment or
+    # target directory must fail the run rather than quietly restore the
+    # parent-relayed contract.
+    if agent_config_dir is None:
+        raise RuntimeError(
+            "Orchestrated review requires a private agent config directory for "
+            "out-of-band assignment delivery"
+        )
+    expected_names = {agent.codex_name for agent in registrations}
+    missing = sorted(expected_names - set(assignments))
+    unexpected = sorted(set(assignments) - expected_names)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise RuntimeError(
+            "Orchestrated review assignments do not match the selected reviewers: "
+            + "; ".join(details)
+        )
+
     for agent in registrations:
         config_path = (agents_root / agent.filename).resolve()
         if not config_path.exists():
@@ -162,13 +185,11 @@ def _review_agent_overrides(
         # into the child's private runtime and names it in an argv override, so
         # the orchestrating parent can choose which reviewer starts but not
         # what that reviewer is told to review.
-        assignment = assignments.get(agent.codex_name)
-        if assignment is not None and agent_config_dir is not None:
-            config_path = _write_assigned_agent_config(
-                config_path,
-                agent_config_dir,
-                assignment,
-            )
+        config_path = _write_assigned_agent_config(
+            config_path,
+            agent_config_dir,
+            assignments[agent.codex_name],
+        )
         overrides.extend(
             [
                 (f"agents.{agent.codex_name}.description", _toml_string(agent.description)),
@@ -229,6 +250,13 @@ def _toml_string(value: str) -> str:
 _ASSIGNED_AGENT_CONFIG_FIELDS = frozenset(
     {"name", "description", "sandbox_mode", "features", "agents", "developer_instructions"}
 )
+# The per-run copy reproduces exactly these nested keys. Anything else added
+# under features or agents would pass a top-level check and vanish silently,
+# which is precisely how a future isolation control would be lost.
+_ASSIGNED_AGENT_NESTED_FIELDS = {
+    "features": frozenset({"multi_agent_v2"}),
+    "agents": frozenset({"enabled"}),
+}
 
 
 def _write_assigned_agent_config(
@@ -248,11 +276,15 @@ def _write_assigned_agent_config(
     # The per-run copy is rebuilt from named fields, so a key added to a
     # packaged definition later would be dropped silently — including, say, a
     # new isolation setting. Fail loudly instead of quietly weakening a child.
-    unexpected = sorted(set(parsed) - _ASSIGNED_AGENT_CONFIG_FIELDS)
-    if unexpected:
+    dropped = sorted(set(parsed) - _ASSIGNED_AGENT_CONFIG_FIELDS)
+    for table, allowed in _ASSIGNED_AGENT_NESTED_FIELDS.items():
+        nested = parsed.get(table)
+        if isinstance(nested, dict):
+            dropped.extend(f"{table}.{key}" for key in sorted(set(nested) - allowed))
+    if dropped:
         raise RuntimeError(
             f"Injected review agent definition {source_config} has fields the per-run "
-            f"copy would drop: {', '.join(unexpected)}"
+            f"copy would drop: {', '.join(sorted(dropped))}"
         )
     instructions = parsed.get("developer_instructions")
     if not isinstance(instructions, str):

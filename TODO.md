@@ -85,35 +85,20 @@ regression test verified to fail when its fix is reverted:
 
 ## Open
 
-### Assignment attestation binds the digest, not the assignment
+### Tightening the ciphertext shape check needs a real capture
 
-Raised by review of the fixes on 2026-08-14. Not introduced by them — it is a
-property of the v2 evidence chain as designed — but the partial-coverage split
-rests on it, so it is worth resolving deliberately.
+`_looks_like_opaque_encrypted_message` accepts any run of 128+ characters from
+`[A-Za-z0-9_=-]`, so underscore-separated prose passes as ciphertext and skips
+the canonical-contract comparison. Calibrating an entropy or character-mix
+threshold needs a captured *real* provider ciphertext: the checked-in fixture is
+sanitized to a placeholder, and a threshold that rejected genuine ciphertext
+would quarantine valid reviews — worse than the bypass it closes. Blocked on the
+same fixture-capture item below.
 
-`_result_with_verified_assignment_attestation` proves a child *saw* the
-canonical assignment digest. It does not prove the child *received* the
-canonical assignment. The parent holds the digest itself: it is line 4 of the
-message embedded in the parent's own prompt. A parent steered by repository
-content could therefore spawn the correct custom role with a substituted
-message that instructs the child to open its summary with the expected
-`Dobby assignment <sha>: ` prefix, and the lens would land `completed` with
-`manifest_validated: true` and `execution_evidence: codex_session_rollouts`.
-
-Two narrower weaknesses feed the same path:
-
-- `_looks_like_opaque_encrypted_message` accepts any run of 128+ characters
-  from `[A-Za-z0-9_=-]`, so underscore-separated English passes as ciphertext
-  and skips the canonical-contract comparison entirely, with no encryption
-  marker present.
-- `_canonical_spawn_contract` binds only the first three lines, so the trailing
-  requirements block of a spawn message is substitutable even on the
-  plaintext-comparison path. The scope JSON is bound.
-
-Nothing in the suite covers a child that attests the right digest from a wrong
-message. Fixing this needs a binding the parent cannot forge — a per-run secret
-the child echoes, or provider-side verification of the delivered plaintext —
-rather than a digest the parent already knows.
+The assignment-substitution weakness this used to feed is closed separately:
+each lens's canonical assignment is now delivered out of band through the
+per-run agent definition, so a substituted spawn message cannot change what a
+reviewer reviews.
 
 ### Smaller open items
 

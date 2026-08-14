@@ -297,6 +297,7 @@ class CodexRunner:
 
         response: ToolResponse | None = None
         failure: BaseException | None = None
+        cancelled = False
         try:
             if spec.tool == ToolName.REVIEW and review_uses_orchestrator(
                 spec.request.agents
@@ -337,7 +338,9 @@ class CodexRunner:
                 response.model_dump(mode="json", by_alias=True),
             )
         except asyncio.CancelledError:
-            # The aborted stub already describes cancellation accurately.
+            # The aborted stub describes cancellation accurately on its own,
+            # but a cleanup failure during cancellation still has to surface.
+            cancelled = True
             raise
         except Exception as exc:
             # Remember why, so the persisted artifact reports the real cause
@@ -370,28 +373,29 @@ class CodexRunner:
                     response,
                     cleanup_issue,
                 )
-            if response is None and failure is not None:
-                # The run raised before producing a response. Replace the
-                # aborted stub, which claims Dobby was cancelled or killed,
-                # with the actual failure plus any cleanup issues that would
-                # otherwise only reach the log.
-                failed_response = self._preflight_response(
-                    spec, started, f"{type(failure).__name__}: {failure}"
+            cleanup_warnings = [
+                issue for issue in (scratch_issue, cleanup_issue) if issue is not None
+            ]
+            if failure is not None:
+                # The run raised. Replace the aborted stub, which claims Dobby
+                # was cancelled or killed, with the actual cause plus any
+                # cleanup issues that would otherwise only reach the log. This
+                # runs even when a response object exists, because the caller
+                # receives the exception rather than that response — for
+                # example when persisting a successful result is what failed.
+                self._write_failure_artifact(
+                    spec,
+                    started,
+                    f"{type(failure).__name__}: {failure}",
+                    cleanup_warnings,
                 )
-                cleanup_warnings = [
-                    issue for issue in (scratch_issue, cleanup_issue) if issue is not None
-                ]
-                if cleanup_warnings:
-                    failed_response = failed_response.model_copy(
-                        update={
-                            "warnings": _merge_preserving_order(
-                                failed_response.warnings, cleanup_warnings
-                            )
-                        }
-                    )
-                write_json(
-                    spec.artifacts.result_json,
-                    failed_response.model_dump(mode="json", by_alias=True),
+            elif cancelled and cleanup_issue is not None:
+                # Cancellation itself is described by the aborted stub, but a
+                # private-runtime deletion failure means copied credentials and
+                # session data are still on disk. README promises that is
+                # reported, so it must not be swallowed by the cancel path.
+                self._write_failure_artifact(
+                    spec, started, cleanup_issue, cleanup_warnings
                 )
             elif (
                 scratch_issue is not None or cleanup_issue is not None
@@ -877,11 +881,37 @@ class CodexRunner:
         write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
         return response
 
+    def _write_failure_artifact(
+        self,
+        spec: ResolvedInvocation,
+        started: float,
+        issue: str,
+        cleanup_warnings: list[str],
+    ) -> None:
+        """Persist the real cause of an abnormal exit over the aborted stub."""
+        failed_response = self._preflight_response(
+            spec, started, issue, as_sandbox_violation=False
+        )
+        if cleanup_warnings:
+            failed_response = failed_response.model_copy(
+                update={
+                    "warnings": _merge_preserving_order(
+                        failed_response.warnings, cleanup_warnings
+                    )
+                }
+            )
+        write_json(
+            spec.artifacts.result_json,
+            failed_response.model_dump(mode="json", by_alias=True),
+        )
+
     @staticmethod
     def _preflight_response(
         spec: ResolvedInvocation,
         started: float,
         issue: str,
+        *,
+        as_sandbox_violation: bool = True,
     ) -> ToolResponse:
         return ToolResponse(
             task_id=spec.artifacts.run_dir.name,
@@ -893,7 +923,10 @@ class CodexRunner:
             next_steps=[],
             files_changed=[],
             artifact_paths=spec.artifacts.as_public_dict(),
-            sandbox_violations=[issue],
+            # Preflight failures are sandbox/permission problems. An arbitrary
+            # internal exception is not, and recording it here would make
+            # sandbox_violations meaningless to anyone acting on it.
+            sandbox_violations=[issue] if as_sandbox_violation else [],
             repo_root=str(spec.repo_root),
             exit_code=None,
             duration_ms=int((time.monotonic() - started) * 1000),
