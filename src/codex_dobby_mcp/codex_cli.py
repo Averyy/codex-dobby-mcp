@@ -266,6 +266,16 @@ def _toml_string(value: str) -> str:
     """
     out = ['"']
     for char in value:
+        if 0xD800 <= ord(char) <= 0xDFFF:
+            # Surrogate code points are not Unicode scalar values: they cannot
+            # be encoded as UTF-8, so they would fail at argv encoding or make
+            # the written config unreadable. Caller strings reach here (an
+            # unrestricted `model`, a surrogate-escaped path), so reject them
+            # with a clear cause rather than a UnicodeEncodeError later.
+            raise RuntimeError(
+                "Cannot encode a surrogate code point "
+                f"U+{ord(char):04X} into a TOML value"
+            )
         escaped = _TOML_SHORT_ESCAPES.get(char)
         if escaped is not None:
             out.append(escaped)
@@ -311,8 +321,17 @@ def _write_assigned_agent_config(
     dropped = sorted(set(parsed) - _ASSIGNED_AGENT_CONFIG_FIELDS)
     for table, allowed in _ASSIGNED_AGENT_NESTED_FIELDS.items():
         nested = parsed.get(table)
-        if isinstance(nested, dict):
-            dropped.extend(f"{table}.{key}" for key in sorted(set(nested) - allowed))
+        if nested is None:
+            continue
+        if not isinstance(nested, dict):
+            # A scalar here is not merely an unknown key: the copy would
+            # replace it with a table, silently changing what the definition
+            # says.
+            raise RuntimeError(
+                f"Injected review agent definition {source_config} has a "
+                f"non-table {table} value: {nested!r}"
+            )
+        dropped.extend(f"{table}.{key}" for key in sorted(set(nested) - allowed))
     if dropped:
         raise RuntimeError(
             f"Injected review agent definition {source_config} has fields the per-run "

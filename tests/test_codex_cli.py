@@ -938,3 +938,50 @@ def test_only_the_per_run_copy_claims_an_embedded_assignment(tmp_path: Path) -> 
     assigned = tomllib.loads(written.read_text(encoding="utf-8"))["developer_instructions"]
     assert claim in assigned
     assert "record the discrepancy in warnings" in assigned
+
+
+@pytest.mark.parametrize("codepoint", [0xD800, 0xDBFF, 0xDC00, 0xDFFF])
+def test_toml_string_rejects_surrogate_code_points(codepoint: int) -> None:
+    """Surrogates are not Unicode scalar values and cannot be UTF-8 encoded.
+
+    A JSON argument such as "\\ud800" survives decoding into a Python string, so
+    an unrestricted caller value like `model` can carry one into command
+    construction. Failing here names the cause instead of surfacing a
+    UnicodeEncodeError from argv encoding much later.
+    """
+    with pytest.raises(RuntimeError, match="surrogate code point"):
+        _toml_string(f"model-{chr(codepoint)}-preview")
+
+
+def test_assigned_agent_config_rejects_non_table_nested_values(tmp_path: Path) -> None:
+    """`features = false` must not be quietly rewritten into a table."""
+    from codex_dobby_mcp.codex_cli import _write_assigned_agent_config
+    from codex_dobby_mcp.prompts import ReviewAssignment
+
+    source = tmp_path / "review-correctness.toml"
+    source.write_text(
+        "\n".join(
+            [
+                'name = "dobby_review_correctness"',
+                'description = "d"',
+                'sandbox_mode = "read-only"',
+                "features = false",
+                "agents.enabled = false",
+                'developer_instructions = "review things"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="non-table features value"):
+        _write_assigned_agent_config(
+            source,
+            tmp_path / "out",
+            ReviewAssignment(
+                task_name="dobby_review_correctness",
+                canonical_json="{}",
+                digest="0" * 64,
+                message="m",
+            ),
+        )
