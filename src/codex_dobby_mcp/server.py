@@ -111,6 +111,26 @@ def _effective_start_run_timeout(
     return DEFAULT_TOOL_TIMEOUT_SECONDS[tool]
 
 
+def _reject_unknown_tool_arguments(server: MCPServer) -> None:
+    """Make a misspelled argument an error instead of a silent default.
+
+    The SDK builds each tool's argument model with Pydantic's default
+    ``extra="ignore"`` (python-sdk #3067), so a caller who writes ``file=[...]``
+    instead of ``files=[...]`` has it dropped and unknowingly gets a whole-repo
+    run. Dobby's arguments materially change scope, cost, and permissions, so
+    an unknown name should fail loudly. Also republishes each tool's input
+    schema so ``additionalProperties: false`` is visible to clients rather than
+    only enforced server-side.
+    """
+    for tool in server._tool_manager.list_tools():
+        arg_model = tool.fn_metadata.arg_model
+        if arg_model.model_config.get("extra") == "forbid":
+            continue
+        arg_model.model_config["extra"] = "forbid"
+        arg_model.model_rebuild(force=True)
+        tool.parameters = arg_model.model_json_schema(by_alias=True)
+
+
 def create_runner(spawn_root: Path | None = None) -> CodexRunner:
     assets_root = _assets_root()
     return CodexRunner(
@@ -494,6 +514,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         resolved_repo_root = resolve_repo_root(runner.spawn_root, repo_root)
         return background_runs.list(resolved_repo_root, limit=limit)
 
+    _reject_unknown_tool_arguments(server)
     return server
 
 

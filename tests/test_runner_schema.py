@@ -6424,3 +6424,41 @@ def test_stall_diagnostics_includes_bytes_and_last_line() -> None:
 def test_stall_diagnostics_flags_pre_stream_hang_when_stderr_empty() -> None:
     msg = _stall_diagnostics("", "", 300.0)
     assert "before the model opened its response stream" in msg
+
+
+@pytest.mark.asyncio
+async def test_failed_run_persists_the_real_cause_not_the_cancelled_stub(
+    tmp_path: Path,
+) -> None:
+    """A run that raises must not leave an artifact blaming cancellation.
+
+    result.json starts as an aborted stub saying Dobby was cancelled or killed,
+    which the normal completion path overwrites. When the run raised instead,
+    that stub survived and misreported the cause to every later get_run.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+        codex_binary="/nonexistent/codex",
+    )
+
+    with pytest.raises(RunnerError, match="Codex executable not found"):
+        await runner.run(ToolName.PLAN, InvocationRequest(prompt="inspect"))
+
+    run_dirs = list((repo_root / ".codex-dobby" / "runs").iterdir())
+    assert len(run_dirs) == 1
+    persisted = json.loads((run_dirs[0] / "result.json").read_text(encoding="utf-8"))
+
+    assert persisted["status"] == "error"
+    assert "Codex executable not found" in persisted["summary"]
+    assert "cancelled or killed" not in persisted["summary"]
+    # The child scratch tree is still cleaned up on the exception path.
+    assert not (run_dirs[0] / "runtime").exists()

@@ -296,6 +296,7 @@ class CodexRunner:
             return preflight_response
 
         response: ToolResponse | None = None
+        failure: BaseException | None = None
         try:
             if spec.tool == ToolName.REVIEW and review_uses_orchestrator(
                 spec.request.agents
@@ -335,6 +336,14 @@ class CodexRunner:
                 spec.artifacts.result_json,
                 response.model_dump(mode="json", by_alias=True),
             )
+        except asyncio.CancelledError:
+            # The aborted stub already describes cancellation accurately.
+            raise
+        except Exception as exc:
+            # Remember why, so the persisted artifact reports the real cause
+            # instead of the aborted stub's "cancelled or killed".
+            failure = exc
+            raise
         finally:
             # The child's scratch tree lives in the user's repo and can reach
             # hundreds of MB per run, so it is removed on every exit path.
@@ -361,7 +370,30 @@ class CodexRunner:
                     response,
                     cleanup_issue,
                 )
-            if (
+            if response is None and failure is not None:
+                # The run raised before producing a response. Replace the
+                # aborted stub, which claims Dobby was cancelled or killed,
+                # with the actual failure plus any cleanup issues that would
+                # otherwise only reach the log.
+                failed_response = self._preflight_response(
+                    spec, started, f"{type(failure).__name__}: {failure}"
+                )
+                cleanup_warnings = [
+                    issue for issue in (scratch_issue, cleanup_issue) if issue is not None
+                ]
+                if cleanup_warnings:
+                    failed_response = failed_response.model_copy(
+                        update={
+                            "warnings": _merge_preserving_order(
+                                failed_response.warnings, cleanup_warnings
+                            )
+                        }
+                    )
+                write_json(
+                    spec.artifacts.result_json,
+                    failed_response.model_dump(mode="json", by_alias=True),
+                )
+            elif (
                 scratch_issue is not None or cleanup_issue is not None
             ) and response is not None:
                 # Rewrite the persisted artifact so a later get_run sees the

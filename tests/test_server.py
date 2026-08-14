@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -227,3 +228,39 @@ def test_important_context_schema_is_still_a_nullable_string() -> None:
 
     assert schema["anyOf"] == [{"type": "string"}, {"type": "null"}]
     assert schema["default"] is None
+
+
+def test_misspelled_tool_argument_is_rejected_not_silently_dropped() -> None:
+    """A typo must not silently change the scope of a run.
+
+    The SDK builds argument models with Pydantic's default extra="ignore"
+    (python-sdk #3067), so `file=[...]` instead of `files=[...]` was dropped and
+    the caller unknowingly got a whole-repo run instead of a scoped one.
+    """
+    server = create_server()
+    plan_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["plan"]
+    arg_model = plan_tool.fn_metadata.arg_model
+
+    with pytest.raises(ValidationError) as excinfo:
+        arg_model.model_validate(
+            {"prompt": "review it", "repo_root": "/tmp/repo", "file": ["a.py"]}
+        )
+    assert "file" in str(excinfo.value)
+
+    # The correctly spelled argument still works.
+    parsed = arg_model.model_validate(
+        {"prompt": "review it", "repo_root": "/tmp/repo", "files": ["a.py"]}
+    )
+    assert parsed.files == ["a.py"]
+
+
+def test_every_tool_publishes_that_it_rejects_unknown_arguments() -> None:
+    server = create_server()
+
+    for tool in server._tool_manager.list_tools():
+        assert tool.fn_metadata.arg_model.model_config["extra"] == "forbid", tool.name
+        # Clients see the constraint rather than only hitting it server-side.
+        assert tool.parameters.get("additionalProperties") is False, tool.name
+        # Hardening must not disturb the published argument surface.
+        assert "repo_root" in tool.parameters["properties"], tool.name
+        assert "ctx" not in tool.parameters["properties"], tool.name

@@ -19,5 +19,8 @@ All notable user-facing changes to Codex Dobby MCP are recorded here.
 - A worker that returns `refused: true` with a non-blocked `completeness` is recorded as blocked with a warning, instead of failing the run with `Codex completed with invalid structured output` and losing the stated refusal reason. The pairing is now documented in the shared worker prompt.
 - Delete the child's runtime scratch tree (`.codex-dobby/runs/<task-id>/runtime`) after every run. It held the child's `TMPDIR` and caches inside the repository and was never removed.
 - Never mirror the parent runtime home itself or its `sessions/` tree into a child runtime, including through symlink aliases and case variants, which could clone credentials and historical rollouts and quarantine an otherwise valid review.
+- Deliver each review lens's canonical assignment to the child out of band, through the per-run agent definition Dobby writes into the child's private runtime, rather than only through the orchestrating parent's spawn message. The parent still chooses which reviewer starts; it no longer chooses what that reviewer reviews, and a conflicting payload assignment must now be reported instead of followed.
+- Reject unknown tool arguments instead of silently dropping them. A misspelled `files` previously became a whole-repo run; every tool now publishes `additionalProperties: false` and fails the call.
+- Report the real cause when a run raises before producing a response. `result.json` kept the aborted placeholder blaming cancellation, which misled every later `get_run`.
 - Accept JSON-looking text in `important_context` again. The MCP SDK JSON-decodes optional string arguments, so such values were rejected as "Input should be a valid string".
 
