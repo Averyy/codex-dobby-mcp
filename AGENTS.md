@@ -22,6 +22,7 @@
 - A child marked `blocked` is not usable review coverage. Partial success requires at least one independently delivered `completed` or `partial` child result.
 - Rollout deviations are split by what they prove. A lens that simply did not deliver — never spawned, never started, no terminal event, or a payload that failed its assignment attestation — is *coverage* loss: that lens is `failed`, its findings are excluded, and the run still returns the other lenses' verified findings as partial success. Anything showing the manifest contradicting the rollouts, or a child Dobby did not ask for — duplicate spawns, sessions, terminal events, or deliveries; a mismatched started/child thread id; the wrong custom role; `multi_agent_version` other than `disabled`; a spawn with the wrong `agent_type`, a `fork_turns` other than `none`, mismatched fields, or an unexpected encrypted argument shape; or a child reporting file changes — is an *integrity* failure that quarantines the whole review.
 - A lens whose evidence failed contributes no caller-visible text at all, not merely no findings. Its `review_details` entry carries a neutral placeholder summary.
+- Attestation binds the digest, not the assignment. The parent holds the same SHA-256 it asks each child to echo, so a verified lens proves the child saw the canonical assignment identity, not that it received the canonical assignment. Do not treat `manifest_validated` as proof that a reviewer read what the caller asked for.
 
 ## Release verification
 
