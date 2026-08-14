@@ -254,6 +254,9 @@ async def test_events_jsonl_is_written_for_each_run(
         "next_steps": [],
         "files_changed": [],
         "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
     }
 
     async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -285,6 +288,9 @@ async def test_event_sink_receives_acp_events_during_run(
         "next_steps": [],
         "files_changed": [],
         "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
     }
 
     received: list[tuple[dict, int]] = []
@@ -323,6 +329,9 @@ async def test_event_sink_errors_do_not_kill_run(
         "next_steps": [],
         "files_changed": [],
         "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
     }
 
     async def angry_sink(event: dict, count: int) -> None:
@@ -360,6 +369,9 @@ async def test_wait_run_forwards_live_events_to_subscriber(
         "next_steps": [],
         "files_changed": [],
         "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
     }
 
     # Gate the codex run so the test gets a chance to subscribe BEFORE codex
@@ -455,6 +467,9 @@ async def test_no_event_sink_means_no_streaming_overhead(
         "next_steps": [],
         "files_changed": [],
         "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
     }
 
     async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]

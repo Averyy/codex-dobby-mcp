@@ -64,6 +64,51 @@
         },
         "required": ["path", "oldText", "newText", "truncated"]
       }
+    },
+    "review_execution": {
+      "description": "Parent execution manifest for orchestrated multi-agent reviews. Dobby cross-checks it against private Codex session rollouts; null for every other run.",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "protocol": {
+              "type": "string",
+              "enum": ["multi_agent_v2"]
+            },
+            "agents": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "review_agent": {
+                    "type": "string",
+                    "enum": ["generalist", "security", "performance", "architecture", "correctness", "ux", "regression"]
+                  },
+                  "task_name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": ["completed", "partial", "blocked", "failed"]
+                  },
+                  "summary": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": ["review_agent", "task_name", "status", "summary"]
+              }
+            }
+          },
+          "required": ["protocol", "agents"]
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
@@ -74,6 +119,7 @@
     "files_changed",
     "warnings",
     "refused",
-    "file_diffs"
+    "file_diffs",
+    "review_execution"
   ]
 }

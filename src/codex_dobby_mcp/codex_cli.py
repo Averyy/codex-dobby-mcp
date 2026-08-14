@@ -6,9 +6,8 @@ import os
 from pathlib import Path
 import tomllib
 
-from codex_dobby_mcp.models import READ_ONLY_TOOLS, ReasoningEffort, ResolvedInvocation, ToolName
+from codex_dobby_mcp.models import READ_ONLY_TOOLS, ResolvedInvocation, ToolName
 from codex_dobby_mcp.review_agents import (
-    REVIEW_SUBAGENT_DEFAULT_MODEL,
     REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
     review_uses_orchestrator,
     selected_review_agent_definitions,
@@ -30,7 +29,7 @@ def build_codex_command(
     review_agents_root: Path | None = None,
     home_config_path: Path | None = None,
 ) -> CodexCommand:
-    review_uses_json_orchestrator = spec.tool == ToolName.REVIEW and review_uses_orchestrator(spec.request.agents)
+    review_uses_multi_agent_v2 = spec.tool == ToolName.REVIEW and review_uses_orchestrator(spec.request.agents)
     reasoning_override = f"model_reasoning_effort={_toml_string(spec.reasoning_effort.value)}"
     approval_override = f"approval_policy={_toml_string('never')}"
     argv = [
@@ -51,10 +50,18 @@ def build_codex_command(
         "-c",
         approval_override,
     ]
-    for override in _dobby_mcp_disable_overrides(spec.repo_root, home_config_path=home_config_path):
+    mcp_disable_overrides = (
+        _review_mcp_disable_overrides
+        if spec.tool == ToolName.REVIEW
+        else _dobby_mcp_disable_overrides
+    )
+    for override in mcp_disable_overrides(
+        spec.repo_root,
+        home_config_path=home_config_path,
+    ):
         argv.extend(["-c", override])
 
-    if review_uses_json_orchestrator:
+    if review_uses_multi_agent_v2:
         if review_agents_root is None:
             raise RuntimeError("Review runs require an explicit review agents root")
         argv.extend(_review_agent_overrides(spec, review_agents_root))
@@ -104,10 +111,31 @@ def build_codex_command(
 def _review_agent_overrides(spec: ResolvedInvocation, agents_root: Path) -> list[str]:
     registrations = selected_review_agent_definitions(spec.request.agents)
     overrides: list[tuple[str, str]] = [
-        ("features.multi_agent", "true"),
-        ("agents.max_depth", "1"),
-        ("agents.max_threads", str(len(registrations) + 1)),
+        ("features.multi_agent_v2", "true"),
+        ("agents.enabled", "true"),
+        # Independent execution validation reads the isolated run's session
+        # rollouts before deleting them. A caller may disable global Codex
+        # history persistence, so force it on only inside this private,
+        # short-lived runtime.
+        ("history.persistence", _toml_string("save-all")),
+        # Codex treats this compatibility setting as the child count and adds
+        # the root thread when it resolves the v2 session-wide slot limit.
+        ("agents.max_concurrent_threads_per_session", str(len(registrations))),
+        # The private child home inherits the caller's config. Always pin the
+        # resolved review model so an inherited default_subagent_model cannot
+        # override an explicit model passed to Dobby.
+        ("agents.default_subagent_model", _toml_string(spec.model)),
     ]
+
+    # No short-timeout downgrade: the validated timeout floor is 300 seconds,
+    # so the old <=120 branch here could never fire.
+    child_reasoning_effort = spec.request.reasoning_effort or REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
+    overrides.append(
+        (
+            "agents.default_subagent_reasoning_effort",
+            _toml_string(child_reasoning_effort.value),
+        )
+    )
 
     for agent in registrations:
         config_path = (agents_root / agent.filename).resolve()
@@ -118,18 +146,6 @@ def _review_agent_overrides(spec: ResolvedInvocation, agents_root: Path) -> list
                 (f"agents.{agent.codex_name}.description", _toml_string(agent.description)),
                 (f"agents.{agent.codex_name}.config_file", _toml_string(str(config_path))),
             ]
-        )
-        if spec.request.model is None:
-            overrides.append((f"agents.{agent.codex_name}.model", _toml_string(REVIEW_SUBAGENT_DEFAULT_MODEL)))
-
-        child_reasoning_effort = spec.request.reasoning_effort or REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
-        if spec.request.timeout_seconds <= 120:
-            child_reasoning_effort = ReasoningEffort.LOW
-        overrides.append(
-            (
-                f"agents.{agent.codex_name}.model_reasoning_effort",
-                _toml_string(child_reasoning_effort.value),
-            )
         )
 
     argv: list[str] = []
@@ -182,6 +198,36 @@ def _toml_string(value: str) -> str:
 
 
 def _dobby_mcp_disable_overrides(repo_root: Path, home_config_path: Path | None = None) -> list[str]:
+    return _mcp_disable_overrides(
+        repo_root,
+        home_config_path=home_config_path,
+        disable_all=False,
+    )
+
+
+def _review_mcp_disable_overrides(
+    repo_root: Path,
+    home_config_path: Path | None = None,
+) -> list[str]:
+    """Disable every inherited MCP server for read-only code review.
+
+    Review needs the repository and local shell only. An empty allowlist avoids
+    trying to recognize recursive Dobby aliases or wrappers by name and also
+    keeps unrelated MCP startup/context out of every reviewer child.
+    """
+    return _mcp_disable_overrides(
+        repo_root,
+        home_config_path=home_config_path,
+        disable_all=True,
+    )
+
+
+def _mcp_disable_overrides(
+    repo_root: Path,
+    *,
+    home_config_path: Path | None,
+    disable_all: bool,
+) -> list[str]:
     codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     config_paths = [
         home_config_path or (codex_home / "config.toml"),
@@ -203,8 +249,10 @@ def _dobby_mcp_disable_overrides(repo_root: Path, home_config_path: Path | None 
         for server_name, server_config in servers.items():
             if not isinstance(server_name, str) or server_name in seen:
                 continue
-            if _looks_like_dobby_server(server_name, server_config):
-                overrides.append(f"mcp_servers.{server_name}.enabled=false")
+            if disable_all or _looks_like_dobby_server(server_name, server_config):
+                overrides.append(
+                    f"mcp_servers.{_toml_key_segment(server_name)}.enabled=false"
+                )
                 seen.add(server_name)
 
     return overrides
@@ -223,3 +271,13 @@ def _looks_like_dobby_server(server_name: str, server_config: object) -> bool:
 
     haystack = " ".join(fragments).lower()
     return any(token in haystack for token in ("codex-dobby-mcp", "codex_dobby_mcp"))
+
+
+def _toml_key_segment(value: str) -> str:
+    """Render one override-path segment without allowing dots to change nesting."""
+    if value and all(
+        character.isascii() and (character.isalnum() or character in "_-")
+        for character in value
+    ):
+        return value
+    return json.dumps(value)

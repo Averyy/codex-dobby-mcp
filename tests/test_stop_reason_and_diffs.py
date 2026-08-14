@@ -12,6 +12,7 @@ import pytest
 from codex_dobby_mcp.models import (
     AsyncRunState,
     InvocationRequest,
+    ReviewAgent,
     ResultArtifactState,
     RunStatus,
     StopReason,
@@ -96,6 +97,9 @@ def _worker_payload(**overrides: object) -> dict[str, object]:
         "next_steps": [],
         "files_changed": [],
         "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
     }
     payload.update(overrides)
     return payload
@@ -144,7 +148,11 @@ async def test_stop_reason_refusal_when_worker_signals_refused(
     runner = _make_runner(repo_root)
     _install_fake_codex(
         monkeypatch,
-        worker_payload=_worker_payload(refused=True, summary="cannot do that"),
+        worker_payload=_worker_payload(
+            refused=True,
+            completeness="blocked",
+            summary="cannot do that",
+        ),
     )
 
     result = await runner.run(ToolName.PLAN, InvocationRequest(prompt="something"))
@@ -279,6 +287,22 @@ async def test_background_failure_response_sets_stop_reason(
     assert lookup.stop_reason == StopReason.ERROR
     assert lookup.result is not None
     assert lookup.result.stop_reason == StopReason.ERROR
+
+    review_spec = runner.prepare(
+        ToolName.REVIEW,
+        InvocationRequest(
+            prompt="review",
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        ),
+    )
+    review_failure = manager._background_failure_response(
+        review_spec,
+        "simulated background review failure",
+    )
+    assert review_failure.review_details is not None
+    assert review_failure.review_details.execution_manifest is None
+    assert review_failure.review_details.execution_evidence is None
+    assert review_failure.review_details.manifest_validated is False
 
 
 @pytest.mark.asyncio
@@ -523,7 +547,14 @@ async def test_file_diffs_merges_worker_supplied_diff_when_wrapper_truncates(
     runner = _make_runner(repo_root)
     worker_payload = _worker_payload(
         files_changed=["huge.txt"],
-        file_diffs=[{"path": "huge.txt", "oldText": "synthetic-old", "newText": None}],
+        file_diffs=[
+            {
+                "path": "huge.txt",
+                "oldText": "synthetic-old",
+                "newText": None,
+                "truncated": False,
+            }
+        ],
     )
 
     def mutate(_args, _kwargs):

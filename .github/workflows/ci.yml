@@ -11,6 +11,32 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Build distributions
+        if: matrix.python-version == '3.12'
+        run: uv build
+
+  test-latest-dependencies:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
@@ -21,11 +47,30 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: uv sync --group dev
+      - name: Test against latest allowed dependencies
+        # -o pythonpath= drops the repo's src/ from sys.path so this lane
+        # imports the installed distribution rather than the source tree.
+        # --no-cache because uv keys a `--with .` build on project.version: with
+        # a warm cache it silently reuses an archive built from older source and
+        # this lane then reports on code that is not in the tree.
+        run: >-
+          uv run --isolated --no-project --no-cache
+          --with .
+          --with pytest
+          --with pytest-asyncio
+          pytest -o pythonpath=
 
-      - name: Run tests
-        run: uv run pytest
+  lint:
+    runs-on: ubuntu-latest
 
-      - name: Build distributions
-        run: uv build
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Lint
+        run: uvx ruff check src tests

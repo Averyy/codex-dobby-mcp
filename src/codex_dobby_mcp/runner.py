@@ -12,7 +12,7 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -39,7 +39,10 @@ from codex_dobby_mcp.models import (
     RunArtifacts,
     RunStatus,
     ReasoningEffort,
-    ReviewAgent,
+    ReviewAgentExecutionStatus,
+    ReviewExecutionEvidence,
+    ReviewExecutionManifest,
+    ReviewOrchestrationProtocol,
     StopReason,
     ToolName,
     ToolResponse,
@@ -105,107 +108,125 @@ _FILE_DIFF_BINARY_SCAN_BYTES = 8192
 
 
 @dataclass(frozen=True)
-class ReviewOrchestrationDiagnostics:
+class ReviewExecutionDiagnostics:
     expected_agents: tuple[str, ...]
-    completed_spawn_count: int
-    wait_started_early: bool
-    prompt_missing_agents: tuple[str, ...]
-    prompt_duplicate_agents: tuple[str, ...]
-    ambiguous_prompt_count: int
-    spawned_children: frozenset[str]
-    completed_children: frozenset[str]
-    child_results: tuple[WorkerResult, ...]
+    manifest: ReviewExecutionManifest | None
+    execution_evidence: ReviewExecutionEvidence | None
+    validation_issues: tuple[str, ...]
+    completed_count: int
+    partial_count: int
+    blocked_count: int
+    failed_count: int
+    # Per-lens non-delivery. Kept apart from ``validation_issues`` because a
+    # lens that produced nothing is ordinary partial coverage, not evidence
+    # tampering: its findings are already excluded from the caller-visible
+    # response, so the lenses that did deliver stay usable.
+    coverage_issues: tuple[str, ...] = ()
 
     @property
     def expected_count(self) -> int:
         return len(self.expected_agents)
 
     @property
-    def completed_child_result_count(self) -> int:
-        return len(self.child_results)
+    def manifest_validated(self) -> bool:
+        return self.manifest is not None and not self.validation_issues
 
     @property
-    def missing_completed_children(self) -> frozenset[str]:
-        return self.spawned_children - self.completed_children
+    def usable_count(self) -> int:
+        return self.completed_count + self.partial_count
+
+    @property
+    def all_completed(self) -> bool:
+        return self.manifest_validated and self.completed_count == self.expected_count
 
     @property
     def warnings(self) -> list[str]:
-        warnings: list[str] = []
-        if self.completed_spawn_count != self.expected_count:
+        warnings = list(self.validation_issues)
+        warnings.extend(self.coverage_issues)
+        if self.manifest_validated and not self.all_completed:
             warnings.append(
-                f"Review emitted {self.completed_spawn_count} completed spawn_agent calls; expected exactly {self.expected_count}"
+                "Review execution manifest reports "
+                f"{self.completed_count} completed, {self.partial_count} partial, "
+                f"{self.blocked_count} blocked, and {self.failed_count} failed of "
+                f"{self.expected_count} selected review agents"
             )
-        if self.wait_started_early:
-            warnings.append("Review started waiting before spawning all selected review agents")
-        if self.prompt_missing_agents:
-            warnings.append(
-                "Review spawn prompts did not cover selected agents: " + ", ".join(self.prompt_missing_agents)
-            )
-        if self.prompt_duplicate_agents:
-            warnings.append(
-                "Review spawn prompts duplicated selected agents: " + ", ".join(self.prompt_duplicate_agents)
-            )
-        if self.ambiguous_prompt_count:
-            warnings.append(
-                f"Review emitted {self.ambiguous_prompt_count} ambiguous spawn prompts that could not be mapped to exactly one selected agent"
-            )
-        if self.spawned_children and self.missing_completed_children:
-            warnings.append("Review did not record completed wait results for every spawned subagent")
         return warnings
 
-    @property
-    def has_missing_wait_only(self) -> bool:
-        return self.warnings == ["Review did not record completed wait results for every spawned subagent"]
-
-    @property
-    def salvage_complete(self) -> bool:
-        return self.completed_child_result_count >= self.expected_count
-
     def failure_summary(self) -> str:
-        details: list[str] = []
-        if self.expected_count:
-            details.append(f"completed {self.completed_child_result_count}/{self.expected_count} subagents")
-        if self.completed_spawn_count != self.expected_count:
-            details.append(f"spawned {self.completed_spawn_count}/{self.expected_count} subagents")
-        if self.wait_started_early:
-            details.append("wait started before all selected review agents were spawned")
-        if self.prompt_missing_agents:
-            details.append("missing prompt coverage for " + ", ".join(self.prompt_missing_agents))
-        if self.prompt_duplicate_agents:
-            details.append("duplicate prompt coverage for " + ", ".join(self.prompt_duplicate_agents))
-        if self.ambiguous_prompt_count:
-            suffix = "" if self.ambiguous_prompt_count == 1 else "s"
-            details.append(f"{self.ambiguous_prompt_count} ambiguous spawn prompt{suffix}")
-        if self.spawned_children and self.missing_completed_children:
-            details.append(
-                "missing completed wait results for "
-                f"{len(self.missing_completed_children)}/{len(self.spawned_children)} spawned subagents"
-            )
-        if not details:
-            return "Review orchestration incomplete."
-        return "Review orchestration incomplete: " + "; ".join(details) + "."
-
-    def salvaged_summary(self) -> str:
-        count = self.completed_child_result_count
-        if count >= self.expected_count:
-            return (
-                "Review orchestrator did not return final JSON; "
-                f"merged findings from {count}/{self.expected_count} completed subagents."
+        if self.validation_issues:
+            return "Review multi-agent v2 execution manifest is invalid: " + "; ".join(
+                self.validation_issues
             )
         return (
-            "Review orchestrator did not return final JSON; "
-            f"surfaced findings from {count}/{self.expected_count} completed subagents."
+            "Review multi-agent v2 execution produced no usable child results: "
+            f"0/{self.expected_count} selected review agents returned usable output."
         )
 
-    def salvaged_warning(self) -> str:
-        return self.salvaged_summary()
 
-    def partial_salvage_warning(self) -> str:
-        return (
-            "Review returned partial findings from "
-            f"{self.completed_child_result_count}/{self.expected_count} completed subagents "
-            "because orchestration did not finish before timeout"
-        )
+@dataclass(frozen=True)
+class ReviewRolloutAgentEvidence:
+    review_agent: str
+    task_name: str
+    agent_role: str
+    spawn_attempt_count: int
+    started_count: int
+    child_thread_ids: tuple[str, ...]
+    child_roles: tuple[str | None, ...]
+    delivered_count: int
+    child_result: WorkerResult | None
+    # Deliberately has no default. A default of 1 silently claims the child
+    # reached a terminal event, which is exactly the state a non-delivering
+    # lens is in, so every construction site must say what it observed.
+    terminal_event_count: int
+    # How the parent spawned this lens: wrong agent_type, fork_turns other than
+    # "none", missing/extra fields, or an unexpected encrypted argument shape.
+    # These are isolation and role guarantees, so they stay integrity failures.
+    spawn_contract_issues: tuple[str, ...] = ()
+    # The delivered child payload did not attest its canonical assignment
+    # digest. The payload is discarded, so this can only cost this lens its own
+    # slot — it is coverage loss, not evidence tampering.
+    attestation_issues: tuple[str, ...] = ()
+    child_multi_agent_versions: tuple[str | None, ...] = ()
+    started_thread_ids: tuple[str | None, ...] = ()
+    reported_mutation_paths: tuple[str, ...] = ()
+    reported_file_diffs: bool = False
+
+    @property
+    def observed_status(self) -> ReviewAgentExecutionStatus:
+        if (
+            self.spawn_attempt_count != 1
+            or self.spawn_contract_issues
+            or self.attestation_issues
+            or self.started_count != 1
+            or len(self.child_thread_ids) != 1
+            or self.started_thread_ids != self.child_thread_ids
+            or self.child_roles != (self.agent_role,)
+            or self.child_multi_agent_versions != ("disabled",)
+            or self.terminal_event_count != 1
+            or self.delivered_count != 1
+            or self.child_result is None
+            or self.reported_mutation_paths
+            or self.reported_file_diffs
+        ):
+            return ReviewAgentExecutionStatus.FAILED
+        if self.child_result.refused:
+            return ReviewAgentExecutionStatus.BLOCKED
+        if self.child_result.completeness == Completeness.FULL:
+            return ReviewAgentExecutionStatus.COMPLETED
+        if self.child_result.completeness == Completeness.PARTIAL:
+            return ReviewAgentExecutionStatus.PARTIAL
+        return ReviewAgentExecutionStatus.BLOCKED
+
+
+@dataclass(frozen=True)
+class ReviewRolloutEvidence:
+    collected: bool
+    agents: tuple[ReviewRolloutAgentEvidence, ...]
+    validation_issues: tuple[str, ...]
+
+    @property
+    def by_task_name(self) -> dict[str, ReviewRolloutAgentEvidence]:
+        return {agent.task_name: agent for agent in self.agents}
 
 
 @dataclass(frozen=True)
@@ -215,6 +236,10 @@ class ChildRuntimeContext:
     claude_config_dir: Path
     home_config_path: Path
     env_overrides: dict[str, str]
+    # The child's TMPDIR and cache roots, inside the run's artifact directory
+    # in the user's repo. Holds no credentials — those live under
+    # ``private_root`` — but it grows without bound if it is not removed.
+    scratch_root: Path
 
 
 class CodexRunner:
@@ -270,17 +295,83 @@ class CodexRunner:
             write_json(spec.artifacts.result_json, preflight_response.model_dump(mode="json", by_alias=True))
             return preflight_response
 
+        response: ToolResponse | None = None
         try:
-            return await self._run_with_child_runtime(
-                spec,
-                started,
-                deadline,
-                use_metadata_fingerprints,
-                child_runtime,
-                event_sink=event_sink,
+            if spec.tool == ToolName.REVIEW and review_uses_orchestrator(
+                spec.request.agents
+            ):
+                try:
+                    await _ensure_multi_agent_v2_available(
+                        self.codex_binary,
+                        spec.repo_root,
+                        child_environment(
+                            os.environ,
+                            overrides=child_runtime.env_overrides,
+                        ),
+                        deadline,
+                    )
+                except asyncio.TimeoutError:
+                    response = self._timeout_response(
+                        spec,
+                        started,
+                        spec.request.timeout_seconds,
+                    )
+                except RunnerError as exc:
+                    response = self._preflight_response(
+                        spec,
+                        started,
+                        str(exc),
+                    )
+            if response is None:
+                response = await self._run_with_child_runtime(
+                    spec,
+                    started,
+                    deadline,
+                    use_metadata_fingerprints,
+                    child_runtime,
+                    event_sink=event_sink,
+                )
+            write_json(
+                spec.artifacts.result_json,
+                response.model_dump(mode="json", by_alias=True),
             )
         finally:
-            _cleanup_private_child_runtime(child_runtime.private_root, self.logger)
+            # The child's scratch tree lives in the user's repo and can reach
+            # hundreds of MB per run, so it is removed on every exit path.
+            # Unlike the private runtime it holds no credentials, so a failed
+            # delete is a warning rather than a run-failing error.
+            scratch_issue = _cleanup_child_scratch_root(
+                child_runtime.scratch_root,
+                self.logger,
+            )
+            if scratch_issue is not None and response is not None:
+                response = response.model_copy(
+                    update={
+                        "warnings": _merge_preserving_order(
+                            response.warnings, [scratch_issue]
+                        )
+                    }
+                )
+            cleanup_issue = _cleanup_private_child_runtime(
+                child_runtime.private_root,
+                self.logger,
+            )
+            if cleanup_issue is not None and response is not None:
+                response = _response_with_private_runtime_cleanup_failure(
+                    response,
+                    cleanup_issue,
+                )
+            if (
+                scratch_issue is not None or cleanup_issue is not None
+            ) and response is not None:
+                # Rewrite the persisted artifact so a later get_run sees the
+                # same warnings the caller just received.
+                write_json(
+                    spec.artifacts.result_json,
+                    response.model_dump(mode="json", by_alias=True),
+                )
+        assert response is not None
+        return response
 
     async def _run_with_child_runtime(
         self,
@@ -316,7 +407,7 @@ class CodexRunner:
             else {}
         )
 
-        prompt_text = self.prompts.render(
+        rendered_prompt = self.prompts.render_prompt(
             tool=tool,
             request=spec.request,
             repo_root=spec.repo_root,
@@ -327,6 +418,7 @@ class CodexRunner:
             fetchaller_available=spec.fetchaller_available,
             ghidra_available=spec.ghidra_available,
         )
+        prompt_text = rendered_prompt.text
         spec.artifacts.prompt_txt.write_text(prompt_text, encoding="utf-8")
         spec.artifacts.output_schema_json.write_text(self.worker_schema_path.read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -380,11 +472,18 @@ class CodexRunner:
         stderr = _read_log_text(spec.artifacts.stderr_log)
 
         worker_result_error: str | None = None
-        review_salvaged = False
-        review_salvaged_complete = False
         review_is_orchestrated = tool == ToolName.REVIEW and review_uses_orchestrator(spec.request.agents)
-        review_diagnostics = (
-            _review_orchestration_diagnostics(stdout, spec.request.agents)
+        review_rollout_evidence = (
+            await asyncio.to_thread(
+                _review_rollout_evidence,
+                child_runtime.codex_home,
+                spec.request.agents,
+                # The exact strings the prompt embedded, not a second
+                # derivation of them: each child attests a SHA-256 digest of
+                # its assignment, and validation compares against these.
+                rendered_prompt.review_subagent_messages,
+                allow_truncated_tail=timeout_hit or exit_code not in (0, None),
+            )
             if review_is_orchestrated
             else None
         )
@@ -393,20 +492,15 @@ class CodexRunner:
         except RunnerError as exc:
             worker_result = None
             worker_result_error = str(exc)
-        if review_is_orchestrated and worker_result is None:
-            worker_result = _salvaged_review_worker_result(
-                stdout,
-                spec.request.agents,
-                diagnostics=review_diagnostics,
+        recovered_review_from_rollouts = False
+        if worker_result is None and review_rollout_evidence is not None:
+            worker_result = _salvaged_review_worker_result_from_rollouts(
+                review_rollout_evidence
             )
             if worker_result is not None:
-                review_salvaged = True
-                review_salvaged_complete = (
-                    review_diagnostics.salvage_complete
-                    if review_diagnostics is not None
-                    else _review_salvage_complete(stdout, spec.request.agents)
-                )
+                recovered_review_from_rollouts = True
                 worker_result_error = None
+                _write_salvage_last_message(spec.artifacts, worker_result)
         if worker_result is None:
             salvaged = _salvage_worker_result_from_trace(
                 tool,
@@ -418,17 +512,88 @@ class CodexRunner:
                 worker_result = salvaged
                 worker_result_error = None
                 _write_salvage_last_message(spec.artifacts, salvaged)
-        recovered_partial_review = (
-            review_is_orchestrated
-            and review_salvaged
-            and worker_result is not None
-            and not review_salvaged_complete
+        review_execution_diagnostics = (
+            _review_execution_diagnostics(
+                worker_result,
+                spec.request.agents,
+                review_rollout_evidence,
+            )
+            if review_is_orchestrated
+            else None
         )
+        if (
+            review_execution_diagnostics is not None
+            and review_rollout_evidence is not None
+            and review_rollout_evidence.collected
+            and not review_rollout_evidence.validation_issues
+            and not recovered_review_from_rollouts
+        ):
+            # The parent is responsible for orchestration, but its prose is
+            # not independent evidence. Return only facts, next steps,
+            # warnings, and per-agent summaries reconstructed from the exact
+            # terminal child results that the rollout validator correlated.
+            verified_worker_result = _verified_review_worker_result_from_rollouts(
+                review_rollout_evidence
+            )
+            verified_diagnostics = _review_execution_diagnostics(
+                verified_worker_result,
+                spec.request.agents,
+                review_rollout_evidence,
+            )
+            if (
+                verified_diagnostics.manifest_validated
+                and not review_execution_diagnostics.manifest_validated
+            ):
+                verified_worker_result = verified_worker_result.model_copy(
+                    update={
+                        "warnings": _merge_preserving_order(
+                            verified_worker_result.warnings,
+                            [
+                                "Parent review synthesis or manifest was invalid; Dobby rebuilt the "
+                                "response from independently verified child rollout results."
+                            ],
+                        )
+                    }
+                )
+            worker_result = verified_worker_result
+            review_execution_diagnostics = verified_diagnostics
+        elif (
+            review_execution_diagnostics is not None
+            and review_rollout_evidence is not None
+            and (
+                not review_rollout_evidence.collected
+                or review_rollout_evidence.validation_issues
+            )
+        ):
+            # Global rollout failures break the evidence chain for every child.
+            # Do not leak parent-authored or partially parsed child prose through
+            # fields that callers may consume even when status=error.
+            worker_result = _quarantined_review_worker_result()
+            review_execution_diagnostics = _review_execution_diagnostics(
+                worker_result,
+                spec.request.agents,
+                review_rollout_evidence,
+            )
         timeout_with_usable_review = (
             tool == ToolName.REVIEW
             and timeout_hit
             and worker_result is not None
             and worker_result.completeness != Completeness.BLOCKED
+            and (
+                review_execution_diagnostics is None
+                or (
+                    review_execution_diagnostics.manifest_validated
+                    and review_execution_diagnostics.usable_count > 0
+                )
+            )
+        )
+        nonzero_with_usable_review = (
+            tool == ToolName.REVIEW
+            and exit_code not in (0, None)
+            and worker_result is not None
+            and review_execution_diagnostics is not None
+            and review_execution_diagnostics.manifest_validated
+            and review_execution_diagnostics.usable_count > 0
         )
         post_run_snapshot_incomplete = False
         post_run_snapshot_deadline = max(
@@ -451,7 +616,19 @@ class CodexRunner:
             current_head = None
             post_run_snapshot_incomplete = True
 
-        reported_files = worker_result.files_changed if worker_result else []
+        rollout_reported_files = (
+            [
+                path
+                for agent_evidence in review_rollout_evidence.agents
+                for path in agent_evidence.reported_mutation_paths
+            ]
+            if review_rollout_evidence is not None
+            else []
+        )
+        reported_files = _merge_preserving_order(
+            worker_result.files_changed if worker_result else [],
+            rollout_reported_files,
+        )
         detected_files = _changed_status_files(baseline, after_snapshot)
         files_changed = detected_files
 
@@ -461,20 +638,6 @@ class CodexRunner:
         error_reasons: list[str] = []
         sandbox_violations = _collect_sandbox_violations(stderr, stdout)
         codex_home_issue = _codex_home_permission_issue(sandbox_violations, stderr=stderr, stdout=stdout)
-        if review_salvaged:
-            if review_diagnostics is not None:
-                warnings.append(review_diagnostics.salvaged_warning())
-            else:
-                warnings.append(
-                    "Review parent did not return final JSON; surfaced completed subagent findings from the orchestration log"
-                )
-        if recovered_partial_review:
-            if review_diagnostics is not None:
-                warnings.append(review_diagnostics.partial_salvage_warning())
-            else:
-                warnings.append(
-                    "Review returned partial findings from completed subagents because orchestration did not finish before timeout"
-                )
         if post_run_snapshot_incomplete:
             warnings.append("Post-run repo snapshot timed out; repo change verification may be incomplete")
 
@@ -511,9 +674,15 @@ class CodexRunner:
             if not timeout_with_usable_review:
                 status = RunStatus.ERROR
                 error_reasons.append(timeout_warning)
-        elif exit_code != 0 and not recovered_partial_review:
-            status = RunStatus.ERROR
+        elif exit_code != 0:
             stop_reason = StopReason.ERROR
+            if nonzero_with_usable_review:
+                warnings.append(
+                    f"Codex parent exited with status {exit_code} after delivering "
+                    "independently verified child review results; returning partial coverage."
+                )
+            else:
+                status = RunStatus.ERROR
         if codex_home_issue is not None:
             warnings.append(codex_home_issue)
             if exit_code not in (0, None) and not stall_hit and not timeout_hit:
@@ -526,18 +695,16 @@ class CodexRunner:
                 stop_reason = StopReason.ERROR
 
         recoverable_orchestration_only = False
-        if review_diagnostics is not None:
-            orchestration_warnings = review_diagnostics.warnings
-            if orchestration_warnings:
-                warnings.extend(orchestration_warnings)
-                recoverable_orchestration_only = (
-                    worker_result is not None
-                    and worker_result.completeness != Completeness.BLOCKED
-                    and review_diagnostics.has_missing_wait_only
-                )
-                if not recovered_partial_review and not recoverable_orchestration_only:
-                    status = RunStatus.ERROR
-                    error_reasons.append(review_diagnostics.failure_summary())
+        if review_execution_diagnostics is not None:
+            warnings.extend(review_execution_diagnostics.warnings)
+            if (
+                not review_execution_diagnostics.manifest_validated
+                or review_execution_diagnostics.usable_count == 0
+            ):
+                status = RunStatus.ERROR
+                error_reasons.append(review_execution_diagnostics.failure_summary())
+            elif not review_execution_diagnostics.all_completed:
+                recoverable_orchestration_only = True
 
         if tool in READ_ONLY_TOOLS and detected_files:
             # The wrapper-detected diff combines (a) anything codex actually
@@ -618,7 +785,12 @@ class CodexRunner:
             completeness = Completeness.BLOCKED
         elif timeout_hit and completeness == Completeness.FULL:
             completeness = Completeness.PARTIAL
-        elif (recovered_partial_review or recoverable_orchestration_only) and completeness == Completeness.FULL:
+        elif recoverable_orchestration_only and completeness == Completeness.FULL:
+            completeness = Completeness.PARTIAL
+        elif (
+            (nonzero_with_usable_review or recovered_review_from_rollouts)
+            and completeness == Completeness.FULL
+        ):
             completeness = Completeness.PARTIAL
         elif post_run_snapshot_incomplete and completeness == Completeness.FULL:
             completeness = Completeness.PARTIAL
@@ -658,7 +830,11 @@ class CodexRunner:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             stop_reason=stop_reason,
-            review_details=_review_details_for_spec(spec),
+            review_details=_review_details_for_spec(
+                spec,
+                worker_result=worker_result,
+                diagnostics=review_execution_diagnostics,
+            ),
             reverse_engineer_details=_reverse_engineer_details_for_run(spec, stdout=stdout, stderr=stderr),
         )
         write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
@@ -812,8 +988,17 @@ class CodexRunner:
         sandbox_roots = [repo_root]
         writable_roots = [repo_root]
         advisory_read_only_roots: list[Path] = []
-        fetchaller_available = mcp_server_is_enabled("fetchaller", repo_root=repo_root)
-        ghidra_available = mcp_server_is_enabled("ghidra", repo_root=repo_root)
+        # Review deliberately uses an empty MCP allowlist. Besides reducing
+        # startup/context overhead, this makes recursive Dobby prevention
+        # independent of server names, wrapper commands, or inherited env.
+        fetchaller_available = tool != ToolName.REVIEW and mcp_server_is_enabled(
+            "fetchaller",
+            repo_root=repo_root,
+        )
+        ghidra_available = tool != ToolName.REVIEW and mcp_server_is_enabled(
+            "ghidra",
+            repo_root=repo_root,
+        )
 
         if tool == ToolName.REVERSE_ENGINEER:
             for root in reverse_engineer_default_writable_roots(repo_root=repo_root):
@@ -844,10 +1029,9 @@ class CodexRunner:
             reasoning_effort = request.reasoning_effort or REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
         elif tool == ToolName.REVIEW and review_uses_orchestrator(request.agents):
             model = request.model or DEFAULT_MODEL
-            reasoning_effort = request.reasoning_effort or REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
-        elif tool == ToolName.PLAN and request.reasoning_effort is None and request.timeout_seconds <= 120:
-            model = request.model or DEFAULT_MODEL
-            reasoning_effort = ReasoningEffort.MEDIUM
+            # The parent only launches, waits, and emits a manifest. Reviewer
+            # reasoning is configured independently in _review_agent_overrides.
+            reasoning_effort = ReasoningEffort.LOW
         else:
             model = request.model or DEFAULT_MODEL
             reasoning_effort = request.reasoning_effort or DEFAULT_REASONING_EFFORTS[tool]
@@ -906,34 +1090,18 @@ class CodexRunner:
             raise RunnerError("Codex completed with an empty last message artifact")
 
         try:
-            payload = json.loads(raw_last_message)
+            json.loads(raw_last_message)
         except json.JSONDecodeError as exc:
             if allow_missing:
                 return None
             raise RunnerError("Codex completed with non-JSON structured output") from exc
 
-        try:
-            return WorkerResult.model_validate(payload)
-        except ValidationError as exc:
+        worker_result = _strict_worker_result(raw_last_message)
+        if worker_result is None:
             if allow_missing:
                 return None
-            raise RunnerError("Codex completed with invalid structured output") from exc
-
-    def _capture_repo_snapshot(
-        self,
-        repo_root: Path,
-        artifacts: RunArtifacts,
-        gitignore_updated: bool,
-        include_head: bool,
-        *,
-        use_metadata_fingerprints: bool = False,
-    ) -> RepoSnapshot:
-        _ = artifacts, gitignore_updated
-        return _build_repo_snapshot(
-            repo_root,
-            include_head=include_head,
-            use_metadata_fingerprints=use_metadata_fingerprints,
-        )
+            raise RunnerError("Codex completed with invalid structured output")
+        return worker_result
 
     @staticmethod
     def _resolve_summary(
@@ -982,13 +1150,66 @@ class CodexRunner:
         return "Codex run failed before producing output"
 
 
-def _review_details_for_spec(spec: ResolvedInvocation) -> ReviewDetails | None:
+def _review_details_for_spec(
+    spec: ResolvedInvocation,
+    *,
+    worker_result: WorkerResult | None = None,
+    diagnostics: ReviewExecutionDiagnostics | None = None,
+) -> ReviewDetails | None:
     if spec.tool != ToolName.REVIEW:
         return None
     effective_agents = selected_review_agents(spec.request.agents)
+    orchestrated = review_uses_orchestrator(spec.request.agents)
+    execution_manifest = (
+        worker_result.review_execution
+        if orchestrated and worker_result is not None
+        else None
+    )
+    if orchestrated:
+        execution_evidence = (
+            diagnostics.execution_evidence
+            if diagnostics is not None
+            else ReviewExecutionEvidence.PARENT_REPORTED_STRUCTURED_OUTPUT
+            if execution_manifest is not None
+            else None
+        )
+    else:
+        execution_evidence = (
+            ReviewExecutionEvidence.DIRECT_PARENT
+            if worker_result is not None
+            else None
+        )
+    coverage_complete = (
+        diagnostics.all_completed if diagnostics is not None else False
+    ) if orchestrated else None
+    completed_agents = (
+        diagnostics.completed_count if diagnostics is not None else 0
+    ) if orchestrated else None
+    partial_agents = (
+        diagnostics.partial_count if diagnostics is not None else 0
+    ) if orchestrated else None
+    blocked_agents = (
+        diagnostics.blocked_count if diagnostics is not None else 0
+    ) if orchestrated else None
+    failed_agents = (
+        diagnostics.failed_count if diagnostics is not None else 0
+    ) if orchestrated else None
     return ReviewDetails(
         requested_review_agents=list(spec.requested_review_agents),
         effective_review_agents=effective_agents,
+        orchestration_protocol=(
+            ReviewOrchestrationProtocol.MULTI_AGENT_V2 if orchestrated else None
+        ),
+        execution_evidence=execution_evidence,
+        execution_manifest=execution_manifest,
+        manifest_validated=(
+            diagnostics.manifest_validated if diagnostics is not None else False
+        ),
+        coverage_complete=coverage_complete,
+        completed_agents=completed_agents,
+        partial_agents=partial_agents,
+        blocked_agents=blocked_agents,
+        failed_agents=failed_agents,
     )
 
 
@@ -1234,298 +1455,1030 @@ def _path_is_within_repo(path: str, repo_root: Path) -> bool:
     return True
 
 
-def _count_completed_spawn_agent_calls(stdout: str) -> int:
-    count = 0
-    top_level_thread_id: str | None = None
-    started_calls: dict[str, str | None] = {}
-
-    for line in stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            payload = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-
-        payload_type = payload.get("type")
-        if payload_type == "thread.started" and top_level_thread_id is None:
-            thread_id = payload.get("thread_id")
-            if isinstance(thread_id, str):
-                top_level_thread_id = thread_id
-            continue
-
-        item = payload.get("item") or {}
-        if item.get("type") != "collab_tool_call" or item.get("tool") != "spawn_agent":
-            continue
-
-        item_id = item.get("id")
-        if not isinstance(item_id, str):
-            continue
-
-        sender_thread_id = item.get("sender_thread_id")
-        normalized_sender = sender_thread_id if isinstance(sender_thread_id, str) else None
-        if payload_type == "item.started":
-            if top_level_thread_id is not None and normalized_sender != top_level_thread_id:
-                continue
-            started_calls[item_id] = normalized_sender
-            continue
-
-        if payload_type != "item.completed" or item_id not in started_calls:
-            continue
-        if top_level_thread_id is not None:
-            started_sender = started_calls[item_id]
-            if started_sender != top_level_thread_id and normalized_sender != top_level_thread_id:
-                continue
-        count += 1
-
-    return count
-
-
-def _review_orchestration_warnings(stdout: str, agents) -> list[str]:
-    return _review_orchestration_diagnostics(stdout, agents).warnings
-
-
-def _review_orchestration_diagnostics(stdout: str, agents) -> ReviewOrchestrationDiagnostics:
-    expected_agents = selected_review_agent_definitions(agents)
-    collab_events = _top_level_collab_events(stdout)
-    spawn_events = _completed_top_level_spawn_events(collab_events)
-    wait_started_early = False
-    completed_spawns_before_wait = 0
-    for payload_type, item in collab_events:
-        tool = item.get("tool")
-        if tool == "spawn_agent" and payload_type == "item.completed":
-            completed_spawns_before_wait += 1
-            continue
-        if tool == "wait" and payload_type == "item.started":
-            if completed_spawns_before_wait < len(expected_agents):
-                wait_started_early = True
-            break
-
-    missing_agents: list[str] = []
-    duplicate_agents: list[str] = []
-    ambiguous_prompts = 0
-    if spawn_events:
-        prompt_match_counts = {
-            definition.review_agent.value: 0
-            for definition in expected_agents
-        }
-        for item in spawn_events:
-            prompt = item.get("prompt")
-            matched_agent = _match_review_spawn_prompt(prompt, expected_agents)
-            if matched_agent is None:
-                ambiguous_prompts += 1
-                continue
-            prompt_match_counts[matched_agent] += 1
-
-        missing_agents = [agent for agent, count in prompt_match_counts.items() if count == 0]
-        duplicate_agents = [agent for agent, count in prompt_match_counts.items() if count > 1]
-
-    spawned_children = {
-        receiver
-        for item in spawn_events
-        for receiver in item.get("receiver_thread_ids", [])
-        if isinstance(receiver, str)
+_CHILD_RESULT_REQUIRED_FIELDS = frozenset(
+    {
+        "summary",
+        "completeness",
+        "important_facts",
+        "next_steps",
+        "files_changed",
+        "warnings",
+        "refused",
+        "file_diffs",
+        "review_execution",
     }
-    return ReviewOrchestrationDiagnostics(
-        expected_agents=tuple(definition.review_agent.value for definition in expected_agents),
-        completed_spawn_count=len(spawn_events),
-        wait_started_early=wait_started_early,
-        prompt_missing_agents=tuple(missing_agents),
-        prompt_duplicate_agents=tuple(duplicate_agents),
-        ambiguous_prompt_count=ambiguous_prompts,
-        spawned_children=frozenset(spawned_children),
-        completed_children=frozenset(_completed_waited_child_threads(collab_events)),
-        child_results=tuple(_completed_wait_worker_results(collab_events)),
+)
+_CHILD_FILE_DIFF_REQUIRED_FIELDS = frozenset(
+    {"path", "oldText", "newText", "truncated"}
+)
+_REVIEW_EXECUTION_REQUIRED_FIELDS = frozenset({"protocol", "agents"})
+_REVIEW_EXECUTION_AGENT_REQUIRED_FIELDS = frozenset(
+    {"review_agent", "task_name", "status", "summary"}
+)
+_SPAWN_REQUIRED_FIELDS = frozenset(
+    {"message", "task_name", "agent_type", "fork_turns"}
+)
+
+
+def _strict_worker_result(payload: str) -> WorkerResult | None:
+    """Parse external output with the exact public worker-schema contract."""
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict) or set(decoded) != _CHILD_RESULT_REQUIRED_FIELDS:
+        return None
+    file_diffs = decoded.get("file_diffs")
+    if not isinstance(file_diffs, list) or any(
+        not isinstance(file_diff, dict)
+        or set(file_diff) != _CHILD_FILE_DIFF_REQUIRED_FIELDS
+        for file_diff in file_diffs
+    ):
+        return None
+    review_execution = decoded.get("review_execution")
+    if review_execution is not None:
+        if (
+            not isinstance(review_execution, dict)
+            or set(review_execution) != _REVIEW_EXECUTION_REQUIRED_FIELDS
+        ):
+            return None
+        agents = review_execution.get("agents")
+        if not isinstance(agents, list) or any(
+            not isinstance(agent, dict)
+            or set(agent) != _REVIEW_EXECUTION_AGENT_REQUIRED_FIELDS
+            for agent in agents
+        ):
+            return None
+    try:
+        result = WorkerResult.model_validate_json(payload, strict=True)
+    except ValidationError:
+        return None
+    if result.refused and result.completeness != Completeness.BLOCKED:
+        # A refusal always means the work did not happen, so the pairing is
+        # real — but discarding the payload turned a worker that clearly stated
+        # why it refused into a bare "invalid structured output" error with the
+        # reason lost, for every tool. Normalise instead, and record the
+        # deviation so it stays visible.
+        result = result.model_copy(
+            update={
+                "completeness": Completeness.BLOCKED,
+                "warnings": _merge_preserving_order(
+                    result.warnings,
+                    [
+                        "Worker reported refused=true with completeness="
+                        f"{result.completeness.value}; recorded as blocked."
+                    ],
+                ),
+            }
+        )
+    return result
+
+
+def _strict_child_worker_result(payload: str) -> WorkerResult | None:
+    """Parse read-only child output and reject every mutation claim."""
+    result = _strict_worker_result(payload)
+    if result is None:
+        return None
+    if result.review_execution is not None:
+        return None
+    if result.files_changed or result.file_diffs:
+        return None
+    return result
+
+
+def _child_reported_mutations(payload: str) -> tuple[tuple[str, ...], bool]:
+    """Extract mutation claims even when the review payload is unusable.
+
+    Review children must return empty mutation fields. Retaining claimed paths
+    separately lets the outer snapshot attribute an observed write to the
+    worker instead of erasing the evidence during verified reconstruction.
+    """
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return (), False
+    if not isinstance(decoded, dict):
+        return (), False
+    paths: list[str] = []
+    files_changed = decoded.get("files_changed")
+    if isinstance(files_changed, list):
+        paths.extend(path for path in files_changed if isinstance(path, str) and path)
+    file_diffs = decoded.get("file_diffs")
+    has_file_diffs = isinstance(file_diffs, list) and bool(file_diffs)
+    if isinstance(file_diffs, list):
+        paths.extend(
+            file_diff["path"]
+            for file_diff in file_diffs
+            if isinstance(file_diff, dict)
+            and isinstance(file_diff.get("path"), str)
+            and file_diff["path"]
+        )
+    return tuple(_merge_preserving_order([], paths)), has_file_diffs
+
+
+def _spawn_contract_validation_issues(
+    arguments: object,
+    definition,
+    expected_message: str | None,
+    encrypted_function_args: object,
+) -> list[str]:
+    task_name = definition.codex_name
+    if not isinstance(arguments, dict):
+        return [f"{task_name} spawn arguments were not an object"]
+    issues: list[str] = []
+    if set(arguments) != _SPAWN_REQUIRED_FIELDS:
+        unexpected = sorted(set(arguments) - _SPAWN_REQUIRED_FIELDS)
+        missing = sorted(_SPAWN_REQUIRED_FIELDS - set(arguments))
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        issues.append(f"{task_name} spawn contract fields mismatch ({'; '.join(details)})")
+    if arguments.get("agent_type") != task_name:
+        issues.append(f"{task_name} spawn agent_type did not match its custom role")
+    if arguments.get("fork_turns") != "none":
+        issues.append(f'{task_name} spawn did not use fork_turns="none"')
+    message = arguments.get("message")
+    if not isinstance(message, str) or not message.strip():
+        issues.append(f"{task_name} spawn message was empty")
+    elif expected_message is None:
+        issues.append(f"{task_name} expected canonical spawn assignment was unavailable")
+    elif encrypted_function_args == ["message"] or (
+        encrypted_function_args in (None, [])
+        and _looks_like_opaque_encrypted_message(message)
+        and _assignment_digest_from_message(expected_message) is not None
+    ):
+        # Codex 0.147 marks this schema field `with_encrypted()` and persists
+        # only the provider ciphertext. The exact plaintext is bound later by
+        # the independently correlated child's assignment-digest attestation.
+        pass
+    elif encrypted_function_args not in (None, []):
+        issues.append(
+            f"{task_name} spawn encrypted unexpected arguments instead of only message"
+        )
+    elif _canonical_spawn_contract(message) != _canonical_spawn_contract(expected_message):
+        issues.append(f"{task_name} spawn message did not match its canonical assignment")
+    return issues
+
+
+def _looks_like_opaque_encrypted_message(message: str) -> bool:
+    # Codex 0.147's persisted provider ciphertext is URL-safe base64-like and
+    # currently starts with a Fernet-style `gAAAA`. Do not bind to that prefix:
+    # the provider format may rotate while remaining an opaque single token.
+    return len(message) >= 128 and re.fullmatch(r"[A-Za-z0-9_=-]+", message) is not None
+
+
+def _canonical_spawn_contract(message: str) -> tuple[str, str, object] | None:
+    """Return the stable, scope-bearing portion of a child assignment.
+
+    Codex may make harmless whitespace or prose changes when it copies a long
+    spawn message into a tool call. Bind validation to the fixed role/lens
+    markers and the complete canonical assignment object instead of brittle
+    byte equality across the explanatory requirements that follow it.
+    """
+    lines = message.splitlines()
+    prefix = "Canonical assignment JSON: "
+    if len(lines) < 3 or not lines[2].startswith(prefix):
+        return None
+    try:
+        assignment = json.loads(lines[2][len(prefix) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(assignment, dict):
+        return None
+    return lines[0], lines[1], assignment
+
+
+def _assignment_digest_from_message(message: str) -> str | None:
+    prefix = "Canonical assignment SHA-256: "
+    matches = [line[len(prefix) :] for line in message.splitlines() if line.startswith(prefix)]
+    if len(matches) != 1 or re.fullmatch(r"[0-9a-f]{64}", matches[0]) is None:
+        return None
+    return matches[0]
+
+
+def _result_with_verified_assignment_attestation(
+    result: WorkerResult,
+    expected_digest: str | None,
+) -> WorkerResult | None:
+    if expected_digest is None:
+        return None
+    prefix = f"Dobby assignment {expected_digest}: "
+    if not result.summary.startswith(prefix):
+        return None
+    summary = result.summary[len(prefix) :].strip()
+    if not summary:
+        return None
+    return result.model_copy(update={"summary": summary})
+
+
+def _review_rollout_evidence(
+    codex_home: Path,
+    agents,
+    expected_spawn_messages: Mapping[str, str],
+    *,
+    allow_truncated_tail: bool = False,
+) -> ReviewRolloutEvidence:
+    definitions = selected_review_agent_definitions(agents)
+    expected_tasks = {definition.codex_name: definition for definition in definitions}
+    rollout_root = codex_home / "sessions"
+    records: list[tuple[dict[str, object], list[dict[str, object]]]] = []
+    read_issues: list[str] = []
+
+    for rollout_path in sorted(rollout_root.glob("**/*.jsonl")):
+        items: list[dict[str, object]] = []
+        # Streamed rather than read whole: a multi-lens review with
+        # history.persistence=save-all can write hundreds of MB of JSONL, and
+        # holding the file text, its split lines, and the parsed items at once
+        # tripled peak memory for no benefit. Only the parsed items are needed.
+        try:
+            with rollout_path.open("r", encoding="utf-8") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    # A line without a trailing newline can only be the final
+                    # line, which is how a truncated rollout tail presents.
+                    complete = raw_line.endswith(("\n", "\r"))
+                    try:
+                        item = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        if allow_truncated_tail and not complete:
+                            continue
+                        read_issues.append(
+                            f"Codex rollout {rollout_path.name} has invalid JSON on line {line_number}"
+                        )
+                        continue
+                    if isinstance(item, dict):
+                        items.append(item)
+        except OSError as exc:
+            read_issues.append(f"could not read Codex rollout {rollout_path.name}: {exc}")
+            continue
+        metadata = next(
+            (
+                item.get("payload")
+                for item in items
+                if item.get("type") == "session_meta"
+                and isinstance(item.get("payload"), dict)
+            ),
+            None,
+        )
+        if isinstance(metadata, dict):
+            records.append((metadata, items))
+
+    root_records = [
+        record
+        for record in records
+        if record[0].get("originator") == "codex_exec"
+        and record[0].get("thread_source") == "user"
+        and record[0].get("source") == "exec"
+    ]
+    if len(root_records) != 1:
+        issue = (
+            "Codex session rollout evidence is unavailable"
+            if not root_records
+            else f"Codex session rollout evidence has {len(root_records)} root sessions; expected exactly 1"
+        )
+        return ReviewRolloutEvidence(
+            collected=False,
+            agents=tuple(
+                ReviewRolloutAgentEvidence(
+                    review_agent=definition.review_agent.value,
+                    task_name=definition.codex_name,
+                    agent_role=definition.codex_name,
+                    spawn_attempt_count=0,
+                    started_count=0,
+                    child_thread_ids=(),
+                    child_roles=(),
+                    delivered_count=0,
+                    child_result=None,
+                    terminal_event_count=0,
+                )
+                for definition in definitions
+            ),
+            validation_issues=tuple([*read_issues, issue]),
+        )
+
+    root_metadata, root_items = root_records[0]
+    root_thread_id = root_metadata.get("id")
+    if not isinstance(root_thread_id, str) or not root_thread_id:
+        read_issues.append("Codex root rollout omitted its thread id")
+        root_thread_id = ""
+    root_multi_agent_versions: list[object] = []
+    for item in root_items:
+        payload = item.get("payload")
+        if item.get("type") == "turn_context" and isinstance(payload, dict):
+            root_multi_agent_versions.append(payload.get("multi_agent_version"))
+    if not root_multi_agent_versions or any(
+        version != "v2" for version in root_multi_agent_versions
+    ):
+        rendered_versions = ", ".join(
+            sorted(
+                "<missing>" if version is None else str(version)
+                for version in root_multi_agent_versions
+            )
+        ) or "<none>"
+        read_issues.append(
+            "Codex root rollout did not prove multi-agent v2 execution; "
+            f"observed turn-context versions: {rendered_versions}"
+        )
+
+    spawn_attempts: list[str] = []
+    spawn_call_count = 0
+    spawn_contract_issues: dict[str, list[str]] = {}
+    attestation_issues: dict[str, list[str]] = {}
+    started_paths: list[str] = []
+    started_thread_ids: dict[str, list[str | None]] = {}
+    collaboration_calls: dict[str, str] = {}
+    delivered_payloads: dict[str, set[str]] = {}
+    delivered_results: dict[str, dict[str, WorkerResult]] = {}
+    delivered_mutation_paths: dict[str, set[str]] = {}
+    delivered_file_diffs: set[str] = set()
+
+    def remember_delivered_result(agent_path: str, delivered_payload: str) -> None:
+        delivered_payloads.setdefault(agent_path, set()).add(delivered_payload)
+        mutation_paths, has_file_diffs = _child_reported_mutations(delivered_payload)
+        delivered_mutation_paths.setdefault(agent_path, set()).update(mutation_paths)
+        if has_file_diffs:
+            delivered_file_diffs.add(agent_path)
+        delivered_result = _strict_child_worker_result(delivered_payload)
+        if delivered_result is None:
+            return
+        delivered_results.setdefault(agent_path, {})[
+            delivered_payload
+        ] = delivered_result
+
+    for item in root_items:
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if item.get("type") == "response_item" and payload.get("type") == "function_call":
+            call_id = payload.get("call_id")
+            call_name = payload.get("name")
+            if isinstance(call_id, str) and isinstance(call_name, str):
+                collaboration_calls[call_id] = call_name
+            if payload.get("name") != "spawn_agent":
+                continue
+            spawn_call_count += 1
+            raw_arguments = payload.get("arguments")
+            if not isinstance(raw_arguments, str):
+                read_issues.append("v2 spawn attempt omitted string arguments")
+                continue
+            try:
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                read_issues.append("v2 spawn attempt contained malformed JSON arguments")
+                continue
+            task_name = arguments.get("task_name") if isinstance(arguments, dict) else None
+            if isinstance(task_name, str) and task_name:
+                spawn_attempts.append(task_name)
+                definition = expected_tasks.get(task_name)
+                if definition is not None:
+                    spawn_contract_issues.setdefault(task_name, []).extend(
+                        _spawn_contract_validation_issues(
+                            arguments,
+                            definition,
+                            expected_spawn_messages.get(task_name),
+                            payload.get("encrypted_function_args"),
+                        )
+                    )
+            else:
+                read_issues.append("v2 spawn attempt omitted a valid task_name")
+            continue
+        if item.get("type") == "response_item" and payload.get("type") == "function_call_output":
+            call_id = payload.get("call_id")
+            raw_output = payload.get("output")
+            if (
+                not isinstance(call_id, str)
+                or collaboration_calls.get(call_id) != "list_agents"
+                or not isinstance(raw_output, str)
+            ):
+                continue
+            try:
+                list_output = json.loads(raw_output)
+            except json.JSONDecodeError:
+                continue
+            listed_agents = list_output.get("agents") if isinstance(list_output, dict) else None
+            if not isinstance(listed_agents, list):
+                continue
+            for listed_agent in listed_agents:
+                if not isinstance(listed_agent, dict):
+                    continue
+                agent_path = listed_agent.get("agent_name")
+                agent_status = listed_agent.get("agent_status")
+                completed_payload = (
+                    agent_status.get("completed")
+                    if isinstance(agent_status, dict)
+                    else None
+                )
+                if isinstance(agent_path, str) and isinstance(completed_payload, str):
+                    remember_delivered_result(agent_path, completed_payload)
+            continue
+        if item.get("type") == "event_msg" and payload.get("type") == "sub_agent_activity":
+            agent_path = payload.get("agent_path")
+            if payload.get("kind") == "started" and isinstance(agent_path, str):
+                started_paths.append(agent_path)
+                agent_thread_id = payload.get("agent_thread_id")
+                started_thread_ids.setdefault(agent_path, []).append(
+                    agent_thread_id if isinstance(agent_thread_id, str) else None
+                )
+            continue
+        if item.get("type") == "response_item" and payload.get("type") == "agent_message":
+            author = payload.get("author")
+            recipient = payload.get("recipient")
+            content = payload.get("content")
+            if not isinstance(author, str) or recipient != "/root" or not isinstance(content, list):
+                continue
+            text_parts = [
+                part.get("text")
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") == "input_text"
+                and isinstance(part.get("text"), str)
+            ]
+            delivered_text = "".join(text_parts)
+            if not delivered_text.startswith("Message Type: FINAL_ANSWER\n"):
+                continue
+            marker = "\nPayload:\n"
+            if marker in delivered_text:
+                remember_delivered_result(author, delivered_text.split(marker, 1)[1])
+
+    child_records: dict[str, list[tuple[dict[str, object], list[dict[str, object]]]]] = {}
+    unexpected_child_paths: list[str] = []
+    for metadata, items in records:
+        source = metadata.get("source")
+        if not isinstance(source, dict):
+            continue
+        subagent = source.get("subagent")
+        thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        if not isinstance(thread_spawn, dict):
+            continue
+        agent_path = thread_spawn.get("agent_path")
+        if not isinstance(agent_path, str):
+            continue
+        if thread_spawn.get("parent_thread_id") != root_thread_id:
+            unexpected_child_paths.append(agent_path)
+            continue
+        child_records.setdefault(agent_path, []).append((metadata, items))
+
+    expected_paths = {f"/root/{task_name}" for task_name in expected_tasks}
+    unexpected_attempts = sorted(set(spawn_attempts) - set(expected_tasks))
+    unexpected_started = sorted(set(started_paths) - expected_paths)
+    unexpected_children = sorted((set(child_records) - expected_paths) | set(unexpected_child_paths))
+    if unexpected_attempts:
+        read_issues.append("unexpected v2 spawn attempts: " + ", ".join(unexpected_attempts))
+    if spawn_call_count > len(definitions):
+        # Only an *excess* is a global integrity problem: it means the parent
+        # ran something beyond the selected lenses. A shortfall removes a lens
+        # and nothing else, so it is reported per-lens as coverage loss by
+        # _rollout_validation_issues rather than quarantining every lens that
+        # did deliver. Duplicate attempts for one lens are caught there too.
+        read_issues.append(
+            f"v2 root emitted {spawn_call_count} spawn attempts; expected at most {len(definitions)}"
+        )
+    if unexpected_started:
+        read_issues.append("unexpected v2 started tasks: " + ", ".join(unexpected_started))
+    if unexpected_children:
+        read_issues.append("unexpected or nested v2 child sessions: " + ", ".join(unexpected_children))
+
+    evidence_agents: list[ReviewRolloutAgentEvidence] = []
+    for definition in definitions:
+        task_name = definition.codex_name
+        agent_path = f"/root/{task_name}"
+        matching_children = child_records.get(agent_path, [])
+        child_thread_ids: list[str] = []
+        child_roles: list[str | None] = []
+        child_multi_agent_versions: list[str | None] = []
+        child_results: list[WorkerResult] = []
+        terminal_event_count = 0
+        reported_mutation_paths: set[str] = set(
+            delivered_mutation_paths.get(agent_path, set())
+        )
+        reported_file_diffs = agent_path in delivered_file_diffs
+        for metadata, items in matching_children:
+            thread_id = metadata.get("id")
+            if isinstance(thread_id, str) and thread_id:
+                child_thread_ids.append(thread_id)
+            source = metadata.get("source")
+            subagent = source.get("subagent") if isinstance(source, dict) else None
+            thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+            agent_role = thread_spawn.get("agent_role") if isinstance(thread_spawn, dict) else None
+            child_roles.append(agent_role if isinstance(agent_role, str) else None)
+            multi_agent_version = metadata.get("multi_agent_version")
+            child_multi_agent_versions.append(
+                multi_agent_version if isinstance(multi_agent_version, str) else None
+            )
+            for item in items:
+                payload = item.get("payload")
+                if (
+                    item.get("type") == "event_msg"
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "task_complete"
+                    and isinstance(payload.get("last_agent_message"), str)
+                ):
+                    terminal_event_count += 1
+                    mutation_paths, has_file_diffs = _child_reported_mutations(
+                        payload["last_agent_message"]
+                    )
+                    reported_mutation_paths.update(mutation_paths)
+                    reported_file_diffs = reported_file_diffs or has_file_diffs
+                    child_result = _strict_child_worker_result(
+                        payload["last_agent_message"]
+                    )
+                    if child_result is not None:
+                        child_results.append(child_result)
+
+        delivered_child_results = list(delivered_results.get(agent_path, {}).values())
+        final_delivery_count = len(delivered_payloads.get(agent_path, set()))
+        matched_child_result = (
+            child_results[0]
+            if len(child_results) == 1
+            and final_delivery_count == 1
+            and len(delivered_child_results) == 1
+            and child_results[0] == delivered_child_results[0]
+            else None
+        )
+        expected_digest = _assignment_digest_from_message(
+            expected_spawn_messages.get(task_name, "")
+        )
+        if matched_child_result is not None:
+            attested_child_result = _result_with_verified_assignment_attestation(
+                matched_child_result,
+                expected_digest,
+            )
+            if attested_child_result is None:
+                attestation_issues.setdefault(task_name, []).append(
+                    f"{task_name} child result did not attest its canonical assignment"
+                )
+            matched_child_result = attested_child_result
+        evidence_agents.append(
+            ReviewRolloutAgentEvidence(
+                review_agent=definition.review_agent.value,
+                task_name=task_name,
+                agent_role=task_name,
+                spawn_attempt_count=spawn_attempts.count(task_name),
+                started_count=started_paths.count(agent_path),
+                child_thread_ids=tuple(child_thread_ids),
+                child_roles=tuple(child_roles),
+                delivered_count=final_delivery_count,
+                child_result=matched_child_result,
+                spawn_contract_issues=tuple(
+                    spawn_contract_issues.get(task_name, [])
+                ),
+                attestation_issues=tuple(attestation_issues.get(task_name, [])),
+                child_multi_agent_versions=tuple(child_multi_agent_versions),
+                started_thread_ids=tuple(started_thread_ids.get(agent_path, [])),
+                terminal_event_count=terminal_event_count,
+                reported_mutation_paths=tuple(sorted(reported_mutation_paths)),
+                reported_file_diffs=reported_file_diffs,
+            )
+        )
+
+    return ReviewRolloutEvidence(
+        collected=True,
+        agents=tuple(evidence_agents),
+        validation_issues=tuple(read_issues),
     )
 
 
-def _match_review_spawn_prompt(prompt: object, expected_agents) -> str | None:
-    if not isinstance(prompt, str):
-        return None
+class RolloutIssues(NamedTuple):
+    """Per-lens rollout deviations, split by what they actually prove.
 
-    prompt_lower = prompt.lower()
-    line_matches: set[str] = set()
-    for raw_line in prompt_lower.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        line_matches.update(_match_review_spawn_prompt_line(line, expected_agents))
+    ``integrity`` issues mean the evidence chain itself cannot be trusted:
+    the manifest contradicts the rollouts, or a child did something a
+    read-only reviewer must never do. Those quarantine the whole review,
+    because a manifest that misreports one lens cannot be believed about any
+    of them.
 
-    if len(line_matches) == 1:
-        return next(iter(line_matches))
-    if len(line_matches) > 1:
-        return None
+    ``coverage`` issues mean one lens simply did not deliver usable output.
+    ``observed_status`` already demotes such a lens to ``failed``, and
+    ``_review_worker_result_from_rollouts`` only ever reconstructs findings
+    from ``completed``/``partial`` lenses, so a non-delivering lens cannot
+    inject anything into the caller-visible response. Failing the entire run
+    over one would discard the independently verified findings the other
+    lenses did deliver, which is precisely what partial coverage exists to
+    avoid.
+    """
 
-    text_matches = {
-        definition.review_agent.value
-        for definition in expected_agents
-        if any(marker in prompt_lower for marker in _review_prompt_markers(definition))
-    }
-    if len(text_matches) == 1:
-        return next(iter(text_matches))
-    return None
+    integrity: list[str]
+    coverage: list[str]
 
 
-def _match_review_spawn_prompt_line(line: str, expected_agents) -> set[str]:
-    normalized = line.strip().strip("`")
-    for prefix in ("required custom agent:", "required agent type:", "assigned lens:"):
-        if normalized.startswith(prefix):
-            value = normalized.split(":", 1)[1].strip().strip("`")
-            return {
-                definition.review_agent.value
-                for definition in expected_agents
-                if value in _review_prompt_markers(definition)
-            }
+def _rollout_validation_issues(
+    evidence: ReviewRolloutAgentEvidence,
+    reported_status: ReviewAgentExecutionStatus,
+) -> RolloutIssues:
+    integrity: list[str] = []
+    coverage: list[str] = []
 
-    if normalized.startswith("### spawn"):
-        return {
-            definition.review_agent.value
-            for definition in expected_agents
-            if definition.codex_name.lower() in normalized
-        }
-    return set()
+    # Duplicates mean something ran that Dobby never asked for, so they stay
+    # integrity failures. Zero of anything just means this lens produced
+    # nothing, which the coverage summary below reports.
+    if evidence.spawn_attempt_count > 1:
+        integrity.append(
+            f"{evidence.task_name} has {evidence.spawn_attempt_count} rollout spawn attempts; expected 1"
+        )
+    # How the lens was spawned is an isolation guarantee, not coverage: a
+    # wrong agent_type, a fork_turns other than "none", or an unexpected
+    # encrypted argument shape means a child ran that Dobby did not ask for,
+    # which README and AGENTS.md both promise is cross-checked before the
+    # manifest is accepted.
+    integrity.extend(evidence.spawn_contract_issues)
+    # A payload that does not attest its canonical assignment is discarded by
+    # ``_result_with_verified_assignment_attestation``, so an unattested child
+    # can only cost itself its own slot. Report it, do not quarantine on it.
+    coverage.extend(evidence.attestation_issues)
+    if len(evidence.child_thread_ids) > 1:
+        integrity.append(
+            f"{evidence.task_name} has {len(evidence.child_thread_ids)} child sessions; expected at most 1"
+        )
+    if evidence.started_count > 1:
+        integrity.append(
+            f"{evidence.task_name} has {evidence.started_count} started events; expected at most 1"
+        )
+    if (
+        evidence.started_thread_ids
+        and evidence.started_thread_ids != evidence.child_thread_ids
+    ):
+        integrity.append(
+            f"{evidence.task_name} started-event thread ids do not match its child session"
+        )
+    if evidence.terminal_event_count > 1:
+        integrity.append(
+            f"{evidence.task_name} has {evidence.terminal_event_count} terminal events; expected at most 1"
+        )
+    if evidence.delivered_count > 1:
+        integrity.append(
+            f"{evidence.task_name} has {evidence.delivered_count} delivered results; expected at most 1"
+        )
+    if evidence.reported_mutation_paths:
+        integrity.append(
+            f"{evidence.task_name} review child reported file changes: "
+            + ", ".join(evidence.reported_mutation_paths)
+        )
+    if evidence.reported_file_diffs:
+        integrity.append(f"{evidence.task_name} review child returned non-empty file_diffs")
+    if evidence.child_roles and evidence.child_roles != (evidence.agent_role,):
+        rendered_roles = ", ".join(role or "<missing>" for role in evidence.child_roles)
+        integrity.append(
+            f"{evidence.task_name} child role mismatch: expected {evidence.agent_role}; "
+            f"observed {rendered_roles}"
+        )
+    if (
+        evidence.child_multi_agent_versions
+        and evidence.child_multi_agent_versions != ("disabled",)
+    ):
+        rendered_versions = ", ".join(
+            version or "<missing>" for version in evidence.child_multi_agent_versions
+        )
+        integrity.append(
+            f"{evidence.task_name} child multi-agent isolation mismatch: expected disabled; "
+            f"observed {rendered_versions}"
+        )
 
-
-def _review_prompt_markers(definition) -> set[str]:
-    return {
-        definition.review_agent.value.lower(),
-        definition.label.lower(),
-        definition.codex_name.lower(),
-    }
-
-
-def _top_level_collab_events(stdout: str) -> list[tuple[str, dict[str, object]]]:
-    top_level_thread_id: str | None = None
-    events: list[tuple[str, dict[str, object]]] = []
-
-    for line in stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            payload = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-
-        payload_type = payload.get("type")
-        if payload_type == "thread.started" and top_level_thread_id is None:
-            thread_id = payload.get("thread_id")
-            if isinstance(thread_id, str):
-                top_level_thread_id = thread_id
-            continue
-
-        item = payload.get("item")
-        if not isinstance(item, dict) or item.get("type") != "collab_tool_call":
-            continue
-        sender_thread_id = item.get("sender_thread_id")
-        if top_level_thread_id is not None and sender_thread_id != top_level_thread_id:
-            continue
-        events.append((payload_type, item))
-
-    return events
-
-
-def _completed_top_level_spawn_events(collab_events: list[tuple[str, dict[str, object]]]) -> list[dict[str, object]]:
-    started_ids: set[str] = set()
-    completed: list[dict[str, object]] = []
-
-    for payload_type, item in collab_events:
-        if item.get("tool") != "spawn_agent":
-            continue
-        item_id = item.get("id")
-        if not isinstance(item_id, str):
-            continue
-        if payload_type == "item.started":
-            started_ids.add(item_id)
-            continue
-        if payload_type == "item.completed" and item_id in started_ids:
-            completed.append(item)
-
-    return completed
-
-
-def _completed_waited_child_threads(collab_events: list[tuple[str, dict[str, object]]]) -> set[str]:
-    completed: set[str] = set()
-    for payload_type, item in collab_events:
-        if payload_type != "item.completed" or item.get("tool") != "wait":
-            continue
-        agents_states = item.get("agents_states")
-        if not isinstance(agents_states, dict):
-            continue
-        for thread_id, state in agents_states.items():
-            if not isinstance(thread_id, str) or not isinstance(state, dict):
-                continue
-            if state.get("status") == "completed":
-                completed.add(thread_id)
-    return completed
-
-
-def _completed_wait_messages(collab_events: list[tuple[str, dict[str, object]]]) -> list[str]:
-    messages: list[str] = []
-    for payload_type, item in collab_events:
-        if payload_type != "item.completed" or item.get("tool") != "wait":
-            continue
-        agents_states = item.get("agents_states")
-        if not isinstance(agents_states, dict):
-            continue
-        for state in agents_states.values():
-            if not isinstance(state, dict) or state.get("status") != "completed":
-                continue
-            message = state.get("message")
-            if isinstance(message, str) and message.strip():
-                messages.append(message)
-    return messages
+    observed_status = evidence.observed_status
+    missing_or_mismatched: list[str] = []
+    if evidence.spawn_attempt_count != 1:
+        missing_or_mismatched.append(f"spawn_attempts={evidence.spawn_attempt_count}")
+    if evidence.started_count != 1:
+        missing_or_mismatched.append(f"started_events={evidence.started_count}")
+    if len(evidence.child_thread_ids) != 1:
+        missing_or_mismatched.append(f"child_sessions={len(evidence.child_thread_ids)}")
+    if evidence.started_thread_ids != evidence.child_thread_ids:
+        missing_or_mismatched.append("started_child_thread_match=false")
+    if evidence.child_roles != (evidence.agent_role,):
+        missing_or_mismatched.append("expected_child_role=false")
+    if evidence.child_multi_agent_versions != ("disabled",):
+        missing_or_mismatched.append("child_multi_agent_disabled=false")
+    if evidence.delivered_count != 1:
+        missing_or_mismatched.append(f"final_deliveries={evidence.delivered_count}")
+    if evidence.terminal_event_count != 1:
+        missing_or_mismatched.append(f"terminal_events={evidence.terminal_event_count}")
+    if evidence.child_result is None:
+        missing_or_mismatched.append("matching_terminal_result=false")
+    detail = (
+        " (" + ", ".join(missing_or_mismatched) + ")" if missing_or_mismatched else ""
+    )
+    if reported_status != observed_status:
+        integrity.append(
+            f"{evidence.task_name} reported {reported_status.value} but Codex rollout evidence shows "
+            f"{observed_status.value}{detail}"
+        )
+    elif observed_status == ReviewAgentExecutionStatus.FAILED:
+        # The manifest and the rollouts agree that this lens failed. That is an
+        # honest report of lost coverage, not a broken evidence chain.
+        coverage.append(
+            f"{evidence.task_name} delivered no usable review result{detail}"
+        )
+    return RolloutIssues(integrity=integrity, coverage=coverage)
 
 
-def _completed_wait_worker_results(collab_events: list[tuple[str, dict[str, object]]]) -> list[WorkerResult]:
-    child_results: list[WorkerResult] = []
-    for message in _completed_wait_messages(collab_events):
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            continue
-        try:
-            child_results.append(WorkerResult.model_validate(payload))
-        except ValidationError:
-            continue
-    return child_results
+def _verified_agent_summary(
+    agent: ReviewRolloutAgentEvidence,
+    fallback: str,
+) -> str:
+    """Return a per-agent manifest summary that never carries failed prose.
+
+    ``child_result`` can be populated for a lens whose evidence still failed —
+    a spawn that used the wrong role or fork policy, for instance. Keying the
+    summary on the payload's mere existence let that child's own words reach
+    the caller through ``review_details`` even though its findings were
+    excluded everywhere else.
+    """
+    if (
+        agent.child_result is None
+        or agent.observed_status == ReviewAgentExecutionStatus.FAILED
+    ):
+        return fallback
+    return agent.child_result.summary
 
 
-def _salvaged_review_worker_result(
-    stdout: str,
-    agents,
+def _review_worker_result_from_rollouts(
+    evidence: ReviewRolloutEvidence,
     *,
-    diagnostics: ReviewOrchestrationDiagnostics | None = None,
+    parent_result_missing: bool,
 ) -> WorkerResult | None:
-    diagnostics = diagnostics or _review_orchestration_diagnostics(stdout, agents)
-    child_results = list(diagnostics.child_results)
-    if not child_results:
+    if not evidence.collected or evidence.validation_issues:
         return None
-    if len(child_results) == 1 and diagnostics.expected_count <= 1:
-        return child_results[0]
+    usable_agents = [
+        agent
+        for agent in evidence.agents
+        if agent.observed_status
+        in {ReviewAgentExecutionStatus.COMPLETED, ReviewAgentExecutionStatus.PARTIAL}
+        and agent.child_result is not None
+    ]
+    if not usable_agents:
+        return None
 
+    important_facts: list[str] = []
+    next_steps: list[str] = []
+    warnings = (
+        [
+            "Review parent did not return final structured output; Dobby recovered independently "
+            "delivered child results from Codex session rollouts."
+        ]
+        if parent_result_missing
+        else []
+    )
+    for agent in usable_agents:
+        assert agent.child_result is not None
+        important_facts = _merge_preserving_order(
+            important_facts,
+            agent.child_result.important_facts,
+        )
+        next_steps = _merge_preserving_order(next_steps, agent.child_result.next_steps)
+        warnings = _merge_preserving_order(warnings, agent.child_result.warnings)
+
+    statuses = [agent.observed_status for agent in evidence.agents]
+    completeness = (
+        Completeness.FULL
+        if all(status == ReviewAgentExecutionStatus.COMPLETED for status in statuses)
+        else Completeness.PARTIAL
+    )
+    summary = (
+        "Review parent did not return final JSON; recovered independently verified findings "
+        if parent_result_missing
+        else "Multi-agent review returned independently verified findings "
+    )
     return WorkerResult(
-        summary=diagnostics.salvaged_summary(),
-        completeness=Completeness.FULL if diagnostics.salvage_complete else Completeness.PARTIAL,
-        important_facts=_merge_preserving_order(
-            [fact for result in child_results for fact in result.important_facts],
-            [],
-        ),
-        next_steps=_merge_preserving_order(
-            [step for result in child_results for step in result.next_steps],
-            [],
-        ),
+        summary=summary
+        + f"from {len(usable_agents)}/{len(evidence.agents)} delivered v2 child results.",
+        completeness=completeness,
+        important_facts=important_facts,
+        next_steps=next_steps,
+        files_changed=[],
+        warnings=warnings,
+        refused=False,
+        file_diffs=[],
+        review_execution={
+            "protocol": ReviewOrchestrationProtocol.MULTI_AGENT_V2,
+            "agents": [
+                {
+                    "review_agent": agent.review_agent,
+                    "task_name": agent.task_name,
+                    "status": agent.observed_status,
+                    "summary": _verified_agent_summary(
+                        agent,
+                        "No usable delivered child result was recorded in Codex session rollouts.",
+                    ),
+                }
+                for agent in evidence.agents
+            ],
+        },
+    )
+
+
+def _salvaged_review_worker_result_from_rollouts(
+    evidence: ReviewRolloutEvidence,
+) -> WorkerResult | None:
+    return _review_worker_result_from_rollouts(
+        evidence,
+        parent_result_missing=True,
+    )
+
+
+def _verified_review_worker_result_from_rollouts(
+    evidence: ReviewRolloutEvidence,
+) -> WorkerResult:
+    if not evidence.collected or evidence.validation_issues:
+        return _quarantined_review_worker_result()
+    result = _review_worker_result_from_rollouts(
+        evidence,
+        parent_result_missing=False,
+    )
+    if result is not None:
+        return result
+
+    # A validated manifest can contain only blocked/failed children. Preserve
+    # the exact observed execution state without accepting parent-authored
+    # prose as findings.
+    return WorkerResult(
+        summary="Multi-agent review produced no independently verified usable child results.",
+        completeness=Completeness.BLOCKED,
+        important_facts=[],
+        next_steps=[],
         files_changed=[],
         warnings=_merge_preserving_order(
-            [warning for result in child_results for warning in result.warnings],
             [],
+            [
+                warning
+                for agent in evidence.agents
+                if agent.child_result is not None
+                and agent.observed_status != ReviewAgentExecutionStatus.FAILED
+                for warning in agent.child_result.warnings
+            ],
         ),
+        refused=False,
+        file_diffs=[],
+        review_execution={
+            "protocol": ReviewOrchestrationProtocol.MULTI_AGENT_V2,
+            "agents": [
+                {
+                    "review_agent": agent.review_agent,
+                    "task_name": agent.task_name,
+                    "status": agent.observed_status,
+                    "summary": _verified_agent_summary(
+                        agent,
+                        "No valid delivered child result was recorded in Codex session rollouts.",
+                    ),
+                }
+                for agent in evidence.agents
+            ],
+        },
     )
 
 
-def _review_salvage_complete(stdout: str, agents) -> bool:
-    return _review_orchestration_diagnostics(stdout, agents).salvage_complete
+def _quarantined_review_worker_result() -> WorkerResult:
+    return WorkerResult(
+        summary="Multi-agent review evidence failed validation; no findings were returned.",
+        completeness=Completeness.BLOCKED,
+        important_facts=[],
+        next_steps=[],
+        files_changed=[],
+        warnings=[],
+        refused=False,
+        file_diffs=[],
+        review_execution=None,
+    )
+
+
+def _review_execution_diagnostics(
+    worker_result: WorkerResult | None,
+    agents,
+    rollout_evidence: ReviewRolloutEvidence | None = None,
+) -> ReviewExecutionDiagnostics:
+    definitions = selected_review_agent_definitions(agents)
+    expected_by_agent = {
+        definition.review_agent.value: definition.codex_name
+        for definition in definitions
+    }
+    manifest = worker_result.review_execution if worker_result is not None else None
+    if manifest is None:
+        return ReviewExecutionDiagnostics(
+            expected_agents=tuple(expected_by_agent),
+            manifest=None,
+            execution_evidence=(
+                ReviewExecutionEvidence.CODEX_SESSION_ROLLOUTS
+                if rollout_evidence is not None and rollout_evidence.collected
+                else None
+            ),
+            validation_issues=("worker result omitted the required review_execution manifest",),
+            completed_count=0,
+            partial_count=0,
+            blocked_count=0,
+            failed_count=0,
+        )
+
+    issues: list[str] = []
+    coverage_issues: list[str] = []
+    if manifest.protocol != ReviewOrchestrationProtocol.MULTI_AGENT_V2:
+        issues.append("review_execution.protocol was not multi_agent_v2")
+
+    reported_agent_order = [entry.review_agent.value for entry in manifest.agents]
+    expected_agent_order = list(expected_by_agent)
+    if reported_agent_order != expected_agent_order:
+        issues.append(
+            "review agent order mismatch: expected "
+            + ", ".join(expected_agent_order)
+            + "; reported "
+            + ", ".join(reported_agent_order)
+        )
+
+    entries_by_agent: dict[str, list] = {}
+    task_counts: dict[str, int] = {}
+    for entry in manifest.agents:
+        entries_by_agent.setdefault(entry.review_agent.value, []).append(entry)
+        task_counts[entry.task_name] = task_counts.get(entry.task_name, 0) + 1
+
+    missing_agents = [agent for agent in expected_by_agent if agent not in entries_by_agent]
+    duplicate_agents = [agent for agent, entries in entries_by_agent.items() if len(entries) > 1]
+    unexpected_agents = [agent for agent in entries_by_agent if agent not in expected_by_agent]
+    duplicate_tasks = [task for task, count in task_counts.items() if count > 1]
+    mismatched_tasks = [
+        f"{agent} expected {expected_by_agent[agent]} but reported {entries[0].task_name}"
+        for agent, entries in entries_by_agent.items()
+        if agent in expected_by_agent
+        and len(entries) == 1
+        and entries[0].task_name != expected_by_agent[agent]
+    ]
+
+    if missing_agents:
+        issues.append("missing selected review agents: " + ", ".join(missing_agents))
+    if duplicate_agents:
+        issues.append("duplicate review agent entries: " + ", ".join(duplicate_agents))
+    if unexpected_agents:
+        issues.append("unexpected review agent entries: " + ", ".join(unexpected_agents))
+    if duplicate_tasks:
+        issues.append("duplicate task names: " + ", ".join(duplicate_tasks))
+    if mismatched_tasks:
+        issues.append("mismatched task names: " + "; ".join(mismatched_tasks))
+
+    if rollout_evidence is None:
+        issues.append("Codex session rollout evidence was not collected")
+    else:
+        issues.extend(rollout_evidence.validation_issues)
+        rollout_by_task = rollout_evidence.by_task_name
+        for entry in manifest.agents:
+            expected_task = expected_by_agent.get(entry.review_agent.value)
+            if expected_task is None or entry.task_name != expected_task:
+                continue
+            evidence = rollout_by_task.get(entry.task_name)
+            if evidence is None:
+                issues.append(f"Codex session rollouts omitted {entry.task_name}")
+                continue
+            lens_issues = _rollout_validation_issues(evidence, entry.status)
+            issues.extend(lens_issues.integrity)
+            coverage_issues.extend(lens_issues.coverage)
+
+    completed_count = sum(
+        entry.status == ReviewAgentExecutionStatus.COMPLETED
+        for entry in manifest.agents
+        if entry.review_agent.value in expected_by_agent
+        and entry.task_name == expected_by_agent[entry.review_agent.value]
+    )
+    partial_count = sum(
+        entry.status == ReviewAgentExecutionStatus.PARTIAL
+        for entry in manifest.agents
+        if entry.review_agent.value in expected_by_agent
+        and entry.task_name == expected_by_agent[entry.review_agent.value]
+    )
+    blocked_count = sum(
+        entry.status == ReviewAgentExecutionStatus.BLOCKED
+        for entry in manifest.agents
+        if entry.review_agent.value in expected_by_agent
+        and entry.task_name == expected_by_agent[entry.review_agent.value]
+    )
+    failed_count = sum(
+        entry.status == ReviewAgentExecutionStatus.FAILED
+        for entry in manifest.agents
+        if entry.review_agent.value in expected_by_agent
+        and entry.task_name == expected_by_agent[entry.review_agent.value]
+    )
+    if not issues:
+        if completed_count == len(expected_by_agent):
+            expected_completeness = Completeness.FULL
+        elif completed_count + partial_count > 0:
+            expected_completeness = Completeness.PARTIAL
+        else:
+            expected_completeness = Completeness.BLOCKED
+        if worker_result is not None and worker_result.completeness != expected_completeness:
+            issues.append(
+                "top-level completeness does not match agent statuses: expected "
+                f"{expected_completeness.value}; reported {worker_result.completeness.value}"
+            )
+    return ReviewExecutionDiagnostics(
+        expected_agents=tuple(expected_by_agent),
+        manifest=manifest,
+        execution_evidence=(
+            ReviewExecutionEvidence.CODEX_SESSION_ROLLOUTS
+            if rollout_evidence is not None and rollout_evidence.collected
+            else None
+        ),
+        validation_issues=tuple(issues),
+        completed_count=completed_count,
+        partial_count=partial_count,
+        blocked_count=blocked_count,
+        failed_count=failed_count,
+        coverage_issues=tuple(coverage_issues),
+    )
 
 
 def _collect_sandbox_violations(stderr: str, stdout: str = "") -> list[str]:
@@ -2065,6 +3018,56 @@ async def _capture_repo_snapshot_with_deadline(
         raise RunnerError(f"Snapshot helper returned an invalid repo snapshot for {repo_root}") from exc
 
 
+async def _ensure_multi_agent_v2_available(
+    codex_binary: str,
+    repo_root: Path,
+    child_env: dict[str, str],
+    deadline: float,
+) -> None:
+    probe_deadline = min(deadline, time.monotonic() + 10.0)
+    try:
+        process = await _create_process_with_deadline(
+            [codex_binary, "features", "list"],
+            repo_root,
+            child_env,
+            probe_deadline,
+        )
+    except FileNotFoundError as exc:
+        raise RunnerError(f"Codex executable not found: {codex_binary}") from exc
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(),
+            timeout=_seconds_remaining(probe_deadline),
+        )
+    except asyncio.TimeoutError as exc:
+        await _terminate_process(
+            process,
+            timeout=_POST_TIMEOUT_TERMINATE_GRACE_SECONDS,
+        )
+        raise RunnerError(
+            "Could not verify Codex multi-agent v2 support within 10 seconds"
+        ) from exc
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+    if process.returncode == 0 and re.search(
+        r"^multi_agent_v2\s+",
+        stdout_text,
+        re.MULTILINE,
+    ):
+        return
+
+    detail = (
+        _first_meaningful_output_line(stderr_text)
+        or _first_meaningful_output_line(stdout_text)
+        or f"Codex exited with status {process.returncode}"
+    )
+    raise RunnerError(
+        "Multi-agent review requires a Codex CLI with the `multi_agent_v2` feature "
+        f"(verified with codex-cli 0.147.0). Installed CLI probe failed: {detail}"
+    )
+
+
 async def _create_process_with_deadline(
     argv: list[str],
     repo_root: Path,
@@ -2173,7 +3176,9 @@ def _prepare_child_runtime(
             )
         )
     private_root: Path | None = None
+    scratch_root: Path | None = None
     try:
+        scratch_root = _child_scratch_root(artifacts)
         private_root = private_runtime_root(artifacts.run_dir.name)
         codex_home = _ensure_artifact_subdirectory(private_root / "codex-home", "child Codex home directory")
         _ensure_artifact_subdirectory(codex_home / "sessions", "child Codex sessions directory")
@@ -2198,26 +3203,36 @@ def _prepare_child_runtime(
             claude_config_dir=claude_config_dir,
             home_config_path=home_config_path,
             env_overrides=_child_runtime_environment_overrides(
-                artifacts,
+                scratch_root,
                 codex_home=codex_home,
                 claude_config_dir=claude_config_dir,
             ),
+            scratch_root=scratch_root,
         )
-    except RunnerError:
+    except RunnerError as exc:
+        # The run never starts, so nothing will consume the scratch tree.
+        if scratch_root is not None:
+            _cleanup_child_scratch_root(scratch_root)
         if private_root is not None:
-            _cleanup_private_child_runtime(private_root)
+            cleanup_issue = _cleanup_private_child_runtime(private_root)
+            if cleanup_issue is not None:
+                raise RunnerError(f"{exc}. {cleanup_issue}") from exc
         raise
     except Exception as exc:
+        cleanup_issue = None
+        if scratch_root is not None:
+            _cleanup_child_scratch_root(scratch_root)
         if private_root is not None:
-            _cleanup_private_child_runtime(private_root)
+            cleanup_issue = _cleanup_private_child_runtime(private_root)
         target = private_root / "codex-home" if private_root is not None else Path(tempfile.gettempdir()) / "codex-dobby"
-        raise RunnerError(
-            _codex_home_access_message(
-                str(target),
-                subject="its private runtime home",
-                verb="cannot create",
-            )
-        ) from exc
+        access_message = _codex_home_access_message(
+            str(target),
+            subject="its private runtime home",
+            verb="cannot create",
+        )
+        if cleanup_issue is not None:
+            access_message = f"{access_message}. {cleanup_issue}"
+        raise RunnerError(access_message) from exc
 
 
 def _rewrite_path_prefix(text: str, prefix: str, replacement: str) -> str:
@@ -2368,6 +3383,13 @@ def _iter_config_path_references(payload: str, *, source_root: Path, tilde_prefi
     return discovered
 
 
+# Never mirrored out of a parent runtime home: the child gets a fresh
+# sessions root, and Dobby's rollout evidence depends on it containing exactly
+# one root session — this run's.
+# Compared case-folded; see _is_excluded_runtime_reference.
+_UNMIRRORABLE_RUNTIME_SUBTREES = frozenset({"sessions"})
+
+
 def _mirror_runtime_path_reference(
     reference: Path,
     *,
@@ -2376,21 +3398,34 @@ def _mirror_runtime_path_reference(
     mirrored: set[Path],
 ) -> None:
     try:
-        reference.relative_to(source_root)
+        relative = reference.relative_to(source_root)
     except ValueError:
         return
     if not reference.exists():
         return
+    # Every containment and exclusion decision below is made on the *resolved*
+    # path. A lexical check is bypassable three ways that all end in the same
+    # place — cloning credentials, caches, or the parent's rollout history into
+    # the child runtime: a symlink alias to the home or to sessions/, a `..`
+    # segment, or a case variant like `Sessions` on a case-insensitive
+    # filesystem.
+    if _is_excluded_runtime_reference(reference, source_root=source_root):
+        return
 
     if reference.is_dir():
         source_item = reference
-        target_item = target_root / reference.relative_to(source_root)
+        target_item = target_root / relative
     elif reference.parent == source_root:
         source_item = reference
-        target_item = target_root / reference.relative_to(source_root)
+        target_item = target_root / relative
     else:
         source_item = reference.parent
-        target_item = target_root / source_item.relative_to(source_root)
+        try:
+            target_item = target_root / source_item.relative_to(source_root)
+        except ValueError:
+            return
+        if _is_excluded_runtime_reference(source_item, source_root=source_root):
+            return
 
     if source_item in mirrored:
         return
@@ -2398,9 +3433,65 @@ def _mirror_runtime_path_reference(
 
     target_item.parent.mkdir(parents=True, exist_ok=True)
     if source_item.is_dir():
-        shutil.copytree(source_item, target_item, dirs_exist_ok=True)
+        # The ignore callback resolves each entry, so a symlink nested inside
+        # an allowed directory cannot pull the home root or a sessions tree in.
+        shutil.copytree(
+            source_item,
+            target_item,
+            dirs_exist_ok=True,
+            ignore=lambda directory, names: _excluded_runtime_names(
+                Path(directory), names, source_root=source_root
+            ),
+        )
     else:
         shutil.copy2(source_item, target_item)
+
+
+def _is_excluded_runtime_reference(reference: Path, *, source_root: Path) -> bool:
+    """Whether a config path reference must never be mirrored.
+
+    Decided on resolved paths so a symlink alias, a ``..`` segment, or a case
+    variant cannot reach an excluded subtree. Resolving *outside* the runtime
+    home is not itself excluded: a symlinked helper directory (for example
+    ``~/.claude/mcp-servers`` pointing at a shared checkout) is a supported
+    layout, and the caller has already required the reference to be lexically
+    inside the home.
+    """
+    try:
+        resolved = reference.resolve()
+        resolved_root = source_root.resolve()
+    except OSError:
+        return True
+    try:
+        relative = resolved.relative_to(resolved_root)
+    except ValueError:
+        return False
+    if relative == Path("."):
+        # A bare reference to the runtime home itself (a plain "~/.codex"
+        # mentioned anywhere in config.toml) is not a mirrorable artifact.
+        # Copying it would clone the whole parent home into the child's private
+        # runtime — auth.json, caches, and every historical session rollout —
+        # which is both enormous and enough to break the review: extra rollouts
+        # under the child's sessions root make Dobby observe more than one root
+        # session and quarantine the run. The seeding path already copies the
+        # specific files a child needs.
+        return True
+    # Case-folded: macOS filesystems are case-insensitive by default, so
+    # "Sessions" and "sessions" name the same directory.
+    return bool(relative.parts) and relative.parts[0].casefold() in _UNMIRRORABLE_RUNTIME_SUBTREES
+
+
+def _excluded_runtime_names(
+    directory: Path,
+    names: list[str],
+    *,
+    source_root: Path,
+) -> set[str]:
+    return {
+        name
+        for name in names
+        if _is_excluded_runtime_reference(directory / name, source_root=source_root)
+    }
 
 
 def _absolute_path(path: Path) -> Path:
@@ -2415,23 +3506,69 @@ def _same_path(left: Path, right: Path) -> bool:
         return _absolute_path(left) == _absolute_path(right)
 
 
-def _cleanup_private_child_runtime(path: Path, logger=None) -> None:  # type: ignore[no-untyped-def]
+def _cleanup_private_child_runtime(path: Path, logger=None) -> str | None:  # type: ignore[no-untyped-def]
     try:
         shutil.rmtree(path)
     except FileNotFoundError:
-        return
+        return None
     except OSError as exc:
+        issue = (
+            "Failed to delete private runtime containing copied credentials and session data at "
+            f"{path}: {exc}"
+        )
         if logger is not None:
-            logger.warning("Failed to remove private child runtime %s: %s", path, exc)
+            logger.warning(issue)
+        return issue
+    return None
+
+
+def _cleanup_child_scratch_root(path: Path, logger=None) -> str | None:  # type: ignore[no-untyped-def]
+    """Remove the child's TMPDIR/cache tree from the run's artifact directory.
+
+    Separate from ``_cleanup_private_child_runtime`` because the two have
+    different consequences: the private runtime holds copied credentials, so
+    failing to delete it fails the run. This tree holds only scratch data, so
+    failing to delete it is reported and the result still stands.
+    """
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        issue = f"Failed to delete the child runtime scratch directory at {path}: {exc}"
+        if logger is not None:
+            logger.warning(issue)
+        return issue
+    return None
+
+
+def _response_with_private_runtime_cleanup_failure(
+    response: ToolResponse,
+    issue: str,
+) -> ToolResponse:
+    return response.model_copy(
+        update={
+            "status": RunStatus.ERROR,
+            "summary": issue,
+            "completeness": Completeness.BLOCKED,
+            "warnings": _merge_preserving_order([issue], response.warnings),
+            "stop_reason": StopReason.ERROR,
+        }
+    )
+
+
+def _child_scratch_root(artifacts: RunArtifacts) -> Path:
+    return _ensure_artifact_subdirectory(
+        artifacts.run_dir / "runtime", "child runtime directory"
+    )
 
 
 def _child_runtime_environment_overrides(
-    artifacts: RunArtifacts,
+    runtime_root: Path,
     *,
     codex_home: Path,
     claude_config_dir: Path,
 ) -> dict[str, str]:
-    runtime_root = _ensure_artifact_subdirectory(artifacts.run_dir / "runtime", "child runtime directory")
     tmp_root = _ensure_artifact_subdirectory(runtime_root / "tmp", "child temp directory")
     cache_root = _ensure_artifact_subdirectory(runtime_root / "cache", "child cache directory")
     uv_cache_root = _ensure_artifact_subdirectory(cache_root / "uv", "child uv cache directory")

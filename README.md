@@ -24,7 +24,8 @@ It gives Claude a sharper tool surface than a raw shell handoff: planning stays 
 
 - Python 3.12+
 - `uv`
-- Codex CLI installed and authenticated
+- MCP Python SDK 2.x (`mcp[cli]>=2.0.0,<3`), installed automatically as a dependency
+- Codex CLI installed and authenticated. Multi-agent review requires a CLI that lists `multi_agent_v2` in `codex features list`; Dobby verifies this before fan-out and has been tested with `codex-cli 0.147.0`.
 - A git worktree for the target repo
 
 ### Optional MCP dependencies
@@ -105,7 +106,9 @@ Offload grunt work — build/test, code review, research, planning, implementati
 - Call `mcp__codex-dobby__*` directly. Never wrap them in a general-purpose Agent/Task subagent.
 - Always pass the absolute path of the current repository as `repo_root` on every Dobby call, including `get_run`, `wait_run`, and `list_runs`.
 - Don't lower `timeout_seconds` below the default. Err too long — a short timeout kills the run; a long one costs nothing because Dobby returns as soon as it's ready.
+- For `review`, omit `agents` or pass one lens for a direct single-agent review. Pass two or more of `generalist`, `security`, `performance`, `architecture`, `correctness`, `ux`, and `regression` for v2 fan-out; use `timeout_seconds=1200` for multi-agent review.
 - For long work, start it with `mcp__codex-dobby__start_run` and then either block on `mcp__codex-dobby__wait_run` (parent sleeps in the tool call) or poll `mcp__codex-dobby__get_run` (parent keeps working). On Claude Code, `/loop` or `ScheduleWakeup` can schedule the polls for you so the parent is free between checks.
+- Always wait for `start_run` to return its `task_id` before calling `wait_run` or `get_run`; do not race the start and lookup calls in parallel.
 - To resume, continue, or check on a background run, call `wait_run`/`get_run` with its `task_id` — a Dobby run takes no further input once started, so to change course let it finish (or cancel) and `start_run` again.
 ```
 
@@ -113,9 +116,9 @@ Offload grunt work — build/test, code review, research, planning, implementati
 
 Every tool requires `repo_root`, the absolute path to the target git worktree. Worker tools also take `prompt`; their other common params are `files`, `important_context`, `timeout_seconds`, `extra_roots`, `model`, and `reasoning_effort`. Tool-specific: `danger` (`build`, `reverse_engineer`), `agents` (`review`).
 
-`review` agents: `generalist` (default), `security`, `performance`, `architecture`, `correctness`, `ux`, `regression`. Pass multiple for multi-agent review.
+`review` agents: `generalist` (default), `security`, `performance`, `architecture`, `correctness`, `ux`, `regression`. Zero or one effective agent runs directly. Pass two or more for explicit multi-agent v2 fan-out, normally with `timeout_seconds=1200`. Multi-agent review costs more tokens and latency than a direct review because it runs a parent plus every selected child, so select only lenses that materially help the task.
 
-`start_run` takes the same params as the target tool, plus required `tool`. If `timeout_seconds` is omitted, it defaults to that target tool's normal timeout. Non-empty `agents` are only accepted when `tool` is `review`; other tools reject them with a validation error.
+`start_run` takes the same params as the target tool, plus required `tool`. If `timeout_seconds` is omitted, it defaults to that target tool's normal timeout, except multi-agent review automatically uses 1200 seconds. Non-empty `agents` are only accepted when `tool` is `review`; other tools reject them with a validation error. Independent `start_run` calls may execute in parallel, but wait for each call's own response before looking up its returned `task_id`.
 
 `get_run` params: `task_id`, `repo_root`.
 
@@ -148,7 +151,7 @@ Default model is `gpt-5.6-sol` for all tools and review subagents. Any explicit 
 - Child Codex runs inherit the parent's environment, but Dobby seeds a private per-run `CODEX_HOME` under the system temp directory (`.../codex-dobby/<task-id>/codex-home`) instead of pointing children at the user's global Codex home directly.
 - `research` prefers codebase evidence and uses fetchaller MCP tools when available. If fetchaller is not installed or not configured for the run, the worker is told not to call it and to continue without web MCP support.
 - `validate` runs in workspace-write `--full-auto` because validation often needs temp or cache writes; the worker prompt still forbids source edits and commits.
-- `review` uses a direct single-lens path for one agent, or multi-agent orchestration (via `spawn_agent` over `codex exec --json`) for multiple. Single-agent review defaults to `gpt-5.6-sol` at `medium` reasoning. Multi-agent review uses a `gpt-5.6-sol` parent at `medium` reasoning and injects `gpt-5.6-sol` reviewer subagents, also at `medium` by default.
+- `review` uses a direct single-lens path for one agent, or explicitly enables Codex multi-agent v2 for multiple. The v2 parent spawns one deterministic task per selected custom reviewer with the exact custom role, a canonical assignment bound to the requested repo/task/files/context, and `fork_turns="none"`, then collects parent-observed completion results. Codex 0.147 intentionally persists the `message` tool argument as opaque provider ciphertext, so Dobby requires every other spawn field to remain exact, accepts only a single high-entropy opaque message value provisionally, and binds it to a SHA-256 assignment identity attested by the independently correlated child terminal result. Before accepting the execution manifest, Dobby also cross-checks root v2 mode, canonical child task/thread/role, disabled child delegation, one strict read-only terminal JSON result, and an identical completed payload observed by the parent through v2 agent state. Global evidence failures quarantine all findings. The wrapper strips the internal attestation and reconstructs returned findings, next steps, warnings, and per-agent summaries from verified child results instead of trusting parent-authored synthesis. Review runs disable every inherited MCP server, and reviewer role configs disable child delegation. Single-agent review defaults to `gpt-5.6-sol` at `medium` reasoning. Multi-agent review uses the resolved model with a `low`-reasoning orchestration parent and `medium` reviewer children by default; an explicit reasoning override applies to reviewers while the parent stays `low`.
 - `reverse_engineer` includes a Ghidra MCP workflow only when Ghidra is installed and configured for the run. When Dobby can discover Ghidra from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`), it adds the configured Ghidra MCP helper repo as a writable helper root. When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run. If Ghidra is not installed or not configured, the worker is told not to call `mcp__ghidra__*`.
 - `reverse_engineer` responses include `reverse_engineer_details.ghidra`, which reports whether Ghidra was configured, whether the run used direct MCP calls or the mounted helper fallback, and which Ghidra calls were observed.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.
@@ -156,6 +159,7 @@ Default model is `gpt-5.6-sol` for all tools and review subagents. Any explicit 
 - Multi-task `wait_run` (`task_ids=[...]` or no ids → all-live) uses `asyncio.wait(..., return_when=FIRST_COMPLETED)` over shielded futures and returns the first run to finish. The response's `pending_task_ids` lists the still-outstanding ids; callers should re-call `wait_run(task_ids=pending_task_ids)` until it's empty. On timeout the primary entry is the first id in the input list; `pending_task_ids` holds every id still waiting.
 - Result artifacts are replaced atomically, so `get_run` sees either the startup placeholder or the final persisted response instead of a partially written `result.json`.
 - Synchronous worker tool calls (`review`, `research`, etc.) can still hit the caller's outer `tools/call` ceiling. Prefer `start_run` + `wait_run` / `get_run` when that's a concern.
+- If an orchestrated review parent times out after one or more children delivered valid results, Dobby reconstructs a partial manifest and salvages those findings from the private Codex session rollouts. Undelivered, malformed, or blocked child output is not counted as usable coverage.
 
 ## Filesystem and Safety
 
@@ -163,8 +167,8 @@ Default model is `gpt-5.6-sol` for all tools and review subagents. Any explicit 
 - Mutating tools run in workspace-write and mount `extra_roots` writable via `--add-dir`.
 - Mutating tools also ensure `.codex-dobby/` is present in `.gitignore`. Unsafe `.gitignore` targets, such as symlinks or multiply-linked files, fail closed.
 - External worktree mutations during a read-only run (you editing files in another terminal, another process touching the repo) are surfaced as a warning, not an error. Codex's OS-level read-only sandbox blocks codex itself from writing, so detected changes are by definition external. The run still escalates to `stop_reason: sandbox_violation` only when the worker self-reports having modified files that the wrapper also observed.
-- Child Codex runs no longer need write access to the parent `~/.codex/sessions`. Dobby seeds the child home from `CODEX_HOME/auth.json` and `CODEX_HOME/config.toml` when those files exist, mirrors referenced helper files from `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into a private runtime, then points the child at that private temp home. The server process therefore needs read access to the parent Codex and Claude config files plus read/write access to the temp runtime directory.
-- `CODEX_DOBBY_ACTIVE=1` is set on child runs and Dobby refuses to run if already set. Inherited `codex-dobby-mcp` entries are disabled so workers can't call back.
+- Child Codex runs no longer need write access to the parent `~/.codex/sessions`. Dobby seeds the child home from `CODEX_HOME/auth.json` and `CODEX_HOME/config.toml` when those files exist, mirrors referenced helper files from `CODEX_HOME` and `CLAUDE_CONFIG_DIR` into a current-user-owned `0700` private runtime, then points the child at that temp home. Existing task directories are rejected. Orchestrated review forces `history.persistence="save-all"` only in this isolated runtime because rollout evidence is required. Dobby deletes the runtime in finalization; if deletion fails, the persisted response is changed to `status: "error"`, names the retained sensitive path, and uses `completeness: "blocked"`. The server process therefore needs read access to the parent Codex and Claude config files plus read/write access to the temp runtime directory.
+- `CODEX_DOBBY_ACTIVE=1` is set on child runs and Dobby refuses to run if already set. Every inherited MCP server is disabled for review, preventing recursive calls through renamed or wrapped Dobby entries. Other tool roles retain useful MCPs but disable recognizable Dobby entries.
 - Commits are forbidden. A mutating worker that creates or moves a commit returns `status: "error"`.
 - Artifact access fails closed on invalid `task_id` values and symlinked artifact roots or paths. Wrapper writes also fail closed on unsafe `.gitignore` targets.
 
@@ -172,7 +176,7 @@ Default model is `gpt-5.6-sol` for all tools and review subagents. Any explicit 
 
 Each run writes to `<target-root>/.codex-dobby/runs/<task-id>/`: `request.json`, `prompt.txt`, `stdout.log`, `stderr.log`, `last_message.txt`, `result.json`, `output-schema.json`, `events.jsonl`. Multi-agent `review` logs are also JSONL inside `stdout.log`. `events.jsonl` is the durable record of streaming progress events for the run (one ACP-shaped event per line; see [Streaming progress](#streaming-progress) below). Treat `.codex-dobby/` as unredacted local logs.
 
-Worker-facing tools (`plan`, `research`, `brainstorm`, `build`, `validate`, `review`, `reverse_engineer`) return `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed` (this run only), `file_diffs` (mutating tools only — see [File diffs](#file-diffs)), `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`, and `stop_reason` (see [Stop reasons](#stop-reasons)). `review` responses also include `review_details`, where `requested_review_agents` is the raw caller-supplied list and `effective_review_agents` is the normalized/defaulted list Dobby actually used. `reverse_engineer` responses also include `reverse_engineer_details.ghidra`, with `mode`, `summary`, and the observed `mcp_calls` and `helper_calls`.
+Worker-facing tools (`plan`, `research`, `brainstorm`, `build`, `validate`, `review`, `reverse_engineer`) return `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed` (this run only), `file_diffs` (mutating tools only — see [File diffs](#file-diffs)), `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`, and `stop_reason` (see [Stop reasons](#stop-reasons)). `review` responses also include `review_details`: the raw requested and normalized effective reviewers, the orchestration protocol, evidence source, per-task manifest, integrity flag, coverage flag, and completed/partial/blocked/failed counts. For multi-agent review, `manifest_validated: true` proves that the manifest matches independently correlated Codex rollouts; it does **not** mean every reviewer finished. `coverage_complete: true` is the separate all-lenses-completed signal. Direct reviews use `coverage_complete: null`. A successful verified fan-out reports `execution_evidence: "codex_session_rollouts"`. The public JSONL CLI stream still omits those v2 events, so Dobby reads the private rollout files before deleting the temporary runtime. `reverse_engineer` responses also include `reverse_engineer_details.ghidra`, with `mode`, `summary`, and the observed `mcp_calls` and `helper_calls`.
 
 ## Streaming progress
 
@@ -300,3 +304,11 @@ uv build --offline --no-build-isolation
 uv run mcp dev src/codex_dobby_mcp/server.py:app
 uv run python -m codex_dobby_mcp
 ```
+
+The default suite includes a sanitized production-shape rollout corpus captured from a successful `codex-cli 0.147.0` multi-agent v2 run. Before deploying against a new Codex CLI release, also run the authenticated opt-in smoke test:
+
+```bash
+CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live tests/test_live_codex_v2.py
+```
+
+Release tags must exactly match `project.version`; for version `0.1.4`, publish tag `v0.1.4`. The publish workflow checks this before both testing and building. A release candidate is ready only after the normal test suite, the live v2 smoke test, `uv build`, and an installed-wheel MCP initialize check all pass. `AGENTS.md`, `CHANGELOG.md`, release checks, tests, and the sanitized v2 corpus are included in the source distribution so downstream maintainers and coding agents receive the same operating guidance.

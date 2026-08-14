@@ -1,12 +1,13 @@
 import asyncio
+from dataclasses import replace
 from contextlib import suppress
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import time
-from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -21,8 +22,59 @@ from codex_dobby_mcp.models import (
     ResultArtifactState,
     ReasoningEffort,
     ReviewAgent,
+    ReviewAgentExecutionStatus,
+    ReviewDetails,
+    ReviewExecutionEvidence,
+    ReviewOrchestrationProtocol,
+    StopReason,
     ToolName,
+    ToolResponse,
     RunStatus,
+    WorkerResult,
+)
+from codex_dobby_mcp.paths import PathResolutionError, reverse_engineer_default_writable_roots
+from codex_dobby_mcp.review_agents import (
+    REVIEW_AGENT_DEFINITIONS,
+    REVIEW_SUBAGENT_DEFAULT_MODEL,
+    REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
+    review_agents_root,
+)
+from codex_dobby_mcp.runner import (
+    CodexRunner,
+    RunnerError,
+    _augment_codex_error,
+    _build_repo_snapshot,
+    _codex_home_permission_issue,
+    _collect_sandbox_violations,
+    _mirror_runtime_config_references,
+    _cleanup_private_child_runtime,
+    _changed_status_files,
+    _create_process_with_deadline,
+    _execute_process_with_streaming_logs,
+    _ensure_multi_agent_v2_available,
+    _first_meaningful_output_line,
+    _ghidra_usage_mode,
+    _git_status,
+    _path_fingerprint,
+    _reverse_engineer_details_for_run,
+    _reverse_engineer_failure_details,
+    _review_execution_diagnostics,
+    _review_rollout_evidence as _raw_review_rollout_evidence,
+    _rollout_validation_issues,
+    _response_with_private_runtime_cleanup_failure,
+    ReviewRolloutAgentEvidence,
+    ReviewRolloutEvidence,
+    _rewrite_path_prefix,
+    _salvaged_review_worker_result_from_rollouts,
+    _salvage_exec_trace,
+    _salvage_worker_result_from_trace,
+    _shielded_terminate_process,
+    _stall_diagnostics,
+    _stall_threshold_for_effort,
+    _strict_child_worker_result,
+    _strict_worker_result,
+    _verified_review_worker_result_from_rollouts,
+    _write_private_text,
 )
 
 
@@ -42,40 +94,304 @@ def _request(**overrides) -> InvocationRequest:
     )
     defaults.update(overrides)
     return InvocationRequest.model_construct(**defaults)
-from codex_dobby_mcp.paths import PathResolutionError, reverse_engineer_default_writable_roots
-from codex_dobby_mcp.review_agents import (
-    REVIEW_SUBAGENT_DEFAULT_MODEL,
-    REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
-    review_agents_root,
-)
-from codex_dobby_mcp.runner import (
-    CodexRunner,
-    RunnerError,
-    _augment_codex_error,
-    _build_repo_snapshot,
-    _codex_home_permission_issue,
-    _collect_sandbox_violations,
-    _changed_status_files,
-    _create_process_with_deadline,
-    _execute_process_with_streaming_logs,
-    _count_completed_spawn_agent_calls,
-    _first_meaningful_output_line,
-    _ghidra_usage_mode,
-    _git_status,
-    _match_review_spawn_prompt,
-    _path_fingerprint,
-    _reverse_engineer_details_for_run,
-    _reverse_engineer_failure_details,
-    _review_orchestration_warnings,
-    _rewrite_path_prefix,
-    _salvaged_review_worker_result,
-    _salvage_exec_trace,
-    _salvage_worker_result_from_trace,
-    _shielded_terminate_process,
-    _stall_diagnostics,
-    _stall_threshold_for_effort,
-    _write_private_text,
-)
+
+
+def _review_execution_manifest(
+    agents: list[ReviewAgent],
+    *,
+    statuses: dict[ReviewAgent, str] | None = None,
+) -> dict[str, object]:
+    statuses = statuses or {}
+    return {
+        "protocol": "multi_agent_v2",
+        "agents": [
+            {
+                "review_agent": agent.value,
+                "task_name": f"dobby_review_{agent.value}",
+                "status": statuses.get(agent, "completed"),
+                "summary": f"{agent.value} review {statuses.get(agent, 'completed')}",
+            }
+            for agent in agents
+        ],
+    }
+
+
+def _rollout_evidence(
+    agents: list[ReviewAgent],
+    *,
+    statuses: dict[ReviewAgent, str] | None = None,
+):
+    statuses = statuses or {}
+    observations = []
+    for agent in agents:
+        status = ReviewAgentExecutionStatus(statuses.get(agent, "completed"))
+        if status == ReviewAgentExecutionStatus.COMPLETED:
+            completeness = Completeness.FULL
+        elif status == ReviewAgentExecutionStatus.PARTIAL:
+            completeness = Completeness.PARTIAL
+        elif status == ReviewAgentExecutionStatus.BLOCKED:
+            completeness = Completeness.BLOCKED
+        else:
+            completeness = None
+        task_name = f"dobby_review_{agent.value}"
+        child_result = (
+            WorkerResult(
+                summary=f"{agent.value} review {status.value}",
+                completeness=completeness,
+                important_facts=[f"{agent.value} independently verified finding"],
+                next_steps=[f"{agent.value} independently verified next step"],
+                files_changed=[],
+                warnings=[],
+                refused=False,
+                file_diffs=[],
+                review_execution=None,
+            )
+            if completeness is not None
+            else None
+        )
+        observations.append(
+            ReviewRolloutAgentEvidence(
+                review_agent=agent.value,
+                task_name=task_name,
+                agent_role=task_name,
+                spawn_attempt_count=1,
+                started_count=1 if child_result is not None else 0,
+                child_thread_ids=(f"thread-{agent.value}",) if child_result is not None else (),
+                child_roles=(task_name,) if child_result is not None else (),
+                delivered_count=1 if child_result is not None else 0,
+                child_result=child_result,
+                # A lens that never delivered a result never reached a
+                # terminal event either. Claiming otherwise here is what let
+                # the partial-coverage tests pass against a broken runner.
+                terminal_event_count=1 if child_result is not None else 0,
+                child_multi_agent_versions=("disabled",)
+                if child_result is not None
+                else (),
+                started_thread_ids=(f"thread-{agent.value}",)
+                if child_result is not None
+                else (),
+            )
+        )
+    return ReviewRolloutEvidence(
+        collected=True,
+        agents=tuple(observations),
+        validation_issues=(),
+    )
+
+
+def _write_review_rollouts(
+    codex_home: Path,
+    statuses: dict[ReviewAgent, Completeness | None],
+) -> None:
+    """Write a production-shaped v2 rollout tree.
+
+    A ``None`` completeness models a lens the parent spawned but whose child
+    never started: the ``spawn_agent`` call is present, and nothing else is —
+    no started event, no child session file, no terminal event, no delivery.
+    """
+    sessions_root = codex_home / "sessions" / "2026" / "08" / "12"
+    sessions_root.mkdir(parents=True)
+    root_thread_id = "root-thread"
+    root_items: list[dict[str, object]] = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": root_thread_id,
+                "session_id": root_thread_id,
+                "originator": "codex_exec",
+                "thread_source": "user",
+                "source": "exec",
+            },
+        },
+        {
+            "type": "turn_context",
+            "payload": {
+                "multi_agent_version": "v2",
+            },
+        },
+    ]
+    listed_agents: list[dict[str, object]] = []
+    for agent, completeness in statuses.items():
+        task_name = f"dobby_review_{agent.value}"
+        agent_path = f"/root/{task_name}"
+        child_thread_id = f"child-{agent.value}"
+        root_items.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "arguments": json.dumps(
+                        {
+                            "task_name": task_name,
+                            "agent_type": task_name,
+                            "fork_turns": "none",
+                            "message": "gAAAA" + ("A" * 256),
+                        }
+                    ),
+                },
+            }
+        )
+        if completeness is None:
+            # Spawn attempted, child never started. No further rollout
+            # evidence exists for this lens.
+            continue
+        root_items.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "agent_path": agent_path,
+                    "agent_thread_id": child_thread_id,
+                    "kind": "started",
+                },
+            }
+        )
+        assignment_digest = _fixture_assignment_digest(agent)
+        child_result = WorkerResult(
+            summary=(
+                f"Dobby assignment {assignment_digest}: "
+                f"{agent.value} child result"
+            ),
+            completeness=completeness,
+            important_facts=[f"{agent.value} finding"],
+            next_steps=[f"{agent.value} next step"],
+            files_changed=[],
+            warnings=[],
+            refused=False,
+            file_diffs=[],
+            review_execution=None,
+        )
+        root_items.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "agent_message",
+                    "author": agent_path,
+                    "recipient": "/root",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"Message Type: FINAL_ANSWER\nTask name: /root/{task_name}\n"
+                                f"Sender: {agent_path}\nPayload:\n{child_result.model_dump_json()}"
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+        listed_agents.append(
+            {
+                "agent_name": agent_path,
+                "agent_status": {"completed": child_result.model_dump_json()},
+            }
+        )
+        child_items = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": child_thread_id,
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": root_thread_id,
+                                "agent_path": agent_path,
+                                "agent_role": task_name,
+                            }
+                        }
+                    },
+                    "thread_source": "subagent",
+                    "agent_path": agent_path,
+                    "multi_agent_version": "disabled",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": child_result.model_dump_json(),
+                },
+            },
+        ]
+        (sessions_root / f"{child_thread_id}.jsonl").write_text(
+            "\n".join(json.dumps(item) for item in child_items) + "\n",
+            encoding="utf-8",
+        )
+    root_items.extend(
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "list_agents",
+                    "call_id": "list-agents-call",
+                    "arguments": "{}",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "list-agents-call",
+                    "output": json.dumps({"agents": listed_agents}),
+                },
+            },
+        ]
+    )
+    (sessions_root / "root.jsonl").write_text(
+        "\n".join(json.dumps(item) for item in root_items) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _fixture_canonical_assignment(agent: ReviewAgent) -> str:
+    return json.dumps(
+        {
+            "files": ["runner.py"],
+            "repo_root": "/repo",
+            "task_name": f"dobby_review_{agent.value}",
+            "task_prompt": "Inspect the requested code",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _fixture_assignment_digest(agent: ReviewAgent) -> str:
+    return hashlib.sha256(
+        _fixture_canonical_assignment(agent).encode("utf-8")
+    ).hexdigest()
+
+
+def _fixture_spawn_messages(agents: list[ReviewAgent]) -> dict[str, str]:
+    messages: dict[str, str] = {}
+    for agent in agents:
+        task_name = f"dobby_review_{agent.value}"
+        canonical_assignment = _fixture_canonical_assignment(agent)
+        assignment_digest = _fixture_assignment_digest(agent)
+        messages[task_name] = (
+            f"Required custom agent: {task_name}\n"
+            f"Assigned lens: {REVIEW_AGENT_DEFINITIONS[agent].label}\n"
+            f"Canonical assignment JSON: {canonical_assignment}\n"
+            f"Canonical assignment SHA-256: {assignment_digest}\n"
+            "Requirements:\n- return strict JSON"
+        )
+    return messages
+
+
+def _review_rollout_evidence(
+    codex_home: Path,
+    agents: list[ReviewAgent],
+    *,
+    allow_truncated_tail: bool = False,
+):
+    return _raw_review_rollout_evidence(
+        codex_home,
+        agents,
+        _fixture_spawn_messages(agents),
+        allow_truncated_tail=allow_truncated_tail,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +405,14 @@ def stub_snapshot_helper(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr("codex_dobby_mcp.runner._capture_repo_snapshot_with_deadline", fake_capture)
+
+    async def fake_v2_capability(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._ensure_multi_agent_v2_available",
+        fake_v2_capability,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -117,12 +441,77 @@ def test_worker_schema_file_is_valid_json_schema() -> None:
         "warnings",
         "refused",
         "file_diffs",
+        "review_execution",
     ]
+    agent_properties = payload["properties"]["review_execution"]["anyOf"][0]["properties"]["agents"]["items"]["properties"]
+    assert agent_properties["task_name"]["minLength"] == 1
+    assert agent_properties["summary"]["minLength"] == 1
+
+
+def test_private_runtime_cleanup_failure_is_returned_and_escalates_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_root = tmp_path / "private-runtime"
+    private_root.mkdir()
+
+    def fail_rmtree(_path: Path) -> None:
+        raise OSError("resource busy")
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.shutil.rmtree", fail_rmtree)
+    issue = _cleanup_private_child_runtime(private_root)
+
+    assert issue is not None
+    assert str(private_root) in issue
+    assert "copied credentials and session data" in issue
+
+    response = ToolResponse(
+        task_id="task-1",
+        tool=ToolName.REVIEW,
+        status=RunStatus.SUCCESS,
+        summary="review complete",
+        completeness=Completeness.FULL,
+        important_facts=["verified finding"],
+        next_steps=[],
+        files_changed=[],
+        file_diffs=[],
+        artifact_paths={},
+        sandbox_violations=[],
+        repo_root=str(tmp_path),
+        warnings=["existing warning"],
+        raw_output_available=True,
+        model="gpt-5.5",
+        reasoning_effort=ReasoningEffort.MEDIUM,
+    )
+    escalated = _response_with_private_runtime_cleanup_failure(response, issue)
+
+    assert escalated.status == RunStatus.ERROR
+    assert escalated.completeness == Completeness.BLOCKED
+    assert escalated.stop_reason == StopReason.ERROR
+    assert escalated.summary == issue
+    assert escalated.warnings == [issue, "existing warning"]
+    assert escalated.important_facts == ["verified finding"]
 
 
 def test_default_reasoning_efforts_include_high_build_and_medium_validate() -> None:
     assert DEFAULT_REASONING_EFFORTS[ToolName.BUILD] == ReasoningEffort.HIGH
     assert DEFAULT_REASONING_EFFORTS[ToolName.VALIDATE] == ReasoningEffort.MEDIUM
+
+
+def test_review_details_remain_compatible_with_pre_v2_result_artifacts() -> None:
+    details = ReviewDetails.model_validate(
+        {
+            "requested_review_agents": ["correctness", "regression"],
+            "effective_review_agents": ["correctness", "regression"],
+        }
+    )
+
+    assert details.orchestration_protocol is None
+    assert details.execution_evidence is None
+    assert details.execution_manifest is None
+    assert details.manifest_validated is False
+    assert details.coverage_complete is None
+    assert details.completed_agents is None
 
 
 def test_ghidra_usage_mode_distinguishes_direct_helper_and_startup_only() -> None:
@@ -249,7 +638,7 @@ def test_single_agent_review_uses_direct_review_defaults(tmp_path: Path) -> None
     assert spec.reasoning_effort == REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
 
 
-def test_multi_agent_review_uses_medium_parent_reasoning_by_default(tmp_path: Path) -> None:
+def test_multi_agent_review_uses_low_parent_reasoning_by_default(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
@@ -270,7 +659,7 @@ def test_multi_agent_review_uses_medium_parent_reasoning_by_default(tmp_path: Pa
     )
 
     assert spec.model == "gpt-5.6-sol"
-    assert spec.reasoning_effort == REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
+    assert spec.reasoning_effort == ReasoningEffort.LOW
 
 
 def test_multi_agent_review_passes_timeout_and_agents_through_uncapped(tmp_path: Path) -> None:
@@ -583,6 +972,12 @@ async def test_multi_agent_review_uses_effective_timeout_for_process_budget(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": _review_execution_manifest(
+                        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                        statuses={ReviewAgent.REGRESSION: "failed"},
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -600,10 +995,11 @@ async def test_multi_agent_review_uses_effective_timeout_for_process_budget(
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
     monkeypatch.setattr(
-        "codex_dobby_mcp.runner._review_orchestration_diagnostics",
-        lambda *args, **kwargs: SimpleNamespace(warnings=[]),
+        "codex_dobby_mcp.runner._review_rollout_evidence",
+        lambda *_args, **_kwargs: _rollout_evidence(
+            [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+        ),
     )
-
     result = await runner.run(
         ToolName.REVIEW,
         InvocationRequest(
@@ -616,6 +1012,31 @@ async def test_multi_agent_review_uses_effective_timeout_for_process_budget(
 
     assert result.status == RunStatus.SUCCESS
     assert 1170 <= captured_timeout["value"] <= 1200
+    assert result.important_facts == [
+        "correctness independently verified finding",
+        "regression independently verified finding",
+    ]
+    assert any(
+        "Dobby rebuilt the response from independently verified child rollout results"
+        in warning
+        for warning in result.warnings
+    )
+    assert result.review_details is not None
+    assert (
+        result.review_details.orchestration_protocol
+        == ReviewOrchestrationProtocol.MULTI_AGENT_V2
+    )
+    assert (
+        result.review_details.execution_evidence
+        == ReviewExecutionEvidence.CODEX_SESSION_ROLLOUTS
+    )
+    assert result.review_details.manifest_validated is True
+    assert result.review_details.execution_manifest is not None
+    assert result.review_details.coverage_complete is True
+    assert result.review_details.completed_agents == 2
+    assert result.review_details.partial_agents == 0
+    assert result.review_details.blocked_agents == 0
+    assert result.review_details.failed_agents == 0
 
 
 @pytest.mark.asyncio
@@ -657,6 +1078,17 @@ async def test_multi_agent_review_passes_all_requested_agents_through(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": _review_execution_manifest(
+                        [
+                            ReviewAgent.SECURITY,
+                            ReviewAgent.ARCHITECTURE,
+                            ReviewAgent.CORRECTNESS,
+                            ReviewAgent.REGRESSION,
+                            ReviewAgent.PERFORMANCE,
+                        ]
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -673,10 +1105,17 @@ async def test_multi_agent_review_passes_all_requested_agents_through(
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
     monkeypatch.setattr(
-        "codex_dobby_mcp.runner._review_orchestration_diagnostics",
-        lambda *args, **kwargs: SimpleNamespace(warnings=[]),
+        "codex_dobby_mcp.runner._review_rollout_evidence",
+        lambda *_args, **_kwargs: _rollout_evidence(
+            [
+                ReviewAgent.SECURITY,
+                ReviewAgent.ARCHITECTURE,
+                ReviewAgent.CORRECTNESS,
+                ReviewAgent.REGRESSION,
+                ReviewAgent.PERFORMANCE,
+            ]
+        ),
     )
-
     result = await runner.run(
         ToolName.REVIEW,
         InvocationRequest(
@@ -735,6 +1174,9 @@ async def test_multi_agent_review_run_renders_prompt_with_effective_timeout_budg
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -750,10 +1192,6 @@ async def test_multi_agent_review_run_renders_prompt_with_effective_timeout_budg
 
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
-    monkeypatch.setattr(
-        "codex_dobby_mcp.runner._review_orchestration_diagnostics",
-        lambda *args, **kwargs: SimpleNamespace(warnings=[]),
-    )
 
     result = await runner.run(
         ToolName.REVIEW,
@@ -827,34 +1265,6 @@ async def test_runner_cancellation_terminates_spawned_process(
 
     assert process.kill_calls == 1
     assert process.wait_calls == 1
-
-
-def test_count_completed_spawn_agent_calls_ignores_non_matching_events() -> None:
-    stdout = "\n".join(
-        [
-            '{"type":"thread.started","thread_id":"t1"}',
-            '{"type":"item.started","item":{"id":"item_1","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t1","prompt":"p"}}',
-            '{"type":"item.completed","item":{"id":"item_1","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t1","prompt":"p"}}',
-            '{"type":"item.completed","item":{"id":"item_2","type":"collab_tool_call","tool":"wait","sender_thread_id":"t1"}}',
-            '{"type":"item.completed","item":{"id":"item_3","type":"command_execution","tool":"spawn_agent","sender_thread_id":"t1"}}',
-        ]
-    )
-
-    assert _count_completed_spawn_agent_calls(stdout) == 1
-
-
-def test_count_completed_spawn_agent_calls_ignores_non_top_level_spawn_events() -> None:
-    stdout = "\n".join(
-        [
-            '{"type":"thread.started","thread_id":"parent"}',
-            '{"type":"item.started","item":{"id":"item_1","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"child","prompt":"p"}}',
-            '{"type":"item.completed","item":{"id":"item_1","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"child","prompt":"p"}}',
-            '{"type":"item.started","item":{"id":"item_2","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"parent","prompt":"p"}}',
-            '{"type":"item.completed","item":{"id":"item_2","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"parent","prompt":"p"}}',
-        ]
-    )
-
-    assert _count_completed_spawn_agent_calls(stdout) == 1
 
 
 def test_first_meaningful_output_line_skips_json_event_stream() -> None:
@@ -1287,423 +1697,1518 @@ def test_metadata_snapshot_detects_changes_to_existing_dirty_file(tmp_path: Path
     assert _changed_status_files(before, after) == ["dirty.txt"]
 
 
-def test_review_orchestration_warnings_require_enough_completed_spawns() -> None:
-    good_stdout = "\n".join(
-        [
-            json.dumps(
-                {
-                    "type": "thread.started",
-                    "thread_id": "parent",
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "review this code",
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": "security review this code",
-                        "agents_states": {"child-1": {"status": "pending_init"}},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_1",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "regression review this code",
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_1",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-2"],
-                        "prompt": "regression review this code",
-                        "agents_states": {"child-2": {"status": "pending_init"}},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1", "child-2"],
-                        "prompt": None,
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": None,
-                        "agents_states": {
-                            "child-1": {"status": "completed"},
-                            "child-2": {"status": "completed"},
-                        },
-                    },
-                }
-            ),
-        ]
-    )
-
-    early_wait_stdout = "\n".join(
-        [
-            json.dumps(
-                {
-                    "type": "thread.started",
-                    "thread_id": "parent",
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "security review this code",
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": "security review this code",
-                        "agents_states": {"child-1": {"status": "pending_init"}},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": None,
-                        "agents_states": {},
-                    },
-                }
-            ),
-        ]
-    )
-
-    incomplete_wait_stdout = "\n".join(
-        [
-            json.dumps(
-                {
-                    "type": "thread.started",
-                    "thread_id": "parent",
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "security review this code",
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": "security review this code",
-                        "agents_states": {"child-1": {"status": "pending_init"}},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_1",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "regression review this code",
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_1",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-2"],
-                        "prompt": "regression review this code",
-                        "agents_states": {"child-2": {"status": "pending_init"}},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1", "child-2"],
-                        "prompt": None,
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": None,
-                        "agents_states": {
-                            "child-2": {"status": "completed"},
-                        },
-                    },
-                }
-            ),
-        ]
-    )
-
-    bad_stdout = "\n".join(
-        [
-            json.dumps(
-                {
-                    "type": "thread.started",
-                    "thread_id": "parent",
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "review this code",
-                        "agents_states": {},
-                    },
-                }
-            ),
-        ]
-    )
-
-    assert _review_orchestration_warnings(good_stdout, [ReviewAgent.SECURITY, ReviewAgent.REGRESSION]) == []
-    assert _review_orchestration_warnings(
-        bad_stdout,
-        [ReviewAgent.SECURITY],
-    ) == ["Review emitted 0 completed spawn_agent calls; expected exactly 1"]
-    assert _review_orchestration_warnings(
-        early_wait_stdout,
-        [ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
-    ) == [
-        "Review emitted 1 completed spawn_agent calls; expected exactly 2",
-        "Review started waiting before spawning all selected review agents",
-        "Review spawn prompts did not cover selected agents: regression",
-        "Review did not record completed wait results for every spawned subagent",
-    ]
-    assert _review_orchestration_warnings(
-        incomplete_wait_stdout,
-        [ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
-    ) == ["Review did not record completed wait results for every spawned subagent"]
-
-
-def test_match_review_spawn_prompt_prefers_exact_header_markers() -> None:
-    from codex_dobby_mcp.review_agents import selected_review_agent_definitions
-
-    definitions = selected_review_agent_definitions([ReviewAgent.SECURITY, ReviewAgent.REGRESSION])
-    prompt = "\n".join(
-        [
-            "Required custom agent: dobby_review_security",
-            "Assigned lens: security",
-            "",
-            "Injected custom review agents available in this run:",
-            "- dobby_review_security (security)",
-            "- dobby_review_regression (regression and patterns)",
-        ]
-    )
-
-    assert _match_review_spawn_prompt(prompt, definitions) == ReviewAgent.SECURITY.value
-
-
-def test_review_orchestration_warnings_accept_assignment_header_prompts() -> None:
-    stdout = "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "parent"}),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": [],
-                        "prompt": "Required custom agent: dobby_review_correctness\nAssigned lens: correctness",
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_0",
-                        "type": "collab_tool_call",
-                        "tool": "spawn_agent",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": "Required custom agent: dobby_review_correctness\nAssigned lens: correctness",
-                        "agents_states": {"child-1": {"status": "pending_init"}},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.started",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": None,
-                        "agents_states": {},
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "receiver_thread_ids": ["child-1"],
-                        "prompt": None,
-                        "agents_states": {"child-1": {"status": "completed", "message": "{}"}},
-                    },
-                }
-            ),
-        ]
-    )
-
-    assert _review_orchestration_warnings(stdout, [ReviewAgent.CORRECTNESS]) == []
-
-
-def test_salvaged_review_worker_result_uses_completed_wait_messages() -> None:
-    child_message = json.dumps(
+def test_v2_review_execution_manifest_validates_exact_agent_task_mapping() -> None:
+    worker_result = WorkerResult.model_validate(
         {
-            "summary": "Found a timeout bug",
+            "summary": "review complete",
             "completeness": "full",
-            "important_facts": ["runner.py can raise bare asyncio.TimeoutError after preflight"],
-            "next_steps": ["Wrap subprocess startup in structured timeout handling."],
+            "important_facts": [],
+            "next_steps": [],
             "files_changed": [],
             "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+            ),
         }
     )
-    stdout = "\n".join(
-        [
-            json.dumps({"type": "thread.started", "thread_id": "parent"}),
-            json.dumps(
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "item_wait",
-                        "type": "collab_tool_call",
-                        "tool": "wait",
-                        "sender_thread_id": "parent",
-                        "agents_states": {
-                            "child-1": {
-                                "status": "completed",
-                                "message": child_message,
-                            }
-                        },
-                    },
-                }
-            ),
-        ]
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        _rollout_evidence([ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]),
     )
 
-    salvaged = _salvaged_review_worker_result(stdout, [ReviewAgent.CORRECTNESS])
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.all_completed is True
+    assert diagnostics.usable_count == 2
+    assert diagnostics.warnings == []
+
+
+def test_v2_review_execution_manifest_requires_independent_rollout_evidence() -> None:
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "parent claims both reviewers completed",
+            "completeness": "full",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert diagnostics.execution_evidence is None
+    assert diagnostics.validation_issues == (
+        "Codex session rollout evidence was not collected",
+    )
+
+
+def test_v2_review_partial_coverage_survives_a_lens_that_never_delivered(
+    tmp_path: Path,
+) -> None:
+    """A lens that never starts must not discard the lens that did deliver.
+
+    Drives ``_review_rollout_evidence`` over a real rollout tree rather than a
+    synthetic evidence helper, because the helper is what previously let this
+    path pass while production returned ``status: error``.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: None,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.collected is True
+    assert evidence.validation_issues == ()
+    regression = evidence.by_task_name["dobby_review_regression"]
+    assert regression.terminal_event_count == 0
+    assert regression.child_result is None
+    assert [agent.observed_status for agent in evidence.agents] == [
+        ReviewAgentExecutionStatus.COMPLETED,
+        ReviewAgentExecutionStatus.FAILED,
+    ]
+
+    worker_result = _verified_review_worker_result_from_rollouts(evidence)
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    # The manifest is honest about the failure, so its integrity holds.
+    assert diagnostics.validation_issues == ()
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.usable_count == 1
+    assert diagnostics.failed_count == 1
+    assert diagnostics.all_completed is False
+
+    # The failure is reported as lost coverage, not as tampering.
+    assert any(
+        "dobby_review_regression delivered no usable review result" in issue
+        for issue in diagnostics.coverage_issues
+    )
+    # Previously unreachable: a validated manifest reporting a failed lens.
+    assert any(
+        "0 blocked, and 1 failed of 2 selected review agents" in warning
+        for warning in diagnostics.warnings
+    )
+
+    # The surviving lens's independently verified findings are still returned.
+    assert worker_result.completeness == Completeness.PARTIAL
+    assert "correctness finding" in worker_result.important_facts
+    assert worker_result.review_execution.agents[1].status == (
+        ReviewAgentExecutionStatus.FAILED
+    )
+
+
+def test_failed_lens_prose_never_reaches_the_caller_through_review_details(
+    tmp_path: Path,
+) -> None:
+    """A failed lens contributes no words, not just no findings.
+
+    ``child_result`` can be populated for a lens whose evidence still failed,
+    so keying the per-agent manifest summary on the payload merely existing let
+    an excluded child's own prose out through ``review_details``.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    leaked = "regression child result"
+    assert any(
+        agent.child_result is not None and leaked in agent.child_result.summary
+        for agent in evidence.agents
+    )
+
+    # Force the regression lens to fail while keeping its delivered payload,
+    # which is exactly the shape a spawn-contract violation produces.
+    agents = tuple(
+        agent
+        if agent.task_name != "dobby_review_regression"
+        else replace(
+            agent,
+            spawn_contract_issues=(
+                'dobby_review_regression spawn did not use fork_turns="none"',
+            ),
+        )
+        for agent in evidence.agents
+    )
+    tainted = replace(evidence, agents=agents)
+    regression = tainted.by_task_name["dobby_review_regression"]
+    assert regression.observed_status == ReviewAgentExecutionStatus.FAILED
+    assert regression.child_result is not None
+
+    verified = _verified_review_worker_result_from_rollouts(tainted)
+    rendered = json.dumps(verified.model_dump(mode="json"))
+
+    assert leaked not in rendered
+    assert "regression finding" not in rendered
+    entry = next(
+        agent
+        for agent in verified.review_execution.agents
+        if agent.task_name == "dobby_review_regression"
+    )
+    assert entry.status == ReviewAgentExecutionStatus.FAILED
+    assert "No usable delivered child result" in entry.summary
+    # The lens that did pass is still reported in full.
+    assert "correctness finding" in verified.important_facts
+
+
+def test_v2_review_survives_a_lens_the_parent_never_spawned(
+    tmp_path: Path,
+) -> None:
+    """A missing spawn removes one lens; it does not discard the others.
+
+    A shortfall in the global spawn count used to be a run-wide integrity
+    failure, which quarantined every lens that had delivered verified findings.
+    An excess still is one, because it means something ran that was not asked
+    for.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: None,
+        },
+    )
+    # Drop the regression spawn call entirely, so the parent never even tried.
+    root_rollout = next((codex_home / "sessions").glob("**/root.jsonl"))
+    kept = []
+    for line in root_rollout.read_text(encoding="utf-8").splitlines():
+        item = json.loads(line)
+        payload = item.get("payload", {})
+        if payload.get("name") == "spawn_agent" and "regression" in payload.get("arguments", ""):
+            continue
+        kept.append(line)
+    root_rollout.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.validation_issues == ()
+    regression = evidence.by_task_name["dobby_review_regression"]
+    assert regression.spawn_attempt_count == 0
+    assert regression.observed_status == ReviewAgentExecutionStatus.FAILED
+
+    worker_result = _verified_review_worker_result_from_rollouts(evidence)
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.usable_count == 1
+    assert any("spawn_attempts=0" in issue for issue in diagnostics.coverage_issues)
+    assert "correctness finding" in worker_result.important_facts
+
+
+def test_v2_review_manifest_still_fails_when_it_claims_a_missing_lens_completed(
+    tmp_path: Path,
+) -> None:
+    """Honest failure is coverage; a manifest that lies is still quarantined."""
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: None,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    lying_result = WorkerResult.model_validate(
+        {
+            "summary": "parent claims both lenses completed",
+            "completeness": "full",
+            "important_facts": ["correctness finding"],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        lying_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert any(
+        "dobby_review_regression reported completed but Codex rollout evidence shows failed"
+        in issue
+        for issue in diagnostics.validation_issues
+    )
+
+
+def test_v2_review_rollouts_verify_child_role_delivery_and_blocked_status(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.BLOCKED,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "one child completed and one was blocked",
+            "completeness": "partial",
+            "important_facts": ["correctness finding"],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                statuses={ReviewAgent.REGRESSION: "blocked"},
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    assert evidence.collected is True
+    assert evidence.validation_issues == ()
+    assert [agent.observed_status for agent in evidence.agents] == [
+        ReviewAgentExecutionStatus.COMPLETED,
+        ReviewAgentExecutionStatus.BLOCKED,
+    ]
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.execution_evidence == ReviewExecutionEvidence.CODEX_SESSION_ROLLOUTS
+    assert diagnostics.usable_count == 1
+    assert diagnostics.blocked_count == 1
+
+
+def test_v2_review_rollouts_treat_all_blocked_children_as_unusable(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.BLOCKED,
+            ReviewAgent.REGRESSION: Completeness.BLOCKED,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "both reviewers were blocked",
+            "completeness": "blocked",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                statuses={
+                    ReviewAgent.CORRECTNESS: "blocked",
+                    ReviewAgent.REGRESSION: "blocked",
+                },
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.blocked_count == 2
+    assert diagnostics.usable_count == 0
+
+
+def test_v2_review_rollouts_reject_parent_status_that_contradicts_child_result(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.BLOCKED,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "fabricated full result",
+            "completeness": "full",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert any(
+        issue.startswith(
+            "dobby_review_regression reported completed but Codex rollout evidence shows blocked"
+        )
+        for issue in diagnostics.validation_issues
+    )
+
+
+def test_v2_review_rollouts_ignore_interim_messages_and_bind_exact_final_delivery(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    interim = {
+        "type": "response_item",
+        "payload": {
+            "type": "agent_message",
+            "author": "/root/dobby_review_correctness",
+            "recipient": "/root",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Message Type: MESSAGE\nTask name: /root/dobby_review_correctness\n"
+                        "Sender: /root/dobby_review_correctness\nPayload:\nstill working"
+                    ),
+                }
+            ],
+        },
+    }
+    root_rollout.write_text(
+        root_rollout.read_text(encoding="utf-8") + json.dumps(interim) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].delivered_count == 1
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+    root_rollout.write_text(
+        root_rollout.read_text(encoding="utf-8").replace(
+            "correctness finding",
+            "different parent payload",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    mismatched = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert mismatched.agents[0].delivered_count == 2
+    assert mismatched.agents[0].child_result is None
+    assert mismatched.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+
+
+def test_v2_review_rollouts_accept_framework_encrypted_final_delivery_payload(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if (
+            payload.get("type") == "agent_message"
+            and payload.get("author") == "/root/dobby_review_correctness"
+        ):
+            text_part = payload["content"][0]
+            text_part["text"] = text_part["text"].split("\nPayload:\n", 1)[0]
+            payload["content"].append(
+                {"type": "encrypted_content", "encrypted_content": "ciphertext"}
+            )
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].delivered_count == 1
+    assert evidence.agents[0].child_result is not None
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
+def test_v2_review_rollouts_reject_malformed_delivered_payload(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if (
+            payload.get("type") == "agent_message"
+            and payload.get("author") == "/root/dobby_review_correctness"
+        ):
+            text_part = payload["content"][0]
+            text_part["text"] = text_part["text"].split("\nPayload:\n", 1)[0] + "\nPayload:\nnot-json"
+        if payload.get("type") == "function_call_output":
+            listed = json.loads(payload["output"])
+            for listed_agent in listed["agents"]:
+                if listed_agent["agent_name"] == "/root/dobby_review_correctness":
+                    listed_agent["agent_status"]["completed"] = "not-json"
+            payload["output"] = json.dumps(listed)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].delivered_count == 1
+    assert evidence.agents[0].child_result is None
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+
+
+def test_v2_review_rollouts_accept_parent_observed_list_delivery_without_agent_message(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    items = [
+        item
+        for item in items
+        if not (
+            item.get("type") == "response_item"
+            and item.get("payload", {}).get("type") == "agent_message"
+            and item.get("payload", {}).get("author")
+            == "/root/dobby_review_correctness"
+        )
+    ]
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].delivered_count == 1
+    assert evidence.agents[0].child_result is not None
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
+def test_v2_review_rollouts_reject_extra_malformed_spawn_attempt(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    malformed_spawn = {
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "name": "spawn_agent",
+            "arguments": "not-json",
+        },
+    }
+    root_rollout.write_text(
+        root_rollout.read_text(encoding="utf-8")
+        + json.dumps(malformed_spawn)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert "v2 spawn attempt contained malformed JSON arguments" in evidence.validation_issues
+    assert "v2 root emitted 3 spawn attempts; expected at most 2" in evidence.validation_issues
+
+
+def test_v2_review_rollouts_allow_only_truncated_final_record_during_recovery(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    root_rollout.write_text(
+        root_rollout.read_text(encoding="utf-8") + '{"type":"response_item"',
+        encoding="utf-8",
+    )
+
+    strict = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    recovered = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        allow_truncated_tail=True,
+    )
+
+    assert any("invalid JSON" in issue for issue in strict.validation_issues)
+    assert recovered.validation_issues == ()
+    assert all(
+        agent.observed_status == ReviewAgentExecutionStatus.COMPLETED
+        for agent in recovered.agents
+    )
+
+
+def test_v2_review_rollouts_bind_started_event_to_child_thread(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if (
+            payload.get("type") == "sub_agent_activity"
+            and payload.get("agent_path") == "/root/dobby_review_correctness"
+        ):
+            payload["agent_thread_id"] = "different-child-thread"
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].started_thread_ids == ("different-child-thread",)
+    assert evidence.agents[0].child_thread_ids == ("child-correctness",)
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+
+
+def test_v2_review_rollouts_require_exactly_one_terminal_event(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    child_rollout = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "08"
+        / "12"
+        / "child-correctness.jsonl"
+    )
+    items = [json.loads(line) for line in child_rollout.read_text(encoding="utf-8").splitlines()]
+    items.append(items[-1])
+    child_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].terminal_event_count == 2
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+
+
+def test_strict_child_result_matches_worker_schema_and_refusal_contract() -> None:
+    valid = {
+        "summary": "verified child result",
+        "completeness": "full",
+        "important_facts": ["finding"],
+        "next_steps": [],
+        "files_changed": [],
+        "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
+    }
+
+    assert _strict_child_worker_result(json.dumps(valid)) is not None
+    assert _strict_child_worker_result("not-json") is None
+    assert _strict_child_worker_result(
+        json.dumps({key: value for key, value in valid.items() if key != "review_execution"})
+    ) is None
+    assert _strict_child_worker_result(json.dumps({**valid, "unexpected": True})) is None
+    assert _strict_child_worker_result(
+        json.dumps({**valid, "files_changed": ["victim.py"]})
+    ) is None
+    assert _strict_child_worker_result(
+        json.dumps(
+            {
+                **valid,
+                "file_diffs": [
+                    {
+                        "path": "victim.py",
+                        "oldText": "before",
+                        "newText": "after",
+                        "truncated": False,
+                    }
+                ],
+            }
+        )
+    ) is None
+    # A refusal paired with a non-blocked completeness is normalised rather
+    # than discarded: the worker stated why it refused, and dropping the whole
+    # payload replaced that with a bare "invalid structured output" error.
+    normalised_refusal = _strict_child_worker_result(
+        json.dumps({**valid, "refused": True})
+    )
+    assert normalised_refusal is not None
+    assert normalised_refusal.refused is True
+    assert normalised_refusal.completeness == Completeness.BLOCKED
+    assert any(
+        "refused=true with completeness=full" in warning
+        for warning in normalised_refusal.warnings
+    )
+
+    blocked_refusal = _strict_child_worker_result(
+        json.dumps({**valid, "completeness": "blocked", "refused": True})
+    )
+    assert blocked_refusal is not None
+    evidence = ReviewRolloutAgentEvidence(
+        review_agent="correctness",
+        task_name="dobby_review_correctness",
+        agent_role="dobby_review_correctness",
+        spawn_attempt_count=1,
+        started_count=1,
+        child_thread_ids=("child",),
+        child_roles=("dobby_review_correctness",),
+        delivered_count=1,
+        child_result=blocked_refusal,
+        terminal_event_count=1,
+        child_multi_agent_versions=("disabled",),
+        started_thread_ids=("child",),
+    )
+    assert evidence.observed_status == ReviewAgentExecutionStatus.BLOCKED
+
+
+def test_strict_top_level_result_rejects_schema_defaults_and_nested_extras() -> None:
+    valid = {
+        "summary": "strict top-level result",
+        "completeness": "full",
+        "important_facts": [],
+        "next_steps": [],
+        "files_changed": [],
+        "warnings": [],
+        "refused": False,
+        "file_diffs": [],
+        "review_execution": None,
+    }
+
+    assert _strict_worker_result(json.dumps(valid)) is not None
+    assert _strict_worker_result(
+        json.dumps({key: value for key, value in valid.items() if key != "refused"})
+    ) is None
+    assert _strict_worker_result(json.dumps({**valid, "unexpected": True})) is None
+    assert _strict_worker_result(
+        json.dumps(
+            {
+                **valid,
+                "review_execution": {
+                    "protocol": "multi_agent_v2",
+                    "agents": [],
+                    "unexpected": True,
+                },
+            }
+        )
+    ) is None
+    assert _strict_worker_result(
+        json.dumps(
+            {
+                **valid,
+                "review_execution": {
+                    "protocol": "multi_agent_v2",
+                    "agents": [
+                        {
+                            "review_agent": "correctness",
+                            "task_name": "dobby_review_correctness",
+                            "status": "completed",
+                            "summary": "complete",
+                            "unexpected": True,
+                        }
+                    ],
+                },
+            }
+        )
+    ) is None
+
+
+def test_v2_review_rollouts_retain_rejected_child_mutation_claims(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    child_rollout = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "08"
+        / "12"
+        / "child-correctness.jsonl"
+    )
+    child_items = [
+        json.loads(line)
+        for line in child_rollout.read_text(encoding="utf-8").splitlines()
+    ]
+    child_payload = json.loads(child_items[-1]["payload"]["last_agent_message"])
+    child_payload["files_changed"] = ["victim.py"]
+    child_payload["file_diffs"] = [
+        {
+            "path": "victim.py",
+            "oldText": "before",
+            "newText": "after",
+            "truncated": False,
+        }
+    ]
+    mutated_result = json.dumps(child_payload, separators=(",", ":"))
+    child_items[-1]["payload"]["last_agent_message"] = mutated_result
+    child_rollout.write_text(
+        "\n".join(json.dumps(item) for item in child_items) + "\n",
+        encoding="utf-8",
+    )
+
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    root_items = [
+        json.loads(line)
+        for line in root_rollout.read_text(encoding="utf-8").splitlines()
+    ]
+    for item in root_items:
+        payload = item.get("payload", {})
+        if payload.get("type") == "agent_message" and payload.get("author") == "/root/dobby_review_correctness":
+            content = payload["content"][0]["text"]
+            payload["content"][0]["text"] = content.split("\nPayload:\n", 1)[0] + "\nPayload:\n" + mutated_result
+        if payload.get("type") == "function_call_output" and payload.get("call_id") == "list-agents-call":
+            listed = json.loads(payload["output"])
+            for listed_agent in listed["agents"]:
+                if listed_agent["agent_name"] == "/root/dobby_review_correctness":
+                    listed_agent["agent_status"]["completed"] = mutated_result
+            payload["output"] = json.dumps(listed)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in root_items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    correctness = evidence.agents[0]
+    assert correctness.observed_status == ReviewAgentExecutionStatus.FAILED
+    assert correctness.child_result is None
+    assert correctness.reported_mutation_paths == ("victim.py",)
+    assert correctness.reported_file_diffs is True
+
+
+def test_v2_review_rollouts_reject_nonisolated_spawn_contract(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") != "function_call" or payload.get("name") != "spawn_agent":
+            continue
+        arguments = json.loads(payload["arguments"])
+        if arguments.get("task_name") == "dobby_review_correctness":
+            arguments["fork_turns"] = "all"
+            arguments["model"] = "untrusted-override"
+            payload["arguments"] = json.dumps(arguments)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+    assert any("fork_turns" in issue for issue in evidence.agents[0].spawn_contract_issues)
+    assert any("unexpected model" in issue for issue in evidence.agents[0].spawn_contract_issues)
+
+    # A spawn that ignored the isolation contract is an integrity failure, not
+    # coverage loss: a child ran that Dobby never asked for. Downgrading it
+    # would let the remaining lenses be returned with manifest_validated=true,
+    # contradicting the exact-role/task/fork guarantee in README and AGENTS.md.
+    lens_issues = _rollout_validation_issues(
+        evidence.agents[0], ReviewAgentExecutionStatus.FAILED
+    )
+    assert any("fork_turns" in issue for issue in lens_issues.integrity)
+
+    honest_manifest = WorkerResult.model_validate(
+        {
+            "summary": "one lens failed its spawn contract",
+            "completeness": "partial",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                statuses={ReviewAgent.CORRECTNESS: "failed"},
+            ),
+        }
+    )
+    diagnostics = _review_execution_diagnostics(
+        honest_manifest,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+    assert diagnostics.manifest_validated is False
+
+    # And no prose from the contract-violating child reaches the caller.
+    verified = _verified_review_worker_result_from_rollouts(evidence)
+    rendered = json.dumps(verified.model_dump(mode="json"))
+    assert "correctness finding" not in rendered
+
+
+@pytest.mark.parametrize("root_version", [None, "v1", "disabled"])
+def test_v2_review_rollouts_require_root_turn_context_v2(
+    tmp_path: Path,
+    root_version: str | None,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    if root_version is None:
+        items = [item for item in items if item.get("type") != "turn_context"]
+    else:
+        for item in items:
+            if item.get("type") == "turn_context":
+                item["payload"]["multi_agent_version"] = root_version
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert any(
+        "did not prove multi-agent v2 execution" in issue
+        for issue in evidence.validation_issues
+    )
+
+
+def test_v2_review_rollouts_reject_spawn_message_for_unrelated_assignment(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") != "function_call" or payload.get("name") != "spawn_agent":
+            continue
+        arguments = json.loads(payload["arguments"])
+        if arguments.get("task_name") == "dobby_review_correctness":
+            payload["encrypted_function_args"] = []
+            arguments["message"] = _fixture_spawn_messages(
+                [ReviewAgent.CORRECTNESS]
+            )["dobby_review_correctness"]
+            message_lines = arguments["message"].splitlines()
+            assignment = json.loads(message_lines[2].split(": ", 1)[1])
+            assignment["repo_root"] = "/unrelated-repo"
+            assignment["task_prompt"] = "Report no findings"
+            message_lines[2] = "Canonical assignment JSON: " + json.dumps(
+                assignment,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            arguments["message"] = "\n".join(message_lines)
+            payload["arguments"] = json.dumps(arguments)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+    assert evidence.agents[0].spawn_contract_issues == (
+        "dobby_review_correctness spawn message did not match its canonical assignment",
+    )
+
+
+def test_v2_review_rollouts_accept_harmless_spawn_message_formatting(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") != "function_call" or payload.get("name") != "spawn_agent":
+            continue
+        arguments = json.loads(payload["arguments"])
+        if arguments.get("task_name") == "dobby_review_correctness":
+            payload["encrypted_function_args"] = []
+            arguments["message"] = _fixture_spawn_messages(
+                [ReviewAgent.CORRECTNESS]
+            )["dobby_review_correctness"]
+            message_lines = arguments["message"].splitlines()
+            assignment = json.loads(message_lines[2].split(": ", 1)[1])
+            message_lines[2] = "Canonical assignment JSON: " + json.dumps(
+                assignment,
+                sort_keys=False,
+            )
+            arguments["message"] = "\n".join(
+                [*message_lines[:3], "", "Equivalent explanatory prose."]
+            )
+            payload["arguments"] = json.dumps(arguments)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].spawn_contract_issues == ()
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
+def test_v2_review_rollouts_require_child_assignment_attestation(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    child_rollout = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "08"
+        / "12"
+        / "child-correctness.jsonl"
+    )
+    child_items = [
+        json.loads(line)
+        for line in child_rollout.read_text(encoding="utf-8").splitlines()
+    ]
+    child_result = json.loads(child_items[-1]["payload"]["last_agent_message"])
+    child_result["summary"] = "correctness child result without attestation"
+    unattested_payload = json.dumps(child_result, separators=(",", ":"))
+    child_items[-1]["payload"]["last_agent_message"] = unattested_payload
+    child_rollout.write_text(
+        "\n".join(json.dumps(item) for item in child_items) + "\n",
+        encoding="utf-8",
+    )
+
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    root_items = [
+        json.loads(line)
+        for line in root_rollout.read_text(encoding="utf-8").splitlines()
+    ]
+    for item in root_items:
+        payload = item.get("payload", {})
+        if (
+            payload.get("type") == "agent_message"
+            and payload.get("author") == "/root/dobby_review_correctness"
+        ):
+            envelope = payload["content"][0]["text"]
+            payload["content"][0]["text"] = (
+                envelope.split("\nPayload:\n", 1)[0]
+                + "\nPayload:\n"
+                + unattested_payload
+            )
+        if (
+            payload.get("type") == "function_call_output"
+            and payload.get("call_id") == "list-agents-call"
+        ):
+            listed = json.loads(payload["output"])
+            for listed_agent in listed["agents"]:
+                if listed_agent["agent_name"] == "/root/dobby_review_correctness":
+                    listed_agent["agent_status"]["completed"] = unattested_payload
+            payload["output"] = json.dumps(listed)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in root_items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.agents[0].child_result is None
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+    # Attestation failure is tracked apart from spawn-contract violations: the
+    # unattested payload is discarded, so it costs this lens its slot without
+    # quarantining the run, whereas a wrong role/fork/encryption shape means a
+    # child ran that Dobby never asked for and must stay an integrity failure.
+    assert evidence.agents[0].spawn_contract_issues == ()
+    assert evidence.agents[0].attestation_issues == (
+        "dobby_review_correctness child result did not attest its canonical assignment",
+    )
+    lens_issues = _rollout_validation_issues(
+        evidence.agents[0], ReviewAgentExecutionStatus.FAILED
+    )
+    assert lens_issues.integrity == []
+    assert any("did not attest" in issue for issue in lens_issues.coverage)
+
+
+def test_verified_review_payload_is_built_only_from_child_results(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    verified = _verified_review_worker_result_from_rollouts(evidence)
+
+    assert verified.important_facts == ["correctness finding", "regression finding"]
+    assert verified.next_steps == ["correctness next step", "regression next step"]
+    assert verified.review_execution is not None
+    assert [entry.summary for entry in verified.review_execution.agents] == [
+        "correctness child result",
+        "regression child result",
+    ]
+
+
+def test_globally_invalid_rollout_evidence_quarantines_all_review_content() -> None:
+    valid = _rollout_evidence(
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    invalid = ReviewRolloutEvidence(
+        collected=True,
+        agents=valid.agents,
+        validation_issues=("unexpected nested child session",),
+    )
+
+    verified = _verified_review_worker_result_from_rollouts(invalid)
+    salvaged = _salvaged_review_worker_result_from_rollouts(invalid)
+
+    assert verified.completeness == Completeness.BLOCKED
+    assert verified.important_facts == []
+    assert verified.next_steps == []
+    assert verified.warnings == []
+    assert verified.review_execution is None
+    assert salvaged is None
+
+
+def test_v2_review_rollouts_salvage_delivered_child_results_after_parent_timeout(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.PARTIAL,
+        },
+    )
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    salvaged = _salvaged_review_worker_result_from_rollouts(evidence)
 
     assert salvaged is not None
-    assert salvaged.summary == "Found a timeout bug"
-    assert salvaged.important_facts == ["runner.py can raise bare asyncio.TimeoutError after preflight"]
+    assert salvaged.completeness == Completeness.PARTIAL
+    assert salvaged.important_facts == ["correctness finding", "regression finding"]
+    assert salvaged.review_execution is not None
+    assert [entry.status for entry in salvaged.review_execution.agents] == [
+        ReviewAgentExecutionStatus.COMPLETED,
+        ReviewAgentExecutionStatus.PARTIAL,
+    ]
+
+
+def test_v2_review_execution_manifest_rejects_missing_duplicate_and_unexpected_entries() -> None:
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "review complete",
+            "completeness": "full",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": {
+                "protocol": "multi_agent_v2",
+                "agents": [
+                    {
+                        "review_agent": "correctness",
+                        "task_name": "wrong_task",
+                        "status": "completed",
+                        "summary": "first",
+                    },
+                    {
+                        "review_agent": "correctness",
+                        "task_name": "wrong_task",
+                        "status": "completed",
+                        "summary": "duplicate",
+                    },
+                    {
+                        "review_agent": "security",
+                        "task_name": "dobby_review_security",
+                        "status": "completed",
+                        "summary": "unexpected",
+                    },
+                ],
+            },
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        _rollout_evidence([ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]),
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert "missing selected review agents: regression" in diagnostics.validation_issues
+    assert "duplicate review agent entries: correctness" in diagnostics.validation_issues
+    assert "unexpected review agent entries: security" in diagnostics.validation_issues
+    assert "duplicate task names: wrong_task" in diagnostics.validation_issues
+
+
+def test_v2_review_execution_manifest_rejects_mismatched_task_name() -> None:
+    manifest = _review_execution_manifest(
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+    )
+    manifest["agents"][1]["task_name"] = "dobby_review_security"  # type: ignore[index]
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "review complete",
+            "completeness": "full",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": manifest,
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        _rollout_evidence([ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]),
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert diagnostics.validation_issues == (
+        "mismatched task names: regression expected dobby_review_regression but reported dobby_review_security",
+    )
+
+
+def test_v2_review_execution_manifest_rejects_reversed_agent_order() -> None:
+    manifest = _review_execution_manifest(
+        [ReviewAgent.REGRESSION, ReviewAgent.CORRECTNESS]
+    )
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "review complete",
+            "completeness": "full",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": manifest,
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        _rollout_evidence([ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]),
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert diagnostics.validation_issues == (
+        "review agent order mismatch: expected correctness, regression; reported regression, correctness",
+    )
+
+
+@pytest.mark.parametrize(
+    ("statuses", "reported_completeness", "expected_completeness"),
+    [
+        ({}, "partial", "full"),
+        ({ReviewAgent.REGRESSION: "failed"}, "full", "partial"),
+        (
+            {
+                ReviewAgent.CORRECTNESS: "failed",
+                ReviewAgent.REGRESSION: "failed",
+            },
+            "partial",
+            "blocked",
+        ),
+    ],
+)
+def test_v2_review_execution_manifest_rejects_completeness_contradictions(
+    statuses: dict[ReviewAgent, str],
+    reported_completeness: str,
+    expected_completeness: str,
+) -> None:
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "review result",
+            "completeness": reported_completeness,
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                statuses=statuses,
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        _rollout_evidence(
+            [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            statuses=statuses,
+        ),
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert diagnostics.validation_issues == (
+        "top-level completeness does not match agent statuses: expected "
+        f"{expected_completeness}; reported {reported_completeness}",
+    )
+
+
+def test_v2_review_execution_manifest_distinguishes_valid_but_unusable_run() -> None:
+    worker_result = WorkerResult.model_validate(
+        {
+            "summary": "review blocked",
+            "completeness": "blocked",
+            "important_facts": [],
+            "next_steps": [],
+            "files_changed": [],
+            "warnings": [],
+            "refused": False,
+            "file_diffs": [],
+            "review_execution": _review_execution_manifest(
+                [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                statuses={
+                    ReviewAgent.CORRECTNESS: "failed",
+                    ReviewAgent.REGRESSION: "failed",
+                },
+            ),
+        }
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        _rollout_evidence(
+            [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            statuses={
+                ReviewAgent.CORRECTNESS: "failed",
+                ReviewAgent.REGRESSION: "failed",
+            },
+        ),
+    )
+
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.usable_count == 0
+    assert diagnostics.failure_summary() == (
+        "Review multi-agent v2 execution produced no usable child results: "
+        "0/2 selected review agents returned usable output."
+    )
 
 
 @pytest.mark.asyncio
@@ -2176,6 +3681,188 @@ async def test_runner_returns_structured_error_when_worker_output_is_invalid(tmp
     assert "Codex completed with invalid structured output" in result.warnings
 
 
+def test_runtime_mirror_exclusions_resolve_symlinks_and_case(
+    tmp_path: Path,
+) -> None:
+    """Lexical exclusion checks are bypassable; resolved ones are not.
+
+    A symlink alias to the home or to sessions/, and a case variant on a
+    case-insensitive filesystem, both reach the same outcome the exclusion
+    exists to prevent: cloning credentials and historical rollouts into the
+    child runtime.
+    """
+    source_root = tmp_path / "codex-home"
+    (source_root / "sessions" / "2026").mkdir(parents=True)
+    (source_root / "sessions" / "2026" / "old.jsonl").write_text("{}\n", encoding="utf-8")
+    (source_root / "auth.json").write_text('{"token": "secret"}', encoding="utf-8")
+    (source_root / "prompts").mkdir()
+    (source_root / "prompts" / "extra.md").write_text("hello", encoding="utf-8")
+    (source_root / "session-cache").symlink_to(
+        source_root / "sessions", target_is_directory=True
+    )
+    (source_root / "home-alias").symlink_to(source_root, target_is_directory=True)
+    # A symlink to sessions nested inside an otherwise mirrorable directory.
+    (source_root / "prompts" / "history").symlink_to(
+        source_root / "sessions", target_is_directory=True
+    )
+    target_root = tmp_path / "child-home"
+    target_root.mkdir()
+
+    payload = "\n".join(
+        [
+            f'alias = "{source_root / "session-cache"}"',
+            f'home = "{source_root / "home-alias"}"',
+            f'extra_prompt = "{source_root / "prompts" / "extra.md"}"',
+            "",
+        ]
+    )
+    _mirror_runtime_config_references(
+        payload, source_root=source_root, target_root=target_root
+    )
+
+    assert not (target_root / "session-cache").exists()
+    assert not (target_root / "home-alias").exists()
+    assert not (target_root / "auth.json").exists()
+    # The legitimate reference is still mirrored, minus the nested alias.
+    assert (target_root / "prompts" / "extra.md").read_text(encoding="utf-8") == "hello"
+    assert not (target_root / "prompts" / "history").exists()
+
+
+def test_runtime_mirror_rejects_case_variant_of_excluded_subtree(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "codex-home"
+    (source_root / "sessions").mkdir(parents=True, exist_ok=True)
+    (source_root / "sessions" / "old.jsonl").write_text("{}\n", encoding="utf-8")
+    target_root = tmp_path / "child-home"
+    target_root.mkdir()
+
+    _mirror_runtime_config_references(
+        f'history = "{source_root}/Sessions"\n',
+        source_root=source_root,
+        target_root=target_root,
+    )
+
+    assert not any(
+        child.name.casefold() == "sessions" for child in target_root.iterdir()
+    )
+
+
+def test_config_reference_to_the_runtime_home_itself_is_not_mirrored(
+    tmp_path: Path,
+) -> None:
+    """A bare ``~/.codex`` in config.toml must not clone the whole parent home.
+
+    ``reference.relative_to(source_root)`` succeeds with ``.`` for the root
+    itself, which would copytree the entire home — auth.json, caches, and every
+    historical rollout — into the child's private runtime. The stray rollouts
+    alone would make Dobby see multiple root sessions and quarantine the review.
+    """
+    source_root = tmp_path / "codex-home"
+    (source_root / "sessions" / "2026").mkdir(parents=True)
+    (source_root / "sessions" / "2026" / "old-rollout.jsonl").write_text(
+        '{"type": "session_meta"}\n', encoding="utf-8"
+    )
+    (source_root / "auth.json").write_text('{"token": "secret"}', encoding="utf-8")
+    (source_root / "prompts").mkdir()
+    (source_root / "prompts" / "extra.md").write_text("hello", encoding="utf-8")
+    target_root = tmp_path / "child-home"
+    target_root.mkdir()
+
+    payload = (
+        f'notify = ["{source_root}"]\n'
+        f'extra_prompt = "{source_root}/prompts/extra.md"\n'
+        f'history_dir = "{source_root}/sessions"\n'
+    )
+    _mirror_runtime_config_references(
+        payload, source_root=source_root, target_root=target_root
+    )
+
+    # The specifically referenced subtree is still mirrored.
+    assert (target_root / "prompts" / "extra.md").read_text(encoding="utf-8") == "hello"
+    # The bare home reference must not drag the rest of the home along.
+    assert not (target_root / "auth.json").exists()
+    # An explicit sessions reference is refused for the same reason.
+    assert not (target_root / "sessions").exists()
+
+
+@pytest.mark.asyncio
+async def test_child_scratch_runtime_is_removed_from_the_repo_after_a_run(
+    tmp_path: Path,
+) -> None:
+    """The child's TMPDIR/cache tree must not accumulate inside the repo.
+
+    It is pointed at ``.codex-dobby/runs/<task-id>/runtime`` so the child never
+    writes to the shared system temp, which means nothing else will ever clean
+    it up.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    (repo_root / "runner.py").write_text("", encoding="utf-8")
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+            return (b"", b"")
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    observed_tmpdir: dict[str, Path] = {}
+
+    async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        tmpdir = Path(kwargs["env"]["TMPDIR"])
+        observed_tmpdir["path"] = tmpdir
+        # A real codex child leaves scratch files behind here.
+        (tmpdir / "child-scratch.bin").write_text("x" * 4096, encoding="utf-8")
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "summary": "planned the work",
+                    "completeness": "full",
+                    "important_facts": ["a fact"],
+                    "next_steps": [],
+                    "files_changed": [],
+                    "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+    try:
+        result = await runner.run(ToolName.PLAN, InvocationRequest(prompt="inspect"))
+    finally:
+        monkeypatch.undo()
+
+    assert result.status == RunStatus.SUCCESS
+    scratch_root = observed_tmpdir["path"].parent
+    assert scratch_root.name == "runtime"
+    run_dir = scratch_root.parent
+    assert not scratch_root.exists(), "child runtime scratch tree leaked into the repo"
+    # The run's own artifacts must survive the scratch cleanup.
+    assert run_dir.exists()
+    assert (run_dir / "result.json").exists()
+    assert not result.warnings
+
+
 @pytest.mark.asyncio
 async def test_review_response_includes_review_details(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = tmp_path / "repo"
@@ -2212,6 +3899,9 @@ async def test_review_response_includes_review_details(tmp_path: Path, monkeypat
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2229,6 +3919,11 @@ async def test_review_response_includes_review_details(tmp_path: Path, monkeypat
     assert result.review_details is not None
     assert result.review_details.requested_review_agents == [ReviewAgent.CORRECTNESS]
     assert result.review_details.effective_review_agents == [ReviewAgent.CORRECTNESS]
+    assert result.review_details.orchestration_protocol is None
+    assert result.review_details.execution_evidence == ReviewExecutionEvidence.DIRECT_PARENT
+    assert result.review_details.execution_manifest is None
+    assert result.review_details.manifest_validated is False
+    assert result.review_details.coverage_complete is None
 
 
 @pytest.mark.asyncio
@@ -2280,6 +3975,9 @@ async def test_reverse_engineer_response_includes_ghidra_details(tmp_path: Path,
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2334,6 +4032,9 @@ async def test_read_only_run_ignores_model_reported_file_changes_without_observe
                     "next_steps": ["Inspect stdout.log if you need the raw worker transcript."],
                     "files_changed": ["fake.py"],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2390,6 +4091,9 @@ async def test_read_only_run_flags_new_dirty_paths(tmp_path: Path) -> None:
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2463,6 +4167,9 @@ async def test_runner_inherits_parent_environment_for_child_codex_process(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2547,6 +4254,9 @@ async def test_runner_surfaces_sandbox_violations_from_process_output(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2607,6 +4317,9 @@ async def test_runner_missing_parent_codex_auth_still_spawns_when_env_based_auth
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2715,6 +4428,9 @@ async def test_mutating_run_returns_error_if_git_head_changes(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2782,6 +4498,9 @@ async def test_mutating_run_reports_only_files_changed_by_this_run(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2844,6 +4563,9 @@ async def test_mutating_run_preserves_reported_changes_outside_repo(
                     "next_steps": [],
                     "files_changed": [str(outside_file)],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2905,6 +4627,9 @@ async def test_review_without_dirty_files_or_named_targets_defaults_to_full_repo
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -2920,10 +4645,6 @@ async def test_review_without_dirty_files_or_named_targets_defaults_to_full_repo
 
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
-    monkeypatch.setattr(
-        "codex_dobby_mcp.runner._review_orchestration_diagnostics",
-        lambda *args, **kwargs: SimpleNamespace(warnings=[]),
-    )
 
     result = await runner.run(
         ToolName.REVIEW,
@@ -2970,7 +4691,7 @@ async def test_runner_returns_structured_timeout_when_baseline_snapshot_exceeds_
 
 
 @pytest.mark.asyncio
-async def test_review_run_salvages_completed_subagent_result_after_parent_timeout(
+async def test_v2_review_does_not_treat_legacy_v1_events_as_execution_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3012,6 +4733,9 @@ async def test_review_run_salvages_completed_subagent_result_after_parent_timeou
                 "next_steps": ["Wrap subprocess startup in structured timeout handling."],
                 "files_changed": [],
                 "warnings": [],
+                "refused": False,
+                "file_diffs": [],
+                "review_execution": None,
             }
         )
         regression_message = json.dumps(
@@ -3022,6 +4746,9 @@ async def test_review_run_salvages_completed_subagent_result_after_parent_timeou
                 "next_steps": ["Add a regression test for timed-out parent review salvage."],
                 "files_changed": [],
                 "warnings": [],
+                "refused": False,
+                "file_diffs": [],
+                "review_execution": None,
             }
         )
         stdout_log.write_text(
@@ -3136,7 +4863,6 @@ async def test_review_run_salvages_completed_subagent_result_after_parent_timeou
 
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
-
     result = await runner.run(
         ToolName.REVIEW,
         _request(
@@ -3147,19 +4873,20 @@ async def test_review_run_salvages_completed_subagent_result_after_parent_timeou
         ),
     )
 
-    assert result.status == RunStatus.SUCCESS
-    assert result.summary == "Review orchestrator did not return final JSON; merged findings from 2/2 completed subagents."
-    assert result.completeness == Completeness.PARTIAL
-    assert result.important_facts == [
-        "runner.py can raise bare asyncio.TimeoutError after preflight",
-        "tests do not cover the post-timeout salvage path",
-    ]
+    assert result.status == RunStatus.ERROR
+    assert result.summary == "Codex run timed out after 10 seconds"
+    assert result.completeness == Completeness.BLOCKED
+    assert result.important_facts == []
     assert "Codex run timed out after 10 seconds" in result.warnings
-    assert "Review orchestrator did not return final JSON; merged findings from 2/2 completed subagents." in result.warnings
+    assert "worker result omitted the required review_execution manifest" in result.warnings
+    assert result.review_details is not None
+    assert result.review_details.execution_manifest is None
+    assert result.review_details.execution_evidence is None
+    assert result.review_details.manifest_validated is False
 
 
 @pytest.mark.asyncio
-async def test_review_run_returns_partial_success_when_timeout_salvage_is_incomplete(
+async def test_review_run_returns_partial_success_when_timeout_has_valid_v2_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3188,6 +4915,30 @@ async def test_review_run_returns_partial_success_when_timeout_salvage_is_incomp
             self.returncode = -9
 
     async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "summary": "One child returned useful findings before the parent timeout.",
+                    "completeness": "partial",
+                    "important_facts": [
+                        "runner.py leaves timeout cleanup unbounded in the streaming path"
+                    ],
+                    "next_steps": [
+                        "Bound timeout cleanup and stream draining to the remaining deadline."
+                    ],
+                    "files_changed": [],
+                    "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": _review_execution_manifest(
+                        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                        statuses={ReviewAgent.REGRESSION: "failed"},
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
         return FakeProcess()
 
     async def fake_execute(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -3201,6 +4952,9 @@ async def test_review_run_returns_partial_success_when_timeout_salvage_is_incomp
                 "next_steps": ["Bound timeout cleanup and stream draining to the remaining deadline."],
                 "files_changed": [],
                 "warnings": [],
+                "refused": False,
+                "file_diffs": [],
+                "review_execution": None,
             }
         )
         stdout_log.write_text(
@@ -3303,6 +5057,13 @@ async def test_review_run_returns_partial_success_when_timeout_salvage_is_incomp
 
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._review_rollout_evidence",
+        lambda *_args, **_kwargs: _rollout_evidence(
+            [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            statuses={ReviewAgent.REGRESSION: "failed"},
+        ),
+    )
 
     result = await runner.run(
         ToolName.REVIEW,
@@ -3315,17 +5076,26 @@ async def test_review_run_returns_partial_success_when_timeout_salvage_is_incomp
     )
 
     assert result.status == RunStatus.SUCCESS
-    assert result.summary == "Review orchestrator did not return final JSON; surfaced findings from 1/2 completed subagents."
+    assert result.summary == (
+        "Multi-agent review returned independently verified findings from 1/2 "
+        "delivered v2 child results."
+    )
     assert result.completeness == Completeness.PARTIAL
-    assert result.important_facts == ["runner.py leaves timeout cleanup unbounded in the streaming path"]
-    assert "Review orchestrator did not return final JSON; surfaced findings from 1/2 completed subagents." in result.warnings
-    assert "Review returned partial findings from 1/2 completed subagents because orchestration did not finish before timeout" in result.warnings
+    assert result.important_facts == ["correctness independently verified finding"]
     assert "Codex run timed out after 10 seconds" in result.warnings
-    assert "Review did not record completed wait results for every spawned subagent" in result.warnings
+    assert (
+        "Review execution manifest reports 1 completed, 0 partial, 0 blocked, and 1 failed of 2 selected review agents"
+        in result.warnings
+    )
+    assert result.review_details is not None
+    assert result.review_details.manifest_validated is True
+    assert result.review_details.coverage_complete is False
+    assert result.review_details.completed_agents == 1
+    assert result.review_details.failed_agents == 1
 
 
 @pytest.mark.asyncio
-async def test_review_run_keeps_partial_parent_result_when_only_wait_coverage_is_incomplete(
+async def test_review_run_keeps_partial_parent_result_with_valid_v2_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3363,6 +5133,12 @@ async def test_review_run_keeps_partial_parent_result_when_only_wait_coverage_is
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": ["Only the regression and patterns subagent completed within the allotted review window."],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": _review_execution_manifest(
+                        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+                        statuses={ReviewAgent.CORRECTNESS: "failed"},
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -3468,6 +5244,13 @@ async def test_review_run_keeps_partial_parent_result_when_only_wait_coverage_is
 
     monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr("codex_dobby_mcp.runner._execute_process_with_streaming_logs", fake_execute)
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._review_rollout_evidence",
+        lambda *_args, **_kwargs: _rollout_evidence(
+            [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            statuses={ReviewAgent.CORRECTNESS: "failed"},
+        ),
+    )
 
     result = await runner.run(
         ToolName.REVIEW,
@@ -3480,10 +5263,21 @@ async def test_review_run_keeps_partial_parent_result_when_only_wait_coverage_is
     )
 
     assert result.status == RunStatus.SUCCESS
-    assert result.summary == "One review lens completed and surfaced useful timeout findings."
+    assert result.summary == (
+        "Multi-agent review returned independently verified findings from 1/2 "
+        "delivered v2 child results."
+    )
     assert result.completeness == Completeness.PARTIAL
-    assert result.important_facts == ["The regression lens completed; the correctness lens did not."]
-    assert "Review did not record completed wait results for every spawned subagent" in result.warnings
+    assert result.important_facts == ["regression independently verified finding"]
+    assert (
+        "Review execution manifest reports 1 completed, 0 partial, 0 blocked, and 1 failed of 2 selected review agents"
+        in result.warnings
+    )
+    assert result.review_details is not None
+    assert result.review_details.manifest_validated is True
+    assert result.review_details.coverage_complete is False
+    assert result.review_details.completed_agents == 1
+    assert result.review_details.failed_agents == 1
 
 
 @pytest.mark.asyncio
@@ -3526,6 +5320,9 @@ async def test_single_agent_review_returns_partial_success_when_timeout_has_usab
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -3597,11 +5394,8 @@ async def test_runner_returns_structured_timeout_when_deadline_expires_before_st
     async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
         return process
 
-    baseline = runner._capture_repo_snapshot(
-        repo_root,
-        runner._resolve(ToolName.PLAN, InvocationRequest(prompt="inspect")).artifacts,
-        gitignore_updated=False,
-        include_head=False,
+    baseline = _build_repo_snapshot(
+        repo_root, include_head=False, use_metadata_fingerprints=False
     )
 
     async def fake_run_blocking(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -3667,17 +5461,17 @@ async def test_runner_warns_when_post_run_snapshot_times_out(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
         )
         return FakeProcess()
 
-    baseline = runner._capture_repo_snapshot(
-        repo_root,
-        runner._resolve(ToolName.PLAN, InvocationRequest(prompt="inspect")).artifacts,
-        gitignore_updated=False,
-        include_head=False,
+    baseline = _build_repo_snapshot(
+        repo_root, include_head=False, use_metadata_fingerprints=False
     )
     call_count = 0
 
@@ -3739,17 +5533,17 @@ async def test_mutating_run_errors_when_post_run_snapshot_times_out(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
         )
         return FakeProcess()
 
-    baseline = runner._capture_repo_snapshot(
-        repo_root,
-        runner._resolve(ToolName.BUILD, InvocationRequest(prompt="build it")).artifacts,
-        gitignore_updated=False,
-        include_head=True,
+    baseline = _build_repo_snapshot(
+        repo_root, include_head=True, use_metadata_fingerprints=False
     )
     call_count = 0
 
@@ -3770,6 +5564,148 @@ async def test_mutating_run_errors_when_post_run_snapshot_times_out(
     assert result.completeness == Completeness.BLOCKED
     assert "Post-run repo snapshot timed out; repo change verification may be incomplete" in result.warnings
     assert "Post-run repo snapshot timed out; mutating tool results could not be fully verified" in result.warnings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "should_raise"),
+    [
+        (b"multi_agent_v2                       stable             false\n", 0, False),
+        (b"multi_agent                          stable             true\n", 0, True),
+        (b"", 2, True),
+    ],
+)
+async def test_multi_agent_v2_capability_probe_requires_listed_feature(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    returncode: int,
+    should_raise: bool,
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = returncode
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return stdout, b"unsupported command" if returncode else b""
+
+    async def fake_exec(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return FakeProcess()
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+    call = _ensure_multi_agent_v2_available(
+        "/usr/bin/codex",
+        tmp_path,
+        {},
+        time.monotonic() + 5,
+    )
+    if should_raise:
+        with pytest.raises(RunnerError, match="multi_agent_v2"):
+            await call
+    else:
+        await call
+
+
+@pytest.mark.asyncio
+async def test_multi_agent_v2_capability_start_timeout_returns_structured_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    async def timed_out_probe(*_args, **_kwargs) -> None:
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._ensure_multi_agent_v2_available",
+        timed_out_probe,
+    )
+
+    result = await runner.run(
+        ToolName.REVIEW,
+        _request(
+            prompt="review it",
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            timeout_seconds=10,
+        ),
+    )
+
+    assert result.status == RunStatus.ERROR
+    assert result.completeness == Completeness.BLOCKED
+    assert result.stop_reason == StopReason.TIMEOUT
+    assert result.summary == "Codex run timed out after 10 seconds"
+
+
+@pytest.mark.asyncio
+async def test_nonzero_parent_exit_returns_verified_partial_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    class FakeProcess:
+        returncode = 2
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_exec(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return FakeProcess()
+
+    async def fake_execute(*args, **_kwargs):  # type: ignore[no-untyped-def]
+        args[2].write_text("", encoding="utf-8")
+        args[3].write_text("parent API failure", encoding="utf-8")
+        return (2, False, False)
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._execute_process_with_streaming_logs",
+        fake_execute,
+    )
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._review_rollout_evidence",
+        lambda *_args, **_kwargs: _rollout_evidence(
+            [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+        ),
+    )
+
+    result = await runner.run(
+        ToolName.REVIEW,
+        _request(
+            prompt="review it",
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+            timeout_seconds=10,
+        ),
+    )
+
+    assert result.status == RunStatus.SUCCESS
+    assert result.completeness == Completeness.PARTIAL
+    assert result.stop_reason == StopReason.ERROR
+    assert result.important_facts == [
+        "correctness independently verified finding",
+        "regression independently verified finding",
+    ]
+    assert any("Codex parent exited with status 2" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
@@ -4117,6 +6053,9 @@ async def test_runner_rewrites_claude_config_references_into_private_runtime(
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",
@@ -4212,6 +6151,9 @@ async def test_runner_rewrites_symlinked_claude_config_references_into_private_r
                     "next_steps": [],
                     "files_changed": [],
                     "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
                 }
             ),
             encoding="utf-8",

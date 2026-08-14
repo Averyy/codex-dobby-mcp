@@ -18,11 +18,13 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.27.0,<2",
+    "mcp[cli]>=2.0.0,<3",
     "pydantic>=2.12.5",
 ]
 
@@ -44,7 +46,29 @@ dev = [
     "pytest-asyncio>=1.3.0",
 ]
 
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# Deliberately narrow: the rules that catch real defects (undefined names,
+# unused locals like the F841 that hid a dropped parse, mutable default args,
+# broken except clauses) rather than whole-repo restyling. Widen this set in a
+# dedicated change, not alongside behaviour work.
+select = ["E4", "E7", "E9", "F", "B"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "live: opt-in tests that require an authenticated local Codex CLI",
+]
+
+[tool.uv.build-backend]
+source-include = [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "scripts/**",
+    "tests/**",
+]

@@ -1,0 +1,5 @@
+{
+  "dobby_review_correctness": "Required custom agent: dobby_review_correctness\nAssigned lens: correctness\nCanonical assignment JSON: {\"files\":[\"src/codex_dobby_mcp/runner.py\"],\"repo_root\":\"/fixture/repo\",\"task_name\":\"dobby_review_correctness\",\"task_prompt\":\"Review the v2 orchestration implementation\"}\nCanonical assignment SHA-256: c5acebe4aa79ac20dd771e6fd9b818ba6167a37eed0f15f03050ea6a726867f3\nRequirements:\n- return strict JSON",
+  "dobby_review_regression": "Required custom agent: dobby_review_regression\nAssigned lens: regression and patterns\nCanonical assignment JSON: {\"files\":[\"src/codex_dobby_mcp/runner.py\"],\"repo_root\":\"/fixture/repo\",\"task_name\":\"dobby_review_regression\",\"task_prompt\":\"Review the v2 orchestration implementation\"}\nCanonical assignment SHA-256: 538abf84cbb8fd90758c59c9a93a46ab9c857ef89d5291f52e2f77598c1ba05c\nRequirements:\n- return strict JSON"
+}
+

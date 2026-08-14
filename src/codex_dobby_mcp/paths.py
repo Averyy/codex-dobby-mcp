@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import tomllib
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from codex_dobby_mcp.models import CODEX_DOBBY_DIRNAME, RunArtifacts, ToolName
+from codex_dobby_mcp.models import CODEX_DOBBY_DIRNAME, RunArtifacts
 
 
 class PathResolutionError(ValueError):
@@ -345,7 +346,7 @@ def create_run_artifacts(repo_root: Path, task_id: str | None = None) -> RunArti
         f"{CODEX_DOBBY_DIRNAME} artifact directory",
     )
     runs_root = _ensure_safe_directory(artifacts_root / "runs", f"{CODEX_DOBBY_DIRNAME}/runs directory")
-    run_dir = _ensure_safe_directory(runs_root / run_id, f"{CODEX_DOBBY_DIRNAME} run directory")
+    _ensure_safe_directory(runs_root / run_id, f"{CODEX_DOBBY_DIRNAME} run directory")
     return run_artifacts_for_task(repo_root, run_id)
 
 
@@ -383,8 +384,16 @@ def private_runtime_root(task_id: str, temp_root: Path | None = None) -> Path:
     if not base_root.is_dir():
         raise PathResolutionError(f"Private runtime base directory is not a directory: {base_root}")
 
-    namespace_root = _ensure_safe_directory(base_root / "codex-dobby", "codex-dobby private runtime directory")
-    return _ensure_safe_directory(namespace_root / task_id, "codex-dobby private task runtime directory")
+    namespace_root = _ensure_private_directory(
+        base_root / "codex-dobby",
+        "codex-dobby private runtime directory",
+        must_create=False,
+    )
+    return _ensure_private_directory(
+        namespace_root / task_id,
+        "codex-dobby private task runtime directory",
+        must_create=True,
+    )
 
 
 def is_git_worktree(path: Path) -> bool:
@@ -433,6 +442,44 @@ def _ensure_safe_directory(path: Path, label: str) -> Path:
     # other local users can't read secrets on multi-user machines.
     path.mkdir(mode=0o700)
     return path
+
+
+def _ensure_private_directory(
+    path: Path,
+    label: str,
+    *,
+    must_create: bool,
+) -> Path:
+    if path.is_symlink():
+        raise PathResolutionError(f"{label} must not be a symlink: {path}")
+    if path.exists():
+        if must_create:
+            raise PathResolutionError(f"{label} already exists: {path}")
+        if not path.is_dir():
+            raise PathResolutionError(f"{label} is not a directory: {path}")
+        _validate_private_directory_metadata(path, label)
+        return path
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        # A concurrent creator or attacker won the atomic mkdir race. Never
+        # continue into a directory whose provenance was not validated.
+        raise PathResolutionError(f"{label} appeared during creation: {path}") from exc
+    _validate_private_directory_metadata(path, label)
+    return path
+
+
+def _validate_private_directory_metadata(path: Path, label: str) -> None:
+    metadata = path.stat(follow_symlinks=False)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode != 0o700:
+        raise PathResolutionError(
+            f"{label} must have mode 0700; found {mode:04o}: {path}"
+        )
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        raise PathResolutionError(
+            f"{label} must be owned by uid {os.geteuid()}; found uid {metadata.st_uid}: {path}"
+        )
 
 
 def _validate_optional_directory(path: Path, label: str) -> Path:

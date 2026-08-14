@@ -136,6 +136,29 @@ def test_private_runtime_root_rejects_symlinked_namespace(tmp_path: Path) -> Non
         private_runtime_root("task-1", temp_root=tmp_path)
 
 
+def test_private_runtime_root_rejects_insecure_existing_namespace(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "codex-dobby"
+    namespace.mkdir(mode=0o700)
+    namespace.chmod(0o777)
+
+    with pytest.raises(PathResolutionError, match="must have mode 0700"):
+        private_runtime_root("task-1", temp_root=tmp_path)
+
+
+def test_private_runtime_root_rejects_preexisting_task_directory(
+    tmp_path: Path,
+) -> None:
+    namespace = tmp_path / "codex-dobby"
+    namespace.mkdir(mode=0o700)
+    task_root = namespace / "task-1"
+    task_root.mkdir(mode=0o700)
+
+    with pytest.raises(PathResolutionError, match="already exists"):
+        private_runtime_root("task-1", temp_root=tmp_path)
+
+
 def test_resolve_extra_roots_rejects_relative_symlink_escape(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

@@ -38,6 +38,7 @@ def test_built_distributions_include_runtime_assets_and_metadata(tmp_path: Path)
     wheel, sdist = _build_artifacts(tmp_path)
 
     wheel_expected_paths = {
+        "codex_dobby_mcp/_version.py",
         "codex_dobby_mcp/background_runs.py",
         "codex_dobby_mcp/snapshot_worker.py",
         "codex_dobby_mcp/assets/prompts/review-single.md",
@@ -47,13 +48,19 @@ def test_built_distributions_include_runtime_assets_and_metadata(tmp_path: Path)
     }
     sdist_prefix = f"{DIST_BASENAME}-{VERSION}"
     sdist_expected_paths = {
+        f"{sdist_prefix}/AGENTS.md",
+        f"{sdist_prefix}/CHANGELOG.md",
         f"{sdist_prefix}/README.md",
         f"{sdist_prefix}/pyproject.toml",
+        f"{sdist_prefix}/scripts/check_release_tag.py",
         f"{sdist_prefix}/src/codex_dobby_mcp/background_runs.py",
         f"{sdist_prefix}/src/codex_dobby_mcp/snapshot_worker.py",
         f"{sdist_prefix}/src/codex_dobby_mcp/assets/prompts/review-single.md",
         f"{sdist_prefix}/src/codex_dobby_mcp/assets/prompts/validate.md",
         f"{sdist_prefix}/src/codex_dobby_mcp/assets/codex_agents/review-security.toml",
+        f"{sdist_prefix}/tests/fixtures/codex-0.147-v2-review/PROVENANCE.md",
+        f"{sdist_prefix}/tests/fixtures/codex-0.147-v2-review/sessions/2026/08/14/root.jsonl",
+        f"{sdist_prefix}/tests/test_codex_v2_compatibility.py",
     }
 
     with zipfile.ZipFile(wheel) as archive:
@@ -68,6 +75,7 @@ def test_built_distributions_include_runtime_assets_and_metadata(tmp_path: Path)
     assert "Project-URL: Issues, https://github.com/Averyy/codex-dobby-mcp/issues" in metadata
     assert "Classifier: Development Status :: 3 - Alpha" in metadata
     assert "Classifier: Environment :: Console" in metadata
+    assert f"Version: {VERSION}" in metadata
     assert "# Codex Dobby MCP" in metadata
     assert "codex-dobby-mcp = codex_dobby_mcp.server:main" in entry_points
 

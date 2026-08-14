@@ -19,6 +19,7 @@ from codex_dobby_mcp.models import (
     ResolvedInvocation,
     ReverseEngineerDetails,
     ReviewDetails,
+    ReviewOrchestrationProtocol,
     RunListResponse,
     RunLookupResponse,
     RunStatus,
@@ -28,7 +29,7 @@ from codex_dobby_mcp.models import (
     ToolResponse,
 )
 from codex_dobby_mcp.paths import PathResolutionError, run_artifacts_for_task, runs_root_for_repo, write_json
-from codex_dobby_mcp.review_agents import selected_review_agents
+from codex_dobby_mcp.review_agents import review_uses_orchestrator, selected_review_agents
 from codex_dobby_mcp.runner import CodexRunner
 
 
@@ -571,9 +572,21 @@ def _review_details_for_spec(spec: ResolvedInvocation) -> ReviewDetails | None:
     if spec.tool != ToolName.REVIEW:
         return None
     effective_agents = selected_review_agents(spec.request.agents)
+    orchestrated = review_uses_orchestrator(spec.request.agents)
     return ReviewDetails(
         requested_review_agents=list(spec.requested_review_agents),
         effective_review_agents=effective_agents,
+        orchestration_protocol=(
+            ReviewOrchestrationProtocol.MULTI_AGENT_V2
+            if orchestrated
+            else None
+        ),
+        execution_evidence=None,
+        coverage_complete=False if orchestrated else None,
+        completed_agents=0 if orchestrated else None,
+        partial_agents=0 if orchestrated else None,
+        blocked_agents=0 if orchestrated else None,
+        failed_agents=0 if orchestrated else None,
     )
 
 

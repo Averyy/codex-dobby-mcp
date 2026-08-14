@@ -1,18 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
 from typing import Annotated
 
 from mcp import types as mcp_types
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from pydantic import AfterValidator, BeforeValidator, Field
 
-from codex_dobby_mcp.mcp_spec_patches import apply_spec_patches
-
-apply_spec_patches()
-
+from codex_dobby_mcp._version import __version__
 from codex_dobby_mcp.background_runs import BackgroundRunManager
 from codex_dobby_mcp.models import (
     AsyncRunHandle,
@@ -27,8 +25,30 @@ from codex_dobby_mcp.models import (
     parse_review_agents_input,
 )
 from codex_dobby_mcp.paths import resolve_repo_root
-from codex_dobby_mcp.review_agents import review_agent_assets_root
+from codex_dobby_mcp.review_agents import review_agent_assets_root, review_uses_orchestrator
 from codex_dobby_mcp.runner import CodexRunner
+
+
+def _restore_json_pre_parsed_text(value: object) -> object:
+    """Undo the SDK's JSON pre-parse for optional free-text arguments.
+
+    ``FuncMetadata.pre_parse_json`` JSON-decodes any string argument whose
+    annotation is not exactly ``str`` (python-sdk #3055, present in 1.x and
+    2.x). An optional ``str | None`` parameter carrying JSON-looking text —
+    pasting a JSON snippet into important_context is the obvious case — is
+    therefore decoded into a dict or list and then rejected by validation with
+    a confusing "Input should be a valid string". Re-serialise it so the
+    caller's argument survives instead of failing the call.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+ImportantContextParam = Annotated[
+    str | None,
+    BeforeValidator(_restore_json_pre_parsed_text),
+]
 
 
 ReviewAgentsParam = Annotated[
@@ -79,6 +99,18 @@ def _default_codex_binary() -> str:
     return "/opt/homebrew/bin/codex"
 
 
+def _effective_start_run_timeout(
+    tool: ToolName,
+    timeout_seconds: int | None,
+    agents: list[ReviewAgent] | None,
+) -> int:
+    if timeout_seconds is not None:
+        return timeout_seconds
+    if tool == ToolName.REVIEW and review_uses_orchestrator(agents):
+        return 1200
+    return DEFAULT_TOOL_TIMEOUT_SECONDS[tool]
+
+
 def create_runner(spawn_root: Path | None = None) -> CodexRunner:
     assets_root = _assets_root()
     return CodexRunner(
@@ -95,7 +127,7 @@ def _request_from_params(
     prompt: str,
     repo_root: str | None = None,
     files: list[str] | None = None,
-    important_context: str | None = None,
+    important_context: ImportantContextParam = None,
     timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.PLAN],
     extra_roots: list[str] | None = None,
     model: str | None = None,
@@ -120,10 +152,12 @@ def _request_from_params(
 def _progress_token_from_ctx(ctx: Context | None) -> str | int | None:
     if ctx is None or ctx._request_context is None:
         return None
+    # MCP SDK 2.x: request `_meta` is a `RequestParamsMeta` TypedDict keyed by
+    # the snake_case protocol field, not a model with a camelCase attribute.
     meta = ctx.request_context.meta
     if meta is None:
         return None
-    token = getattr(meta, "progressToken", None)
+    token = meta.get("progress_token")
     if token is None:
         return None
     return token
@@ -146,17 +180,13 @@ def _build_event_sink(ctx: Context | None):
 
     async def sink(event: dict, count: int) -> None:
         message = event.get("title") or event.get("type")
-        params = mcp_types.ProgressNotificationParams.model_validate(
-            {
-                "progressToken": progress_token,
-                "progress": float(count),
-                "message": message if isinstance(message, str) else None,
-                "_meta": {"acpEvent": event},
-            }
+        params = mcp_types.ProgressNotificationParams(
+            progress_token=progress_token,
+            progress=float(count),
+            message=message if isinstance(message, str) else None,
+            _meta={"acpEvent": event},
         )
-        await session.send_notification(
-            mcp_types.ServerNotification(mcp_types.ProgressNotification(params=params))
-        )
+        await session.send_notification(mcp_types.ProgressNotification(params=params))
 
     return sink
 
@@ -180,31 +210,28 @@ def _build_wait_event_sink(ctx: Context | None):
     async def sink(event: dict, count: int, task_id: str) -> None:
         counter[0] += 1
         message = event.get("title") or event.get("type")
-        params = mcp_types.ProgressNotificationParams.model_validate(
-            {
-                "progressToken": progress_token,
-                "progress": float(counter[0]),
-                "message": message if isinstance(message, str) else None,
-                "_meta": {
-                    "acpEvent": event,
-                    "taskId": task_id,
-                    "perTaskCount": count,
-                },
-            }
+        params = mcp_types.ProgressNotificationParams(
+            progress_token=progress_token,
+            progress=float(counter[0]),
+            message=message if isinstance(message, str) else None,
+            _meta={
+                "acpEvent": event,
+                "taskId": task_id,
+                "perTaskCount": count,
+            },
         )
-        await session.send_notification(
-            mcp_types.ServerNotification(mcp_types.ProgressNotification(params=params))
-        )
+        await session.send_notification(mcp_types.ProgressNotification(params=params))
 
     return sink
 
 
-def create_server(spawn_root: Path | None = None) -> FastMCP:
+def create_server(spawn_root: Path | None = None) -> MCPServer:
     runner = create_runner(spawn_root)
     background_runs = BackgroundRunManager(runner)
-    server = FastMCP(
+    server = MCPServer(
         "codex-dobby-mcp",
-        instructions="Delegate scoped work to codex exec and return concise structured results. Always pass the absolute path of the caller's active git worktree as repo_root; Dobby deliberately does not guess or default it. Important: short timeouts cause failures. Always use a longer timeout_seconds than you think is needed — the default (900s) is a safe choice. Do not override it lower unless you have a specific reason. For long review, research, build, validate, or reverse_engineer work, prefer start_run plus wait_run (wait_run blocks until done or until its own timeout_seconds elapses, then re-call). If the caller is Claude Code and you want the parent to keep working on other things instead of blocking in wait_run, schedule a poll of get_run via /loop or ScheduleWakeup — the parent wakes itself periodically to check without holding a tool call open. Use get_run/list_runs for a non-blocking peek or to recover a task id after a caller-side timeout. To resume, continue, or check on any background run, call wait_run or get_run with its task_id — runs accept no further input once started.",
+        version=__version__,
+        instructions="Delegate scoped work to codex exec and return concise structured results. Always pass the absolute path of the caller's active git worktree as repo_root; Dobby deliberately does not guess or default it. Important: short timeouts cause failures. Use the selected tool's default timeout or longer; do not override it lower unless you have a specific reason. Review is direct with zero or one effective agent; pass two or more canonical agents for Codex multi-agent v2. Multi-agent start_run defaults to 1200 seconds when timeout_seconds is omitted. For long review, research, build, validate, or reverse_engineer work, prefer start_run plus wait_run. Always wait for each start_run to return its task_id before looking up that run; independent start_run calls may run in parallel. wait_run blocks until done or until its own timeout_seconds elapses, then re-call it with pending_task_ids. If the caller is Claude Code and you want the parent to keep working instead of blocking in wait_run, schedule a poll of get_run via /loop or ScheduleWakeup. Use get_run/list_runs for a non-blocking peek or to recover a task id after a caller-side timeout. For multi-agent results, manifest_validated proves integrity while coverage_complete proves every lens completed. Runs accept no further input once started.",
     )
 
     @server.tool(name="plan", structured_output=True)
@@ -212,7 +239,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.PLAN],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -237,7 +264,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.RESEARCH],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -262,7 +289,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.BRAINSTORM],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -287,7 +314,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.BUILD],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -314,7 +341,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.VALIDATE],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -339,21 +366,25 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
-        timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVIEW],
+        important_context: ImportantContextParam = None,
+        timeout_seconds: int | None = None,
         extra_roots: list[str] | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
         agents: ReviewAgentsParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Review code with one agent (default) or fan out to multiple specialist agents. Recommended timeout: 10 minutes single-agent, 20 minutes multi-agent (pass timeout_seconds=1200 when using multiple agents)."""
+        """Review code directly with zero or one effective agent, or pass two or more canonical agents to fan out through Codex multi-agent v2. Dobby verifies v2 support and independently correlates each manifest entry with Codex session rollouts. In review_details, manifest_validated proves integrity; coverage_complete proves every selected lens completed. Defaults to 600 seconds, or 1200 seconds for multi-agent review, when timeout_seconds is omitted."""
+        # Same default as start_run: a multi-agent fan-out through the same
+        # orchestrator needs the same budget whichever entry point launched it.
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
             files=files,
             important_context=important_context,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_effective_start_run_timeout(
+                ToolName.REVIEW, timeout_seconds, agents
+            ),
             extra_roots=extra_roots,
             model=model,
             reasoning_effort=reasoning_effort,
@@ -366,7 +397,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVERSE_ENGINEER],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -394,7 +425,7 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: str | None = None,
+        important_context: ImportantContextParam = None,
         timeout_seconds: int | None = None,
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -403,8 +434,12 @@ def create_server(spawn_root: Path | None = None) -> FastMCP:
         danger: bool = False,
         ctx: Context | None = None,
     ) -> AsyncRunHandle:
-        """Start a Dobby tool in the background and return immediately with a task id. Follow up with wait_run(task_id=...) to block on one run, or call start_run several times and then wait_run(task_ids=[...]) to be woken by whichever finishes first. get_run/list_runs remain available for a non-blocking peek. Recommended when your MCP client enforces short tools/call timeouts."""
-        effective_timeout_seconds = timeout_seconds or DEFAULT_TOOL_TIMEOUT_SECONDS[tool]
+        """Start a Dobby tool in the background and return immediately with a task id. Wait for this specific call to return before looking up its run; independent start_run calls may execute in parallel. Then use wait_run(task_id=...) for one run or wait_run(task_ids=[...]) to be woken by whichever finishes first. Multi-agent review defaults to 1200 seconds when timeout_seconds is omitted. get_run/list_runs remain available for a non-blocking peek."""
+        effective_timeout_seconds = _effective_start_run_timeout(
+            tool,
+            timeout_seconds,
+            agents,
+        )
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,

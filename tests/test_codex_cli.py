@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from codex_dobby_mcp.codex_cli import _dobby_mcp_disable_overrides, build_codex_command
+from codex_dobby_mcp.codex_cli import (
+    _dobby_mcp_disable_overrides,
+    _review_mcp_disable_overrides,
+    build_codex_command,
+)
 from codex_dobby_mcp.models import (
     InvocationRequest,
     ReasoningEffort,
@@ -11,10 +15,7 @@ from codex_dobby_mcp.models import (
     RunArtifacts,
     ToolName,
 )
-from codex_dobby_mcp.review_agents import (
-    REVIEW_SUBAGENT_DEFAULT_MODEL,
-    REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
-)
+from codex_dobby_mcp.review_agents import REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
 
 
 REVIEW_AGENTS_ROOT = Path(__file__).resolve().parents[1] / "src" / "codex_dobby_mcp" / "assets" / "codex_agents"
@@ -210,76 +211,28 @@ def test_review_tool_injects_selected_custom_agents(tmp_path: Path) -> None:
 
     assert command.sandbox_mode == "read-only"
     assert command.emits_json_events is True
-    assert "features.multi_agent=true" in config_values
-    assert "agents.max_depth=1" in config_values
-    assert "agents.max_threads=3" in config_values
+    assert "features.multi_agent_v2=true" in config_values
+    assert "agents.enabled=true" in config_values
+    assert "agents.max_concurrent_threads_per_session=2" in config_values
+    assert 'history.persistence="save-all"' in config_values
+    assert "features.multi_agent=true" not in config_values
+    assert not any(value.startswith("agents.max_depth=") for value in config_values)
+    assert not any(value.startswith("agents.max_threads=") for value in config_values)
     assert any("agents.dobby_review_security.config_file=" in value for value in config_values)
     assert any("agents.dobby_review_security.description=" in value for value in config_values)
-    assert any(
-        value == f'agents.dobby_review_security.model="{REVIEW_SUBAGENT_DEFAULT_MODEL}"' for value in config_values
-    )
+    assert 'agents.default_subagent_model="gpt-5.5"' in config_values
     assert any(
         value
-        == f'agents.dobby_review_security.model_reasoning_effort="{REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT.value}"'
+        == f'agents.default_subagent_reasoning_effort="{REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT.value}"'
+        for value in config_values
+    )
+    assert not any(value.startswith("agents.dobby_review_security.model=") for value in config_values)
+    assert not any(
+        value.startswith("agents.dobby_review_security.model_reasoning_effort=")
         for value in config_values
     )
     assert any("agents.dobby_review_regression.config_file=" in value for value in config_values)
     assert not any("agents.dobby_review_architecture.config_file=" in value for value in config_values)
-
-
-def test_short_timeout_review_tool_uses_low_reasoning_for_subagents(tmp_path: Path) -> None:
-    spec = make_spec(tmp_path, ToolName.REVIEW)
-    spec.request = InvocationRequest.model_construct(
-        prompt="review the diff",
-        agents=[ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
-        timeout_seconds=90,
-    )
-    spec.reasoning_effort = ReasoningEffort.MEDIUM
-
-    command = build_codex_command(
-        spec,
-        "/opt/homebrew/bin/codex",
-        spec.artifacts.output_schema_json,
-        REVIEW_AGENTS_ROOT,
-    )
-    config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
-
-    assert any(
-        value == 'agents.dobby_review_security.model_reasoning_effort="low"'
-        for value in config_values
-    )
-    assert any(
-        value == 'agents.dobby_review_regression.model_reasoning_effort="low"'
-        for value in config_values
-    )
-
-
-def test_short_timeout_review_tool_overrides_explicit_high_subagent_reasoning(tmp_path: Path) -> None:
-    spec = make_spec(tmp_path, ToolName.REVIEW)
-    spec.request = InvocationRequest.model_construct(
-        prompt="review the diff",
-        agents=[ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
-        timeout_seconds=110,
-        reasoning_effort=ReasoningEffort.HIGH,
-    )
-    spec.reasoning_effort = ReasoningEffort.MEDIUM
-
-    command = build_codex_command(
-        spec,
-        "/opt/homebrew/bin/codex",
-        spec.artifacts.output_schema_json,
-        REVIEW_AGENTS_ROOT,
-    )
-    config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
-
-    assert any(
-        value == 'agents.dobby_review_security.model_reasoning_effort="low"'
-        for value in config_values
-    )
-    assert any(
-        value == 'agents.dobby_review_regression.model_reasoning_effort="low"'
-        for value in config_values
-    )
 
 
 def test_single_agent_review_runs_without_multi_agent_overrides(tmp_path: Path) -> None:
@@ -300,7 +253,7 @@ def test_single_agent_review_runs_without_multi_agent_overrides(tmp_path: Path) 
     assert command.sandbox_mode == "read-only"
     assert command.emits_json_events is True
     assert "--json" in command.argv
-    assert "features.multi_agent=true" not in config_values
+    assert "features.multi_agent_v2=true" not in config_values
     assert not any("agents.dobby_review_correctness.config_file=" in value for value in config_values)
 
 
@@ -318,14 +271,14 @@ def test_review_tool_default_single_generalist_is_not_orchestrated(tmp_path: Pat
     assert command.sandbox_mode == "read-only"
     assert command.emits_json_events is True
     assert "--json" in command.argv
-    assert "features.multi_agent=true" not in config_values
+    assert "features.multi_agent_v2=true" not in config_values
 
 
-def test_review_tool_honors_explicit_parent_model_and_reasoning(tmp_path: Path) -> None:
+def test_multi_agent_review_children_inherit_explicit_parent_model_and_use_requested_reasoning(tmp_path: Path) -> None:
     spec = make_spec(tmp_path, ToolName.REVIEW)
     spec.request = InvocationRequest(
         prompt="review the diff",
-        agents=[ReviewAgent.SECURITY],
+        agents=[ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
         model="gpt-5.5",
         reasoning_effort=ReasoningEffort.HIGH,
     )
@@ -338,6 +291,8 @@ def test_review_tool_honors_explicit_parent_model_and_reasoning(tmp_path: Path) 
     )
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
+    assert 'agents.default_subagent_model="gpt-5.5"' in config_values
+    assert 'agents.default_subagent_reasoning_effort="high"' in config_values
     assert not any(value.startswith("agents.dobby_review_security.model=") for value in config_values)
     assert not any(value.startswith("agents.dobby_review_security.model_reasoning_effort=") for value in config_values)
 
@@ -374,6 +329,101 @@ args = ["-m", "codex_dobby_mcp.server"]
     assert "mcp_servers.dobby.enabled=false" in overrides
     assert "mcp_servers.local_dobby.enabled=false" in overrides
     assert not any("fetchaller" in override for override in overrides)
+
+
+def test_review_disables_every_mcp_including_aliased_dobby_wrappers(
+    tmp_path: Path,
+) -> None:
+    home_config = tmp_path / "config.toml"
+    home_config.write_text(
+        """
+[mcp_servers.fetchaller]
+command = "python"
+args = ["-m", "fetchaller.main"]
+
+[mcp_servers.helper]
+command = "/usr/local/bin/company-agent-wrapper"
+args = ["--profile", "review"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    repo_root = tmp_path / "repo"
+    (repo_root / ".codex").mkdir(parents=True)
+    (repo_root / ".codex" / "config.toml").write_text(
+        """
+[mcp_servers."repo.helper"]
+url = "https://example.invalid/mcp"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    overrides = _review_mcp_disable_overrides(repo_root, home_config)
+
+    assert overrides == [
+        "mcp_servers.fetchaller.enabled=false",
+        "mcp_servers.helper.enabled=false",
+        'mcp_servers."repo.helper".enabled=false',
+    ]
+
+
+def test_review_command_applies_empty_mcp_allowlist(tmp_path: Path) -> None:
+    home_config = tmp_path / "config.toml"
+    home_config.write_text(
+        """
+[mcp_servers.helper]
+command = "/usr/local/bin/company-agent-wrapper"
+args = ["--profile", "review"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = make_spec(tmp_path, ToolName.REVIEW)
+
+    command = build_codex_command(
+        spec,
+        "/opt/homebrew/bin/codex",
+        spec.artifacts.output_schema_json,
+        REVIEW_AGENTS_ROOT,
+        home_config,
+    )
+
+    config_values = [
+        command.argv[index + 1]
+        for index, value in enumerate(command.argv)
+        if value == "-c"
+    ]
+    assert "mcp_servers.helper.enabled=false" in config_values
+
+
+def test_dobby_mcp_disable_overrides_quote_dynamic_toml_key_segments(
+    tmp_path: Path,
+) -> None:
+    home_config = tmp_path / "config.toml"
+    home_config.write_text(
+        """
+[mcp_servers."codex.dobby"]
+command = "uvx"
+args = ["codex-dobby-mcp"]
+
+[mcp_servers."local dobby"]
+command = "python"
+args = ["-m", "codex_dobby_mcp.server"]
+
+[mcp_servers.'quoted"dobby']
+command = "uvx"
+args = ["codex-dobby-mcp"]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    overrides = _dobby_mcp_disable_overrides(tmp_path, home_config)
+
+    assert 'mcp_servers."codex.dobby".enabled=false' in overrides
+    assert 'mcp_servers."local dobby".enabled=false' in overrides
+    assert 'mcp_servers."quoted\\\"dobby".enabled=false' in overrides
 
 
 def test_dobby_mcp_disable_overrides_respects_codex_home_env(

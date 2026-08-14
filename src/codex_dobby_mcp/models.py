@@ -81,6 +81,23 @@ class ReviewAgent(str, Enum):
     REGRESSION = "regression"
 
 
+class ReviewAgentExecutionStatus(str, Enum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
+class ReviewOrchestrationProtocol(str, Enum):
+    MULTI_AGENT_V2 = "multi_agent_v2"
+
+
+class ReviewExecutionEvidence(str, Enum):
+    DIRECT_PARENT = "direct_parent"
+    CODEX_SESSION_ROLLOUTS = "codex_session_rollouts"
+    PARENT_REPORTED_STRUCTURED_OUTPUT = "parent_reported_structured_output"
+
+
 SUPPORTED_REVIEW_AGENT_VALUES = tuple(agent.value for agent in ReviewAgent)
 SUPPORTED_REVIEW_AGENTS_TEXT = ", ".join(SUPPORTED_REVIEW_AGENT_VALUES)
 
@@ -201,6 +218,34 @@ class FileDiff(BaseModel):
     truncated: bool = False
 
 
+class ReviewAgentExecution(BaseModel):
+    review_agent: ReviewAgent = Field(
+        description="Canonical review lens represented by this task."
+    )
+    task_name: str = Field(
+        ...,
+        min_length=1,
+        description="Deterministic Codex task name independently correlated with rollout evidence.",
+    )
+    status: ReviewAgentExecutionStatus = Field(
+        description="Verified child coverage status; blocked and failed are not usable coverage."
+    )
+    summary: str = Field(
+        ...,
+        min_length=1,
+        description="Short child-result or failure summary reconstructed from verified evidence.",
+    )
+
+
+class ReviewExecutionManifest(BaseModel):
+    protocol: ReviewOrchestrationProtocol = Field(
+        description="Orchestration protocol used for the review."
+    )
+    agents: list[ReviewAgentExecution] = Field(
+        description="One ordered entry per requested review lens, including failed or blocked tasks."
+    )
+
+
 class WorkerResult(BaseModel):
     summary: str = Field(..., min_length=1)
     completeness: Completeness
@@ -210,11 +255,50 @@ class WorkerResult(BaseModel):
     warnings: list[str]
     refused: bool = False
     file_diffs: list[FileDiff] = Field(default_factory=list)
+    review_execution: ReviewExecutionManifest | None = None
 
 
 class ReviewDetails(BaseModel):
-    requested_review_agents: list[ReviewAgent] = Field(default_factory=list)
-    effective_review_agents: list[ReviewAgent] = Field(default_factory=list)
+    requested_review_agents: list[ReviewAgent] = Field(
+        default_factory=list,
+        description="Raw review lenses supplied by the caller before defaulting and normalization.",
+    )
+    effective_review_agents: list[ReviewAgent] = Field(
+        default_factory=list,
+        description="Normalized review lenses actually executed.",
+    )
+    orchestration_protocol: ReviewOrchestrationProtocol | None = Field(
+        default=None,
+        description="Multi-agent protocol, or null for a direct zero/one-lens review.",
+    )
+    execution_evidence: ReviewExecutionEvidence | None = Field(
+        default=None,
+        description="Evidence source used to establish execution; rollout evidence is required for verified v2 fan-out.",
+    )
+    execution_manifest: ReviewExecutionManifest | None = Field(
+        default=None,
+        description="Per-lens execution state reconstructed from verified evidence.",
+    )
+    manifest_validated: bool = Field(
+        default=False,
+        description="Integrity signal only: true means the manifest matches evidence, not that every lens completed.",
+    )
+    coverage_complete: bool | None = Field(
+        default=None,
+        description="For orchestrated reviews, true only when every selected lens completed; null for direct review.",
+    )
+    completed_agents: int | None = Field(
+        default=None, ge=0, description="Verified completed lens count."
+    )
+    partial_agents: int | None = Field(
+        default=None, ge=0, description="Verified partial lens count."
+    )
+    blocked_agents: int | None = Field(
+        default=None, ge=0, description="Verified blocked lens count."
+    )
+    failed_agents: int | None = Field(
+        default=None, ge=0, description="Verified failed lens count."
+    )
 
 
 class GhidraUsageMode(str, Enum):

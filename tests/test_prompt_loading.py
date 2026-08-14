@@ -67,7 +67,7 @@ def test_review_prompt_renders_selected_agents() -> None:
         request=_request(
             prompt="review the current diff",
             agents=[ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
-            timeout_seconds=180,
+            timeout_seconds=600,
         ),
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
@@ -80,49 +80,71 @@ def test_review_prompt_renders_selected_agents() -> None:
     assert "Injected custom review agents available in this run:" in rendered
     assert "dobby_review_security (security)" in rendered
     assert "The parent review worker is an orchestrator, not a primary reviewer." in rendered
-    assert "Your first substantive action should be to spawn the selected review subagents" in rendered
-    assert "Spawn exactly one read-only Codex subagent for each selected custom review agent below." in rendered
-    assert "When you call `spawn_agent`, specify the exact custom agent name from the assignment block and set `fork_context=false`." in rendered
-    assert "Each child message must begin with the exact `Required custom agent:` and `Assigned lens:` lines" in rendered
-    assert "If more than one review agent is selected, spawn those subagents in parallel" in rendered
-    assert "Record the spawned child thread id from each `spawn_agent` completion" in rendered
-    assert "without inheriting the parent orchestrator context" in rendered
-    assert "start from Claude's named files and expand outward only as far as needed" in rendered
-    assert "start with the named implementation files before opening docs or tests" in rendered
-    assert "large test files unless a specific contract or candidate issue requires that confirmation" in rendered
-    assert "Timeout plan for this run: total budget `180` seconds." in rendered
-    assert "Short-timeout mode for this run: `yes`." in rendered
-    assert "start with at most `3` named files" in rendered
-    assert "avoid more than `6` shell commands" in rendered
-    assert "Reserve the last `60` seconds for wrap-up and final synthesis." in rendered
-    assert "call `wait_agent` on all of them with `timeout_ms=120000`" in rendered
-    assert "Never let the first `wait_agent` call consume the wrap-up reserve." in rendered
-    assert "Treat that first `wait_agent` timeout as a soft deadline or request-end" in rendered
-    assert "Treat empty or missing `agents_states` as incomplete." in rendered
-    assert "call `send_input` with `interrupt=true` for each unfinished child id" in rendered
-    assert "Dobby timeout approaching. Stop exploring now and return the best JSON you have immediately." in rendered
-    assert "do not inspect more code, deliberate further, or send any message other than those wrap-up interrupts" in rendered
-    assert "call `wait_agent` on the unfinished subagents with `timeout_ms=45000`" in rendered
-    assert "If some child ids still have no completed result, note that those review lenses are incomplete" in rendered
-    assert "Once `wait` returns completed results, stop exploring and emit the final JSON immediately." in rendered
-    assert "If exactly one review subagent was selected, adapt that completed subagent output directly" in rendered
+    assert "Your first substantive action must be to spawn every selected review subagent" in rendered
+    assert "Spawn exactly one read-only Codex subagent for each assignment below." in rendered
+    assert "pass the assignment's exact custom name as both `agent_type` and `task_name`" in rendered
+    assert "pass `fork_turns=\"none\"`" in rendered
+    assert "Do not pass `fork_context`." in rendered
+    assert "Preserve its first four lines exactly" in rendered
+    assert "Spawn all selected agents before waiting so they can run concurrently." in rendered
+    assert "canonical message already contains the isolated child contract and shared repo/task/files/context" in rendered
+    # These requirements are carried by the canonical child message the parent
+    # passes through verbatim, so the parent prompt no longer restates them.
+    assert "Tell each subagent to" not in rendered
+    assert "start with the named implementation files and expand only as needed" in rendered
+    assert "inspect relevant surrounding code" in rendered
+    # The parent must not rank, rewrite, or deduplicate; Dobby rebuilds findings.
+    assert "Rewrite, rank, or deduplicate subagent findings" in rendered
+    assert "synthesized from separately delivered" not in rendered
+    assert "Timeout plan for this run: total budget `600` seconds." in rendered
+    # Short-timeout mode is unreachable while the validated floor is 300s; see
+    # test_timeout_floor_keeps_short_timeout_budgets_unreachable.
+    assert "Short-timeout mode for this run: `no`." in rendered
+    assert "start with at most `4` named files" in rendered
+    assert "avoid more than `8` shell commands" in rendered
+    assert "Reserve the last `120` seconds for wrap-up and final synthesis." in rendered
+    assert "call `list_agents` and verify that every exact task name is present" in rendered
+    assert "Multi-agent v2 `wait_agent` does not accept child ids" in rendered
+    assert "an empty receiver/state map in the public JSONL event is normal" in rendered
+    assert "use at most `420` seconds total" in rendered
+    assert "Begin with `wait_agent(timeout_ms=420000)`" in rendered
+    assert "call `interrupt_agent(target=<task_name>)` exactly once" in rendered
+    assert "spend at most `90` seconds total" in rendered
+    assert "Begin with `wait_agent(timeout_ms=90000)`" in rendered
+    assert "A child is usable only when its exact JSON completion payload is delivered to the parent" in rendered
+    assert "build only the required execution manifest from delivered statuses" in rendered
+    assert "do not spend tokens rewriting or synthesizing their prose" in rendered
+    assert "Keep top-level `important_facts`, `next_steps`, and `warnings` empty" in rendered
+    assert "Required execution manifest:" in rendered
+    assert "Set `review_execution.protocol` to `multi_agent_v2`." in rendered
+    assert "Never claim a task completed merely because it spawned or appeared in `list_agents`." in rendered
     assert "### Spawn `dobby_review_security`" in rendered
     assert "### Spawn `dobby_review_regression`" in rendered
     assert "Lens: regression and patterns" in rendered
     assert "Required agent type: `dobby_review_security`" in rendered
-    assert "Call `spawn_agent` and select this exact injected custom agent type." in rendered
-    assert "Set `fork_context=false`." in rendered
-    assert "The child message must begin with these exact two lines" in rendered
-    assert "`Required custom agent: dobby_review_security`" in rendered
-    assert "`Assigned lens: security`" in rendered
-    assert "Copy this exact opening into the child message before the rest of the assignment:" in rendered
-    assert "do not substitute `default`, `worker`, `explorer`, or any other agent type" in rendered
-    assert "start with Claude's named files and expand outward only as needed" in rendered
-    assert "default to static code inspection" in rendered
-    assert "do not run broad test suites or `uv run` from a read-only review" in rendered
-    assert "start with at most 3 named files, read at most 6 additional files, and avoid more than 6 shell commands before synthesizing" in rendered
-    assert "if the parent interrupts you to request wrap-up" in rendered
-    assert "use `completeness` = `partial` if an interrupt forces you to return" in rendered
+    assert "Required task name: `dobby_review_security`" in rendered
+    assert "Manifest review agent: `security`" in rendered
+    assert "Call `spawn_agent` with this exact `agent_type` and `task_name`." in rendered
+    assert "Set `fork_turns=\"none\"`" in rendered
+    assert "Preserve its first four lines exactly" in rendered
+    assert "Required custom agent: dobby_review_security" in rendered
+    assert "Assigned lens: security" in rendered
+    assert 'Canonical assignment JSON: {"advisory_read_only_roots":[]' in rendered
+    assert "Canonical assignment SHA-256:" in rendered
+    assert '"repo_root":"/repo"' in rendered
+    assert '"task_prompt":"review the current diff"' in rendered
+    assert "do not substitute another agent type" in rendered
+    assert "start with the named implementation files and expand only as needed" in rendered
+    assert "use static inspection before shell commands" in rendered
+    assert "do not run broad test suites or uv run" in rendered
+    assert "start with at most 4 named files, read at most 8 additional files, and avoid more than 8 shell commands before synthesizing" in rendered
+    assert "if interrupted for wrap-up" in rendered
+    assert "completeness=partial" in rendered
+    assert "return exactly one JSON object with fields" in rendered
+    assert "completeness must be full, partial, or blocked" in rendered
+    assert "begin summary exactly with `Dobby assignment" in rendered
+    assert "refused must be the JSON boolean false" in rendered
+    assert '"refused":false' in rendered
     assert "Spend the parent turn on broad code reading" in rendered
     assert "Do not use nested delegation." in rendered
     assert "generalist quick pass" not in rendered
@@ -147,6 +169,36 @@ def test_review_prompt_marks_entire_repo_when_files_are_omitted() -> None:
     assert "Relevant files from Claude:\n- (entire repo)" in rendered
 
 
+def test_review_subagent_message_cannot_break_its_prompt_fence() -> None:
+    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
+    request = _request(
+        prompt="review this ```text\nadversarial fence\n``` safely",
+        agents=[ReviewAgent.SECURITY, ReviewAgent.REGRESSION],
+    )
+
+    messages = loader.review_subagent_messages(
+        request=request,
+        repo_root=Path("/repo"),
+        sandbox_roots=[Path("/repo")],
+        advisory_read_only_roots=[],
+        fetchaller_available=False,
+        ghidra_available=False,
+    )
+    rendered = loader.render(
+        tool=ToolName.REVIEW,
+        request=request,
+        repo_root=Path("/repo"),
+        sandbox_roots=[Path("/repo")],
+        advisory_read_only_roots=[],
+        model="gpt-5.5",
+        reasoning_effort="low",
+    )
+
+    assert all("```" not in message for message in messages.values())
+    assert all(r"\u0060\u0060\u0060text" in message for message in messages.values())
+    assert all(f"```text\n{message}\n```" in rendered for message in messages.values())
+
+
 def test_single_agent_review_prompt_uses_direct_lens_mode() -> None:
     loader = PromptLoader(ASSETS_PROMPTS_ROOT)
 
@@ -155,7 +207,7 @@ def test_single_agent_review_prompt_uses_direct_lens_mode() -> None:
         request=_request(
             prompt="review the current diff",
             agents=[ReviewAgent.CORRECTNESS],
-            timeout_seconds=60,
+            timeout_seconds=600,
         ),
         repo_root=Path("/repo"),
         sandbox_roots=[Path("/repo")],
@@ -170,10 +222,10 @@ def test_single_agent_review_prompt_uses_direct_lens_mode() -> None:
     assert "- dobby_review_correctness" in rendered
     assert "This review uses the selected lens directly instead of spawning subagents." in rendered
     assert "Do not call `spawn_agent`, `wait_agent`, or `send_input`." in rendered
-    assert "Short-timeout mode for this run: `yes`." in rendered
-    assert "Start with at most `2` named files before branching outward." in rendered
-    assert "Read at most `4` additional files beyond Claude's named files" in rendered
-    assert "Run at most `4` shell commands" in rendered
+    assert "Short-timeout mode for this run: `no`." in rendered
+    assert "Start with at most `4` named files before branching outward." in rendered
+    assert "Read at most `8` additional files beyond Claude's named files" in rendered
+    assert "Run at most `8` shell commands" in rendered
     assert "Start with the named implementation files before opening docs or tests." in rendered
     assert "Do not open `README.md`, repo-local instruction docs, or large test files unless you need them to confirm a specific contract or candidate issue." in rendered
     assert "Do not read git status, git diff, or unrelated tests by default." in rendered
@@ -181,34 +233,25 @@ def test_single_agent_review_prompt_uses_direct_lens_mode() -> None:
     assert "Find bugs, logic errors, and edge cases." in rendered
     assert "Stop once you have the highest-signal findings." in rendered
     assert "If time is running short, or you have reached the exploration budget without a concrete issue" in rendered
-    assert "Call `spawn_agent` and select this exact injected custom agent type." not in rendered
+    assert "Call `spawn_agent` with this exact `agent_type` and `task_name`." not in rendered
 
 
-def test_multi_agent_review_prompt_uses_early_soft_deadline_on_short_timeouts() -> None:
-    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
+def test_multi_agent_timeout_plan_reserves_wrapper_time_and_caps_wait_calls() -> None:
+    for timeout_seconds in (90, 120, 180, 300, 600, 1200, 3721, 7200):
+        plan = PromptLoader._review_timeout_plan(timeout_seconds, 2)
+        allocated_seconds = (
+            plan["initial_wait_seconds"]
+            + plan["interrupt_wait_seconds"]
+            + plan["synthesis_seconds"]
+        )
 
-    rendered = loader.render(
-        tool=ToolName.REVIEW,
-        request=_request(
-            prompt="review the current diff",
-            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
-            timeout_seconds=90,
-        ),
-        repo_root=Path("/repo"),
-        sandbox_roots=[Path("/repo")],
-        advisory_read_only_roots=[],
-        model="gpt-5.5",
-        reasoning_effort="high",
-    )
+        assert allocated_seconds < timeout_seconds
+        assert plan["initial_wait_timeout_ms"] <= 3_600_000
+        assert plan["interrupt_wait_timeout_ms"] <= 3_600_000
 
-    assert "Short-timeout mode for this run: `yes`." in rendered
-    assert "start with at most `1` named files" in rendered
-    assert "read at most `3` additional files" in rendered
-    assert "avoid more than `2` shell commands" in rendered
-    assert "start with at most 1 named files, read at most 3 additional files, and avoid more than 2 shell commands before synthesizing" in rendered
-    assert "Reserve the last `70` seconds for wrap-up and final synthesis." in rendered
-    assert "call `wait_agent` on all of them with `timeout_ms=20000`" in rendered
-    assert "call `wait_agent` on the unfinished subagents with `timeout_ms=55000`" in rendered
+    long_plan = PromptLoader._review_timeout_plan(7200, 2)
+    assert long_plan["initial_wait_seconds"] > 3600
+    assert long_plan["initial_wait_timeout_ms"] == 3_600_000
 
 
 def test_research_and_brainstorm_prompts_include_external_research_rules() -> None:
@@ -251,28 +294,6 @@ def test_research_and_brainstorm_prompts_include_external_research_rules() -> No
     assert "~/Code/temp/profile.md" not in brainstorm
 
 
-def test_short_timeout_read_only_prompts_add_exploration_budget() -> None:
-    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
-
-    rendered = loader.render(
-        tool=ToolName.RESEARCH,
-        request=_request(prompt="summarize this", timeout_seconds=60),
-        repo_root=Path("/repo"),
-        sandbox_roots=[Path("/repo")],
-        advisory_read_only_roots=[],
-        model="gpt-5.5",
-        reasoning_effort="medium",
-    )
-
-    assert "Short-timeout mode for this run: yes." in rendered
-    assert "start with at most 2 named files" in rendered
-    assert "read at most 4 additional files" in rendered
-    assert "avoid more than 4 shell commands" in rendered
-    assert "do not open `README.md`, repo-local instruction docs, or large test files" in rendered
-    assert "do not run `git status`, `git diff`, or broad codebase searches by default" in rendered
-    assert "Start from Claude's named files and only widen scope when they are insufficient to answer the question." in rendered
-
-
 def test_validate_prompt_renders_validation_role() -> None:
     loader = PromptLoader(ASSETS_PROMPTS_ROOT)
 
@@ -292,3 +313,94 @@ def test_validate_prompt_renders_validation_role() -> None:
     assert "Edit source files" in rendered
     assert "`completeness`" in rendered
     assert "`next_steps`" in rendered
+
+
+def test_render_prompt_returns_the_subagent_messages_it_embedded() -> None:
+    """Validation must compare against the strings the prompt actually carried.
+
+    Each review child attests a SHA-256 digest of its assignment, and rollout
+    validation recomputes the expected digest from these messages. Deriving
+    them a second time would make any future nondeterminism in rendering fail
+    every multi-agent review with an unhelpful attestation error, so
+    ``render_prompt`` reports exactly what it embedded.
+    """
+    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
+
+    rendered = loader.render_prompt(
+        tool=ToolName.REVIEW,
+        request=_request(
+            prompt="review the runner",
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        ),
+        repo_root=Path("/repo"),
+        sandbox_roots=[Path("/repo")],
+        advisory_read_only_roots=[],
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert set(rendered.review_subagent_messages) == {
+        "dobby_review_correctness",
+        "dobby_review_regression",
+    }
+    for message in rendered.review_subagent_messages.values():
+        assert message in rendered.text
+
+    # render() stays the plain-text convenience wrapper.
+    assert loader.render(
+        tool=ToolName.REVIEW,
+        request=_request(
+            prompt="review the runner",
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        ),
+        repo_root=Path("/repo"),
+        sandbox_roots=[Path("/repo")],
+        advisory_read_only_roots=[],
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    ) == rendered.text
+
+
+def test_render_prompt_reports_no_subagent_messages_for_direct_tools() -> None:
+    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
+
+    rendered = loader.render_prompt(
+        tool=ToolName.PLAN,
+        request=_request(prompt="plan the work"),
+        repo_root=Path("/repo"),
+        sandbox_roots=[Path("/repo")],
+        advisory_read_only_roots=[],
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert rendered.review_subagent_messages == {}
+
+
+def test_timeout_floor_keeps_short_timeout_budgets_unreachable() -> None:
+    """Pins the invariant that let the short-timeout tiers be removed.
+
+    ``InvocationRequest.timeout_seconds`` is validated ``ge=300``, so the old
+    <=90/<=120/<=180 exploration-budget tiers could never render. Their tests
+    only reached them via ``model_construct`` to bypass validation, which
+    asserted behaviour production cannot produce. If the floor is ever lowered,
+    this fails and the tiers should be reintroduced.
+    """
+    field = InvocationRequest.model_fields["timeout_seconds"]
+    floor = next(
+        meta.ge for meta in field.metadata if getattr(meta, "ge", None) is not None
+    )
+    assert floor >= 300
+
+    loader = PromptLoader(ASSETS_PROMPTS_ROOT)
+    for tool in (ToolName.PLAN, ToolName.RESEARCH, ToolName.BRAINSTORM, ToolName.REVIEW):
+        rendered = loader.render(
+            tool=tool,
+            request=InvocationRequest(prompt="do the work", timeout_seconds=floor),
+            repo_root=Path("/repo"),
+            sandbox_roots=[Path("/repo")],
+            advisory_read_only_roots=[],
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+        )
+        assert "Short-timeout mode for this run: `yes`." not in rendered

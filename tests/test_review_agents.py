@@ -17,6 +17,8 @@ def test_shipped_review_agent_files_exist_and_match_registered_names() -> None:
         assert payload["name"] == definition.codex_name
         assert payload["description"] == definition.description
         assert payload["sandbox_mode"] == "read-only"
+        assert payload["features"]["multi_agent_v2"] is False
+        assert payload["agents"]["enabled"] is False
 
 
 def test_review_agents_absorb_domain_specific_guidance() -> None:
