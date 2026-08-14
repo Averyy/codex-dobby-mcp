@@ -431,6 +431,11 @@ class CodexRunner:
             spec.artifacts.output_schema_json,
             self.review_agents_root,
             child_runtime.home_config_path,
+            # The assignments the prompt embedded, delivered to each child
+            # through its own agent definition in the private runtime so the
+            # parent cannot decide what a reviewer reviews.
+            review_assignments=rendered_prompt.review_subagent_assignments,
+            review_agent_config_dir=child_runtime.codex_home / "dobby-agents",
         )
         child_env = child_environment(os.environ, overrides=child_runtime.env_overrides)
 
@@ -1623,9 +1628,24 @@ def _spawn_contract_validation_issues(
 
 
 def _looks_like_opaque_encrypted_message(message: str) -> bool:
-    # Codex 0.147's persisted provider ciphertext is URL-safe base64-like and
-    # currently starts with a Fernet-style `gAAAA`. Do not bind to that prefix:
-    # the provider format may rotate while remaining an opaque single token.
+    """Whether a persisted spawn message is provider ciphertext rather than plaintext.
+
+    Codex 0.147's persisted ciphertext is URL-safe base64-like and currently
+    starts with a Fernet-style `gAAAA`. Deliberately not bound to that prefix:
+    the provider format may rotate while remaining an opaque single token.
+
+    This is a shape check, not proof of encryption. Underscore-separated prose
+    satisfies the same character class, so a parent could in principle present
+    crafted plaintext here and skip the canonical-contract comparison below.
+    Tightening it (entropy floor, required digit, character-class mix) needs a
+    captured *real* ciphertext to calibrate against — the checked-in fixture is
+    sanitized to a placeholder — because a threshold that rejects genuine
+    ciphertext would quarantine valid reviews, which is worse than the bypass
+    it closes. The load-bearing defence is instead that each child now receives
+    its canonical assignment out of band, through the per-run agent definition
+    Dobby writes into the child's private runtime, so a substituted spawn
+    message cannot change what a reviewer reviews.
+    """
     return len(message) >= 128 and re.fullmatch(r"[A-Za-z0-9_=-]+", message) is not None
 
 

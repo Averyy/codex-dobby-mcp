@@ -1,12 +1,18 @@
 from pathlib import Path
+import subprocess
 
 import pytest
+
+import tomllib
 
 from codex_dobby_mcp.codex_cli import (
     _dobby_mcp_disable_overrides,
     _review_mcp_disable_overrides,
+    _toml_string,
     build_codex_command,
 )
+from codex_dobby_mcp.prompts import PromptLoader
+from codex_dobby_mcp.runner import CodexRunner
 from codex_dobby_mcp.models import (
     InvocationRequest,
     ReasoningEffort,
@@ -15,7 +21,10 @@ from codex_dobby_mcp.models import (
     RunArtifacts,
     ToolName,
 )
-from codex_dobby_mcp.review_agents import REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT
+from codex_dobby_mcp.review_agents import (
+    REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
+    review_agents_root,
+)
 
 
 REVIEW_AGENTS_ROOT = Path(__file__).resolve().parents[1] / "src" / "codex_dobby_mcp" / "assets" / "codex_agents"
@@ -490,3 +499,107 @@ def test_review_tool_requires_explicit_agent_assets_root_for_orchestrated(tmp_pa
         assert "explicit review agents root" in str(exc)
     else:
         raise AssertionError("expected RuntimeError when review agent assets root is missing")
+
+
+def test_review_agent_config_carries_the_assignment_out_of_band(tmp_path: Path) -> None:
+    """The child must learn its scope from Dobby, not from the parent.
+
+    The parent relays a spawn message and also holds the SHA-256 each child
+    attests, so attestation alone cannot prove a child received the canonical
+    assignment. Writing the assignment into the per-run agent definition — a
+    file Dobby creates in the child's private runtime and names in argv — means
+    the parent chooses which reviewer starts, not what it reviews.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    assets_root = Path(__file__).resolve().parents[1] / "src" / "codex_dobby_mcp" / "assets"
+    agents_root = review_agents_root(assets_root)
+    agent_config_dir = tmp_path / "child-home" / "dobby-agents"
+
+    loader = PromptLoader(assets_root / "prompts")
+    request = InvocationRequest(
+        prompt="review the parser",
+        agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    assignments = loader.review_subagent_assignments(
+        request=request,
+        repo_root=repo_root,
+        sandbox_roots=[repo_root],
+        advisory_read_only_roots=[],
+        fetchaller_available=False,
+        ghidra_available=False,
+    )
+
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=agents_root,
+    )
+    spec = runner.prepare(ToolName.REVIEW, request)
+    command = build_codex_command(
+        spec,
+        "/usr/bin/codex",
+        spec.artifacts.output_schema_json,
+        agents_root,
+        None,
+        review_assignments=assignments,
+        review_agent_config_dir=agent_config_dir,
+    )
+
+    correctness = assignments["dobby_review_correctness"]
+    written = agent_config_dir / "review-correctness.toml"
+    assert written.exists()
+    # Argv points at the per-run copy, not the packaged asset.
+    assert f"agents.dobby_review_correctness.config_file={_toml_string(str(written))}" in command.argv
+    assert str(agents_root / "review-correctness.toml") not in " ".join(command.argv)
+
+    body = written.read_text(encoding="utf-8")
+    parsed = tomllib.loads(body)
+    instructions = parsed["developer_instructions"]
+    assert correctness.canonical_json in instructions
+    assert correctness.digest in instructions
+    assert "authoritative" in instructions
+    assert "record the discrepancy in warnings" in instructions
+    # Isolation guarantees from the packaged definition survive the rewrite.
+    assert parsed["sandbox_mode"] == "read-only"
+    assert parsed["features"]["multi_agent_v2"] is False
+    assert parsed["agents"]["enabled"] is False
+    assert parsed["name"] == "dobby_review_correctness"
+    # Written into the private runtime with owner-only permissions.
+    assert written.stat().st_mode & 0o777 == 0o600
+
+    # Each lens gets its own assignment, never another lens's.
+    regression = assignments["dobby_review_regression"]
+    assert regression.digest != correctness.digest
+    assert regression.digest not in instructions
+
+
+def test_review_agent_config_falls_back_to_packaged_definition(tmp_path: Path) -> None:
+    """Without assignments (or a target dir) the packaged asset is used as-is."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    assets_root = Path(__file__).resolve().parents[1] / "src" / "codex_dobby_mcp" / "assets"
+    agents_root = review_agents_root(assets_root)
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=agents_root,
+    )
+    spec = runner.prepare(
+        ToolName.REVIEW,
+        InvocationRequest(
+            prompt="review the parser",
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        ),
+    )
+
+    command = build_codex_command(
+        spec, "/usr/bin/codex", spec.artifacts.output_schema_json, agents_root, None
+    )
+
+    packaged = (agents_root / "review-correctness.toml").resolve()
+    assert f"agents.dobby_review_correctness.config_file={_toml_string(str(packaged))}" in command.argv

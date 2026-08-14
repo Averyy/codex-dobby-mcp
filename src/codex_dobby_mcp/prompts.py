@@ -14,6 +14,21 @@ from codex_dobby_mcp.models import (
 from codex_dobby_mcp.review_agents import selected_review_agent_definitions
 
 
+class ReviewAssignment(NamedTuple):
+    """One lens's canonical assignment.
+
+    ``message`` is what the parent is asked to relay. ``canonical_json`` and
+    ``digest`` are the same assignment delivered to the child out of band, via
+    the per-run agent definition Dobby writes into the child's private runtime,
+    so a parent cannot decide what a reviewer actually reviews.
+    """
+
+    task_name: str
+    canonical_json: str
+    digest: str
+    message: str
+
+
 class RenderedPrompt(NamedTuple):
     """A rendered worker prompt plus the canonical messages it embedded.
 
@@ -23,6 +38,7 @@ class RenderedPrompt(NamedTuple):
 
     text: str
     review_subagent_messages: dict[str, str]
+    review_subagent_assignments: dict[str, ReviewAssignment]
 
 
 class PromptLoader:
@@ -81,7 +97,7 @@ class PromptLoader:
         would let any future nondeterminism in rendering fail every
         multi-agent review with an unhelpful attestation error.
         """
-        subagent_messages: dict[str, str] = {}
+        subagent_assignments: dict[str, ReviewAssignment] = {}
         tool_prompt = self.load(f"{tool.value}.md").strip()
         if tool == ToolName.REVIEW:
             selected_agents = selected_review_agent_definitions(request.agents)
@@ -112,7 +128,7 @@ class PromptLoader:
                     agent_count=len(selected_agents),
                     orchestrated=True,
                 )
-                subagent_messages = self.review_subagent_messages(
+                subagent_assignments = self.review_subagent_assignments(
                     request=request,
                     repo_root=repo_root,
                     sandbox_roots=sandbox_roots,
@@ -127,7 +143,10 @@ class PromptLoader:
                     ),
                     review_subagent_jobs=self._render_review_subagent_jobs(
                         request.agents,
-                        subagent_messages,
+                        {
+                            task_name: assignment.message
+                            for task_name, assignment in subagent_assignments.items()
+                        },
                     ),
                     review_timeout_seconds=request.timeout_seconds,
                     review_initial_wait_seconds=timeout_plan["initial_wait_seconds"],
@@ -172,7 +191,11 @@ class PromptLoader:
         )
         return RenderedPrompt(
             text="\n\n".join([tool_prompt, shared_rendered]).strip() + "\n",
-            review_subagent_messages=subagent_messages,
+            review_subagent_messages={
+                task_name: assignment.message
+                for task_name, assignment in subagent_assignments.items()
+            },
+            review_subagent_assignments=subagent_assignments,
         )
 
     @staticmethod
@@ -205,6 +228,28 @@ class PromptLoader:
         fetchaller_available: bool,
         ghidra_available: bool,
     ) -> dict[str, str]:
+        return {
+            task_name: assignment.message
+            for task_name, assignment in self.review_subagent_assignments(
+                request=request,
+                repo_root=repo_root,
+                sandbox_roots=sandbox_roots,
+                advisory_read_only_roots=advisory_read_only_roots,
+                fetchaller_available=fetchaller_available,
+                ghidra_available=ghidra_available,
+            ).items()
+        }
+
+    def review_subagent_assignments(
+        self,
+        *,
+        request: InvocationRequest,
+        repo_root: Path,
+        sandbox_roots: list[Path],
+        advisory_read_only_roots: list[Path],
+        fetchaller_available: bool,
+        ghidra_available: bool,
+    ) -> dict[str, ReviewAssignment]:
         definitions = selected_review_agent_definitions(request.agents)
         if len(definitions) <= 1:
             return {}
@@ -226,7 +271,7 @@ class PromptLoader:
             "timeout_seconds": request.timeout_seconds,
         }
         return {
-            definition.codex_name: self._render_review_subagent_message(
+            definition.codex_name: self._render_review_subagent_assignment(
                 definition,
                 shared_assignment,
                 review_budget,
@@ -235,11 +280,11 @@ class PromptLoader:
         }
 
     @staticmethod
-    def _render_review_subagent_message(
+    def _render_review_subagent_assignment(
         agent,
         shared_assignment: dict[str, object],
         review_budget: dict[str, int | bool],
-    ) -> str:
+    ) -> ReviewAssignment:
         assignment = {
             **shared_assignment,
             "manifest_review_agent": agent.review_agent.value,
@@ -269,7 +314,7 @@ class PromptLoader:
             },
             separators=(",", ":"),
         )
-        return "\n".join(
+        message = "\n".join(
             [
                 f"Required custom agent: {agent.codex_name}",
                 f"Assigned lens: {agent.label}",
@@ -298,6 +343,12 @@ class PromptLoader:
                 "- return only concrete findings, risks, regressions, or missing tests, with file/symbol evidence when possible",
                 "- do not include placeholders, orchestration markers, hidden tokens other than the required Dobby assignment prefix, or meta commentary",
             ]
+        )
+        return ReviewAssignment(
+            task_name=agent.codex_name,
+            canonical_json=canonical_assignment,
+            digest=assignment_digest,
+            message=message,
         )
 
     @staticmethod
