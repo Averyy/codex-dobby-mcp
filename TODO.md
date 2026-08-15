@@ -102,19 +102,19 @@ reviewer reviews.
 
 ### Smaller open items
 
-- `_review_rollout_evidence` still retains every parsed record for the whole
-  call. Streaming removed the text and split-lines copies (roughly 3x to 1x),
-  but peak memory is still proportional to the whole rollout tree.
-- `tests/fixtures/codex-0.147-v2-review` captures only the all-completed case.
-  The never-delivered and partial-failure shapes still rely on the synthetic
-  `_write_review_rollouts` writer, which can drift from real Codex output.
-  Capturing a real partial-failure rollout would close that gap.
-
-- A per-lens integrity failure returns `status: error` while the response still
-  carries other lenses' verified `important_facts`. That content is
-  independently verified, so it is deliberate, but it is worth stating in
-  README alongside the integrity/coverage split.
+- `tests/fixtures/codex-0.147-v2-review` still captures only the all-completed
+  case. A real partial-failure capture would let the never-delivered and
+  spawn-contract paths be checked against genuine Codex output rather than the
+  synthetic writer. Mitigated for now by
+  `test_synthetic_rollout_writer_still_models_the_captured_shape`, which fails
+  if the writer stops modelling any record or field the real capture contains.
 
 - Consider widening the ruff rule selection (import sorting, `UP`, `SIM`,
   `ASYNC`) in a dedicated change. `ASYNC240`/`ASYNC221` report ~130 findings
   that need individual judgement about which blocking calls are deliberate.
+
+- Scope substitution is bound by instruction, not made impossible. The child
+  holds the authoritative assignment and is told to report a conflicting task
+  payload, but a reviewer model persuaded by a crafted payload while still
+  echoing the expected digest would pass every mechanical check. Closing that
+  needs provider-side verification of the delivered plaintext.

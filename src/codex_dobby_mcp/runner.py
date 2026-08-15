@@ -1758,6 +1758,35 @@ def _result_with_verified_assignment_attestation(
     return result.model_copy(update={"summary": summary})
 
 
+# The only record shapes _review_rollout_evidence reads. Everything else in a
+# rollout — reasoning traces, streaming deltas, token counts — is discarded at
+# parse time: it is the bulk of the file and nothing downstream looks at it.
+# Keep this in step with the consumption sites in _review_rollout_evidence.
+_CONSUMED_ROLLOUT_RECORD_TYPES = frozenset({"session_meta", "turn_context"})
+_CONSUMED_ROLLOUT_PAYLOAD_TYPES = {
+    "response_item": frozenset(
+        {"function_call", "function_call_output", "agent_message"}
+    ),
+    "event_msg": frozenset({"sub_agent_activity", "task_complete"}),
+}
+
+
+def _is_consumed_rollout_record(item: dict[str, object]) -> bool:
+    kind = item.get("type")
+    if not isinstance(kind, str):
+        return False
+    if kind in _CONSUMED_ROLLOUT_RECORD_TYPES:
+        return True
+    allowed = _CONSUMED_ROLLOUT_PAYLOAD_TYPES.get(kind)
+    if allowed is None:
+        return False
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    payload_type = payload.get("type")
+    return isinstance(payload_type, str) and payload_type in allowed
+
+
 def _review_rollout_evidence(
     codex_home: Path,
     agents,
@@ -1792,7 +1821,7 @@ def _review_rollout_evidence(
                             f"Codex rollout {rollout_path.name} has invalid JSON on line {line_number}"
                         )
                         continue
-                    if isinstance(item, dict):
+                    if isinstance(item, dict) and _is_consumed_rollout_record(item):
                         items.append(item)
         except OSError as exc:
             read_issues.append(f"could not read Codex rollout {rollout_path.name}: {exc}")
