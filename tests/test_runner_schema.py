@@ -60,6 +60,7 @@ from codex_dobby_mcp.runner import (
     _reverse_engineer_details_for_run,
     _reverse_engineer_failure_details,
     _review_execution_diagnostics,
+    _quarantined_review_worker_result,
     _review_rollout_evidence as _raw_review_rollout_evidence,
     _rollout_validation_issues,
     _response_with_private_runtime_cleanup_failure,
@@ -1754,6 +1755,100 @@ def test_v2_review_execution_manifest_requires_independent_rollout_evidence() ->
     assert diagnostics.validation_issues == (
         "Codex session rollout evidence was not collected",
     )
+
+
+def test_same_result_delivered_through_both_channels_is_one_delivery(
+    tmp_path: Path,
+) -> None:
+    """review.md asks the parent to observe two channels for the same result.
+
+    The child emits a FINAL_ANSWER message and list_agents reports a completed
+    payload. Counting distinct payload *bytes* made a one-byte formatting
+    difference between those copies look like a second delivery — an integrity
+    failure that quarantined a review in which every lens had succeeded.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    # Re-emit the correctness lens's list_agents payload with trailing
+    # whitespace: same result, different bytes.
+    root_rollout = next((codex_home / "sessions").rglob("root.jsonl"))
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") != "function_call_output":
+            continue
+        listed = json.loads(payload["output"])
+        for entry in listed["agents"]:
+            if entry["agent_name"].endswith("correctness"):
+                entry["agent_status"]["completed"] += "\n"
+        payload["output"] = json.dumps(listed)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8"
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    correctness = evidence.by_task_name["dobby_review_correctness"]
+    assert correctness.delivered_count == 1
+    assert correctness.observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+    worker_result = _verified_review_worker_result_from_rollouts(evidence)
+    diagnostics = _review_execution_diagnostics(
+        worker_result,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+    assert diagnostics.validation_issues == ()
+    assert diagnostics.manifest_validated is True
+    assert diagnostics.usable_count == 2
+
+
+def test_two_genuinely_different_delivered_results_still_fail_integrity(
+    tmp_path: Path,
+) -> None:
+    """Semantic counting must not excuse a second, different result."""
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = next((codex_home / "sessions").rglob("root.jsonl"))
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") != "function_call_output":
+            continue
+        listed = json.loads(payload["output"])
+        for entry in listed["agents"]:
+            if entry["agent_name"].endswith("correctness"):
+                swapped = json.loads(entry["agent_status"]["completed"])
+                swapped["important_facts"] = ["a different finding entirely"]
+                entry["agent_status"]["completed"] = json.dumps(swapped)
+        payload["output"] = json.dumps(listed)
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8"
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    correctness = evidence.by_task_name["dobby_review_correctness"]
+    assert correctness.observed_status == ReviewAgentExecutionStatus.FAILED
+    assert correctness.child_result is None
 
 
 def test_v2_review_partial_coverage_survives_a_lens_that_never_delivered(
@@ -6673,3 +6768,128 @@ def test_codex_home_warning_ignores_output_of_commands_the_child_ran() -> None:
         }
     )
     assert _codex_home_permission_issue([], stdout=non_command) is not None
+
+
+def test_quarantine_reports_the_real_global_evidence_failure() -> None:
+    """The quarantine substitutes a manifest-less result and recomputes.
+
+    That early-returned with only "omitted the required review_execution
+    manifest", discarding the actual tamper alarm — a nested child session, a
+    root that never proved v2 — and the rollouts proving it are deleted with
+    the private runtime moments later.
+    """
+    evidence = ReviewRolloutEvidence(
+        collected=True,
+        agents=(),
+        validation_issues=(
+            "unexpected or nested v2 child sessions: /root/interloper",
+        ),
+    )
+
+    diagnostics = _review_execution_diagnostics(
+        _quarantined_review_worker_result(),
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        evidence,
+    )
+
+    assert diagnostics.manifest_validated is False
+    assert any(
+        "nested v2 child sessions" in issue
+        for issue in diagnostics.validation_issues
+    ), diagnostics.validation_issues
+    assert "nested v2 child sessions" in diagnostics.failure_summary()
+
+
+@pytest.mark.asyncio
+async def test_runner_wires_out_of_band_assignments_into_the_private_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the production wiring of out-of-band assignment delivery.
+
+    Review tests monkeypatch _review_rollout_evidence wholesale, so passing an
+    empty assignment mapping, or writing the per-run agent definitions into the
+    repository instead of the auto-deleted private runtime, both left the suite
+    green. The second would persist the caller's task prompt, files and context
+    under .codex-dobby/runs/<id>/ inside a directory mounted for the child.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+
+    captured: dict = {}
+    real_build = runner_module.build_codex_command
+
+    def capturing_build(*args, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return real_build(*args, **kwargs)
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
+            return (b"", b"")
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def fake_exec(*args, **kwargs):  # type: ignore[no-untyped-def]
+        Path(args[args.index("--output-last-message") + 1]).write_text(
+            json.dumps(
+                {
+                    "summary": "s",
+                    "completeness": "blocked",
+                    "important_facts": [],
+                    "next_steps": [],
+                    "files_changed": [],
+                    "warnings": [],
+                    "refused": False,
+                    "file_diffs": [],
+                    "review_execution": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    async def fake_v2_available(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.build_codex_command", capturing_build)
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        "codex_dobby_mcp.runner._ensure_multi_agent_v2_available", fake_v2_available
+    )
+
+    await runner.run(
+        ToolName.REVIEW,
+        InvocationRequest(
+            prompt="review it",
+            repo_root=str(repo_root),
+            agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        ),
+    )
+
+    assignments = captured.get("review_assignments")
+    assert assignments, "runner passed no assignments; out-of-band delivery is disabled"
+    assert set(assignments) == {"dobby_review_correctness", "dobby_review_regression"}
+    for assignment in assignments.values():
+        assert assignment.message.strip(), "assignment message is empty"
+        assert assignment.digest in assignment.message
+
+    config_dir = captured.get("review_agent_config_dir")
+    assert config_dir is not None
+    # Must live in the private runtime, which is deleted with the run — never
+    # in the repository, where it would persist the caller's prompt and context.
+    assert ".codex-dobby" not in str(config_dir), config_dir
+    assert not str(config_dir).startswith(str(repo_root)), config_dir
+    assert config_dir.name == "dobby-agents"

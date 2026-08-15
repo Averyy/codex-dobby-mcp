@@ -678,3 +678,95 @@ async def test_background_failure_keeps_the_runner_cleanup_warnings(
     assert persisted["status"] == "error"
     assert any(leak in warning for warning in persisted["warnings"])
     assert any("codex exploded" in warning for warning in persisted["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_cancelled_background_run_does_not_report_the_pre_run_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stub written before a run starts is not a finding.
+
+    run_resolved seeds result.json with a placeholder and the cancel path
+    deliberately leaves it, so folding any error artifact in reported "Dobby was
+    cancelled or killed … the normal completion path would have overwritten
+    this file" as a warning on a final result.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+    manager = BackgroundRunManager(runner)
+
+    async def cancel_mid_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", cancel_mid_run)
+
+    spec = runner.prepare(
+        ToolName.PLAN, InvocationRequest(prompt="inspect", repo_root=str(repo_root))
+    )
+    handle = manager.start(spec)
+    await manager.wait(repo_root, None, [handle.task_id], 30.0)
+
+    persisted = json.loads(
+        (repo_root / ".codex-dobby" / "runs" / handle.task_id / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert not any(
+        "cancelled or killed" in warning for warning in persisted["warnings"]
+    ), persisted["warnings"]
+    assert not any(
+        "would have overwritten this file" in warning
+        for warning in persisted["warnings"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_failure_reports_the_cause_once_and_keeps_duration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two layers word the same exception differently, so dedupe missed it."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    project_root = Path(__file__).resolve().parents[1]
+    assets_root = project_root / "src" / "codex_dobby_mcp" / "assets"
+    runner = CodexRunner(
+        spawn_root=repo_root,
+        prompts_root=assets_root / "prompts",
+        worker_schema_path=assets_root / "schemas" / "worker-output.schema.json",
+        review_agents_root=review_agents_root(assets_root),
+    )
+    manager = BackgroundRunManager(runner)
+
+    async def boom(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("codex exploded")
+
+    monkeypatch.setattr("codex_dobby_mcp.runner.asyncio.create_subprocess_exec", boom)
+
+    spec = runner.prepare(
+        ToolName.PLAN, InvocationRequest(prompt="inspect", repo_root=str(repo_root))
+    )
+    handle = manager.start(spec)
+    await manager.wait(repo_root, None, [handle.task_id], 30.0)
+
+    persisted = json.loads(
+        (repo_root / ".codex-dobby" / "runs" / handle.task_id / "result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    mentions = [w for w in persisted["warnings"] if "codex exploded" in w]
+    assert len(mentions) == 1, persisted["warnings"]
+    assert persisted["duration_ms"] is not None

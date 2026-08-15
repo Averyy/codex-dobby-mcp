@@ -209,3 +209,39 @@ def test_gitignore_refuses_symlink_without_o_nofollow(tmp_path: Path) -> None:
             ensure_codex_dobby_ignored(tmp_path)
     finally:
         monkeypatch.undo()
+
+
+def test_gitignore_readonly_but_already_correct_is_not_an_error(tmp_path: Path) -> None:
+    """Opening for write before checking need turned a no-op into a failed run.
+
+    A read-only .gitignore that already lists the entry aborted build, validate
+    and reverse_engineer with a raw PermissionError.
+    """
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(".codex-dobby/\n", encoding="utf-8")
+    gitignore.chmod(0o444)
+    try:
+        assert ensure_codex_dobby_ignored(tmp_path) is False
+    finally:
+        gitignore.chmod(0o644)
+
+
+def test_gitignore_readonly_and_missing_entry_reports_a_clear_cause(
+    tmp_path: Path,
+) -> None:
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("coverage-html/\n", encoding="utf-8")
+    gitignore.chmod(0o444)
+    try:
+        with pytest.raises(PathResolutionError, match="not writable"):
+            ensure_codex_dobby_ignored(tmp_path)
+    finally:
+        gitignore.chmod(0o644)
+
+
+def test_gitignore_rejects_non_utf8_with_a_named_cause(tmp_path: Path) -> None:
+    """A raw UnicodeDecodeError escapes prepare() with no run directory."""
+    (tmp_path / ".gitignore").write_bytes(b"\xff\xfe binary junk\n")
+
+    with pytest.raises(PathResolutionError, match="not valid UTF-8"):
+        ensure_codex_dobby_ignored(tmp_path)

@@ -15,6 +15,25 @@ from codex_dobby_mcp.paths import PathResolutionError
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
+def _entry_present(text: str) -> bool:
+    # rstrip, not strip: leading whitespace is significant in a gitignore
+    # pattern, so " .codex-dobby/" does not ignore the directory and must not
+    # be mistaken for an entry that does.
+    return any(
+        line.rstrip()
+        in {CODEX_DOBBY_GITIGNORE_ENTRY, CODEX_DOBBY_GITIGNORE_ENTRY.rstrip("/")}
+        for line in text.split("\n")
+    )
+
+
+def _already_ignored(gitignore_path: Path) -> bool:
+    """Whether the entry is present, reading only. Used when writing is denied."""
+    try:
+        return _entry_present(gitignore_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def ensure_codex_dobby_ignored(repo_root: Path) -> bool:
     """Append Dobby's ignore entry, refusing symlinked or multiply-linked files.
 
@@ -51,6 +70,16 @@ def ensure_codex_dobby_ignored(repo_root: Path) -> bool:
             raise PathResolutionError(
                 f".gitignore is not a regular file: {gitignore_path}"
             ) from exc
+        if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+            # Opening for write before checking whether anything needs writing
+            # would fail a run whose .gitignore is read-only but already
+            # correct. Fall back to a read to answer that.
+            if _already_ignored(gitignore_path):
+                return False
+            raise PathResolutionError(
+                f"Cannot update .gitignore to ignore {CODEX_DOBBY_GITIGNORE_ENTRY}: "
+                f"{gitignore_path} is not writable"
+            ) from exc
         raise
 
     with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
@@ -64,15 +93,15 @@ def ensure_codex_dobby_ignored(repo_root: Path) -> bool:
                 f"Refusing to update multiply-linked .gitignore: {gitignore_path}"
             )
 
-        existing = handle.read()
-        # rstrip, not strip: leading whitespace is significant in a gitignore
-        # pattern, so " .codex-dobby/" does not ignore the directory and must
-        # not be mistaken for an entry that does.
-        if any(
-            line.rstrip()
-            in {CODEX_DOBBY_GITIGNORE_ENTRY, CODEX_DOBBY_GITIGNORE_ENTRY.rstrip("/")}
-            for line in existing.split("\n")
-        ):
+        try:
+            existing = handle.read()
+        except UnicodeDecodeError as exc:
+            # A raw ValueError here escapes prepare() as an opaque failure with
+            # no run directory; name the cause instead.
+            raise PathResolutionError(
+                f".gitignore is not valid UTF-8: {gitignore_path}"
+            ) from exc
+        if _entry_present(existing):
             return False
 
         # Decided from the raw text, not splitlines(): a file ending in exactly

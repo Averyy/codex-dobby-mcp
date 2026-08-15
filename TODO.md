@@ -54,7 +54,8 @@ regression test verified to fail when its fix is reverted:
 
 - Partial coverage survives a lens that never delivered. `_rollout_validation_issues`
   now returns `RolloutIssues(integrity, coverage)`; only integrity failures
-  quarantine the review. Spawn-contract violations (wrong `agent_type`, a
+  exclude that lens and set `manifest_validated: false`; only a global evidence
+  failure returns nothing at all. Spawn-contract violations (wrong `agent_type`, a
   `fork_turns` other than `none`, mismatched fields, unexpected encrypted
   argument shape) stay integrity; only assignment-attestation failure and plain
   non-delivery are coverage.

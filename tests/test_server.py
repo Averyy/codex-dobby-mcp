@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -319,3 +320,71 @@ def test_configure_logging_keeps_a_level_set_before_any_handler_exists() -> None
         for handler in original_handlers:
             root.addHandler(handler)
         root.setLevel(original_level)
+
+
+def test_progress_token_is_read_with_the_sdk_2x_snake_case_key() -> None:
+    """SDK 2.x request _meta is a TypedDict keyed progress_token, not a model.
+
+    Reading progressToken instead returns None for every client and silently
+    disables streaming progress. Nothing else in the suite executes this path,
+    so without this the rename is invisible.
+    """
+    from types import SimpleNamespace
+
+    from codex_dobby_mcp.server import _progress_token_from_ctx
+
+    ctx = SimpleNamespace(
+        _request_context=object(),
+        request_context=SimpleNamespace(meta={"progress_token": "tok-1"}),
+    )
+    assert _progress_token_from_ctx(ctx) == "tok-1"
+
+    # A camelCase-only meta must not be mistaken for a token.
+    camel = SimpleNamespace(
+        _request_context=object(),
+        request_context=SimpleNamespace(meta={"progressToken": "tok-1"}),
+    )
+    assert _progress_token_from_ctx(camel) is None
+
+    assert _progress_token_from_ctx(None) is None
+    absent = SimpleNamespace(
+        _request_context=object(), request_context=SimpleNamespace(meta=None)
+    )
+    assert _progress_token_from_ctx(absent) is None
+
+
+def test_event_sink_is_built_only_when_the_caller_asked_for_progress() -> None:
+    from types import SimpleNamespace
+
+    from codex_dobby_mcp.server import _build_event_sink
+
+    assert _build_event_sink(None) is None
+    no_token = SimpleNamespace(
+        _request_context=object(), request_context=SimpleNamespace(meta=None)
+    )
+    assert _build_event_sink(no_token) is None
+
+    sent: list = []
+
+    class _Session:
+        async def send_notification(self, notification):  # type: ignore[no-untyped-def]
+            sent.append(notification)
+
+    with_token = SimpleNamespace(
+        _request_context=object(),
+        request_context=SimpleNamespace(
+            meta={"progress_token": "tok-2"}, session=_Session()
+        ),
+    )
+    sink = _build_event_sink(with_token)
+    assert sink is not None
+
+    asyncio.run(sink({"type": "tool_call", "title": "rg TODO"}, 1))
+
+    assert len(sent) == 1
+    params = sent[0].params
+    assert params.progress_token == "tok-2"
+    assert params.progress == 1.0
+    assert params.message == "rg TODO"
+    # _meta.acpEvent is a client-visible contract.
+    assert params.meta["acpEvent"] == {"type": "tool_call", "title": "rg TODO"}

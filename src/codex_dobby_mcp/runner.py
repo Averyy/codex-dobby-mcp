@@ -609,6 +609,15 @@ class CodexRunner:
             # Global rollout failures break the evidence chain for every child.
             # Do not leak parent-authored or partially parsed child prose through
             # fields that callers may consume even when status=error.
+            # Log first: the rollouts that prove the cause are deleted with the
+            # private runtime moments from now, so this is the only durable
+            # record beyond the response itself.
+            self.logger.warning(
+                "Review evidence chain failed globally for %s: %s",
+                spec.artifacts.run_dir.name,
+                "; ".join(review_rollout_evidence.validation_issues)
+                or "rollout evidence was not collected",
+            )
             worker_result = _quarantined_review_worker_result()
             review_execution_diagnostics = _review_execution_diagnostics(
                 worker_result,
@@ -2100,14 +2109,27 @@ def _review_rollout_evidence(
                     if child_result is not None:
                         child_results.append(child_result)
 
-        delivered_child_results = list(delivered_results.get(agent_path, {}).values())
-        final_delivery_count = len(delivered_payloads.get(agent_path, set()))
+        # Count distinct *results*, not distinct payload bytes. review.md asks
+        # the parent to observe both the child's FINAL_ANSWER message and the
+        # completed payload from list_agents, so the same result legitimately
+        # arrives twice. A one-byte formatting difference between those two
+        # copies used to read as a second delivery, which is an integrity
+        # failure, and quarantined a review in which every lens had succeeded.
+        # Payloads that did not parse stay counted individually: an unreadable
+        # delivery is not evidence of the same result.
+        delivered_result_map = delivered_results.get(agent_path, {})
+        distinct_delivered = {
+            result.model_dump_json() for result in delivered_result_map.values()
+        }
+        unparsed_deliveries = len(
+            delivered_payloads.get(agent_path, set())
+        ) - len(delivered_result_map)
+        final_delivery_count = len(distinct_delivered) + max(0, unparsed_deliveries)
         matched_child_result = (
             child_results[0]
             if len(child_results) == 1
             and final_delivery_count == 1
-            and len(delivered_child_results) == 1
-            and child_results[0] == delivered_child_results[0]
+            and child_results[0].model_dump_json() in distinct_delivered
             else None
         )
         expected_digest = _assignment_digest_from_message(
@@ -2466,6 +2488,17 @@ def _review_execution_diagnostics(
     }
     manifest = worker_result.review_execution if worker_result is not None else None
     if manifest is None:
+        # Keep the rollout-level reasons. The quarantine path substitutes a
+        # result whose review_execution is None and then recomputes diagnostics
+        # here, so returning only "omitted the manifest" replaced the actual
+        # cause — an unexpected nested child session, a root that never proved
+        # v2 mode — with a generic message, and the rollouts that proved it are
+        # deleted with the private runtime moments later.
+        global_issues = (
+            tuple(rollout_evidence.validation_issues)
+            if rollout_evidence is not None
+            else ()
+        )
         return ReviewExecutionDiagnostics(
             expected_agents=tuple(expected_by_agent),
             manifest=None,
@@ -2474,7 +2507,10 @@ def _review_execution_diagnostics(
                 if rollout_evidence is not None and rollout_evidence.collected
                 else None
             ),
-            validation_issues=("worker result omitted the required review_execution manifest",),
+            validation_issues=(
+                *global_issues,
+                "worker result omitted the required review_execution manifest",
+            ),
             completed_count=0,
             partial_count=0,
             blocked_count=0,

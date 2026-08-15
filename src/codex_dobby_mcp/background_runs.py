@@ -508,6 +508,12 @@ class BackgroundRunManager:
             or persisted.get("status") != RunStatus.ERROR.value
         ):
             return response
+        if persisted.get("result_state") == ResultArtifactState.PLACEHOLDER.value:
+            # run_resolved seeds this stub before the run starts and the cancel
+            # path deliberately leaves it. Folding it in reported "Dobby was
+            # cancelled or killed … the normal completion path would have
+            # overwritten this file" as a warning on a final result.
+            return response
 
         carried: list[str] = []
         summary = persisted.get("summary")
@@ -517,13 +523,28 @@ class BackgroundRunManager:
             if isinstance(warning, str) and warning.strip():
                 carried.append(warning.strip())
 
-        merged = list(response.warnings)
+        # The runner's artifact is authoritative for a failed run: it names the
+        # exception type and carries any runtime-cleanup warnings. This layer's
+        # only warning is a restatement of its own summary, worded differently
+        # ("Background run failed: X" vs "RuntimeError: X"), so keeping both
+        # reported the same exception twice on every failure. Take the runner's
+        # and let this layer's phrasing survive as the summary.
+        merged: list[str] = []
         for entry in carried:
             if entry not in merged:
                 merged.append(entry)
-        if merged == list(response.warnings):
+
+        update: dict = {}
+        if merged != list(response.warnings):
+            update["warnings"] = merged
+        # Carry measurements the runner recorded; rebuilding the response from
+        # scratch discarded them.
+        duration = persisted.get("duration_ms")
+        if isinstance(duration, int) and response.duration_ms in (None, 0):
+            update["duration_ms"] = duration
+        if not update:
             return response
-        return response.model_copy(update={"warnings": merged})
+        return response.model_copy(update=update)
 
     def _background_failure_response(
         self,
