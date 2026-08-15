@@ -2646,6 +2646,33 @@ def _sandbox_violation_from_line(line: str, *, allow_plain_text: bool) -> str | 
     return None
 
 
+def _diagnostic_stdout_lines(stdout: str) -> list[str]:
+    """Codex's own stdout diagnostics, excluding output of commands it ran.
+
+    ``validate`` and ``build`` exist to run commands, and the JSONL stream
+    carries whatever those commands printed inside ``command_execution``
+    events. Treating that as Dobby's own diagnostics reports the child's log
+    text as a Dobby fault: a project whose test output happens to contain
+    "permission denied" near "session files" got a warning claiming its Codex
+    home was unreadable, which is both false and alarming.
+    """
+    lines: list[str] = []
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            lines.append(line)
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if isinstance(item, dict) and item.get("type") == "command_execution":
+            continue
+        lines.append(line)
+    return lines
+
+
 def _codex_home_permission_issue(
     sandbox_violations: list[str],
     *,
@@ -2654,7 +2681,7 @@ def _codex_home_permission_issue(
 ) -> str | None:
     candidates = list(sandbox_violations)
     candidates.extend(line.strip() for line in stderr.splitlines() if line.strip())
-    candidates.extend(line.strip() for line in stdout.splitlines() if line.strip())
+    candidates.extend(_diagnostic_stdout_lines(stdout))
 
     for candidate in candidates:
         normalized = " ".join(candidate.split())

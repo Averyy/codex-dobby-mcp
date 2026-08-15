@@ -19,7 +19,7 @@ from codex_dobby_mcp.review_agents import (
 @dataclass(frozen=True)
 class CodexCommand:
     argv: list[str]
-    uses_full_auto: bool
+    uses_workspace_write: bool
     sandbox_mode: str
     emits_json_events: bool
 
@@ -90,7 +90,7 @@ def build_codex_command(
             argv.extend(["--add-dir", str(extra_root)])
         return CodexCommand(
             argv=argv + ["-"],
-            uses_full_auto=False,
+            uses_workspace_write=False,
             sandbox_mode="read-only",
             emits_json_events=True,
         )
@@ -98,11 +98,15 @@ def build_codex_command(
     if spec.request.danger:
         argv.extend(["-s", "danger-full-access"])
         sandbox_mode = "danger-full-access"
-        uses_full_auto = False
+        uses_workspace_write = False
     else:
-        argv.append("--full-auto")
+        # Not --full-auto: codex-cli removed that flag, and passing it makes
+        # every mutating run die instantly with "unexpected argument". The
+        # approval policy is already pinned to never above, so selecting the
+        # workspace-write sandbox is what --full-auto used to mean here.
+        argv.extend(["-s", "workspace-write"])
         sandbox_mode = "workspace-write"
-        uses_full_auto = True
+        uses_workspace_write = True
         if spec.tool == ToolName.REVERSE_ENGINEER:
             for override in _reverse_engineer_network_overrides(spec):
                 argv.extend(["-c", override])
@@ -113,7 +117,7 @@ def build_codex_command(
 
     return CodexCommand(
         argv=argv + ["-"],
-        uses_full_auto=uses_full_auto,
+        uses_workspace_write=uses_workspace_write,
         sandbox_mode=sandbox_mode,
         emits_json_events=True,
     )

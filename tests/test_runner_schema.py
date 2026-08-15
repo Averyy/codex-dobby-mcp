@@ -6628,3 +6628,48 @@ async def test_cancelled_run_still_reports_a_private_runtime_cleanup_failure(
     assert any("copied credentials" in warning for warning in persisted["warnings"])
     # Not misreported as a sandbox violation.
     assert persisted["sandbox_violations"] == []
+
+
+def test_codex_home_warning_ignores_output_of_commands_the_child_ran() -> None:
+    """A validate/build child's captured command output is not Dobby's diagnostics.
+
+    Those tools exist to run commands, and the JSONL stream carries whatever
+    those commands printed. Scanning it for Codex-home permission problems
+    reported a project's own log text as a Dobby fault.
+    """
+    child_command_output = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "command_execution",
+                "command": "/bin/zsh -lc 'pytest -q'",
+                "aggregated_output": (
+                    "codex cannot access session files at /users/x/.codex/sessions "
+                    "(permission denied)"
+                ),
+            },
+        }
+    )
+
+    assert _codex_home_permission_issue([], stdout=child_command_output) is None
+
+    # A genuine Codex diagnostic on stderr is still reported.
+    genuine = _codex_home_permission_issue(
+        [],
+        stderr="codex cannot access session files at /users/x/.codex/sessions (permission denied)",
+    )
+    assert genuine is not None
+    assert "could not access" in genuine
+
+    # And a non-command event on stdout is still scanned.
+    non_command = json.dumps(
+        {
+            "type": "error",
+            "message": (
+                "codex cannot access session files at /users/x/.codex/sessions "
+                "(permission denied)"
+            ),
+        }
+    )
+    assert _codex_home_permission_issue([], stdout=non_command) is not None

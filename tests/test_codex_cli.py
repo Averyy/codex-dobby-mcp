@@ -97,16 +97,16 @@ def test_read_only_tool_maps_to_read_only_sandbox(tmp_path: Path) -> None:
     )
 
     assert command.sandbox_mode == "read-only"
-    assert command.uses_full_auto is False
+    assert command.uses_workspace_write is False
     assert command.emits_json_events is True
-    assert "--full-auto" not in command.argv
+    assert "--full-auto" not in command.argv  # removed from codex-cli
     assert ["-s", "read-only"] == command.argv[command.argv.index("-s") : command.argv.index("-s") + 2]
     add_dirs = [Path(command.argv[index + 1]) for index, value in enumerate(command.argv) if value == "--add-dir"]
     assert add_dirs == [spec.artifacts.run_dir, spec.sandbox_roots[1]]
     assert command.argv[-1] == "-"
 
 
-def test_validate_tool_maps_to_full_auto_sandbox(tmp_path: Path) -> None:
+def test_validate_tool_maps_to_workspace_write_sandbox(tmp_path: Path) -> None:
     spec = make_spec(tmp_path, ToolName.VALIDATE)
 
     command = build_codex_command(
@@ -117,9 +117,8 @@ def test_validate_tool_maps_to_full_auto_sandbox(tmp_path: Path) -> None:
     )
 
     assert command.sandbox_mode == "workspace-write"
-    assert command.uses_full_auto is True
-    assert "--full-auto" in command.argv
-    assert "-s" not in command.argv
+    assert command.uses_workspace_write is True
+    assert command.argv[command.argv.index("-s") + 1] == "workspace-write"
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
     assert "sandbox_workspace_write.network_access=true" not in config_values
 
@@ -155,9 +154,9 @@ def test_build_tool_maps_to_full_auto_and_extra_roots(tmp_path: Path) -> None:
     )
 
     assert command.sandbox_mode == "workspace-write"
-    assert command.uses_full_auto is True
+    assert command.uses_workspace_write is True
     assert command.emits_json_events is True
-    assert "--full-auto" in command.argv
+    assert command.argv[command.argv.index("-s") + 1] == "workspace-write"
     assert "--add-dir" in command.argv
     assert "approval_policy=\"never\"" in command.argv
 
@@ -173,9 +172,9 @@ def test_danger_mode_maps_to_danger_full_access(tmp_path: Path) -> None:
     )
 
     assert command.sandbox_mode == "danger-full-access"
-    assert command.uses_full_auto is False
+    assert command.uses_workspace_write is False
     assert command.emits_json_events is True
-    assert "--full-auto" not in command.argv
+    assert "--full-auto" not in command.argv  # removed from codex-cli
     assert ["-s", "danger-full-access"] == command.argv[command.argv.index("-s") : command.argv.index("-s") + 2]
 
 
@@ -192,8 +191,8 @@ def test_reverse_engineer_tool_without_live_socket_root_does_not_enable_network_
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
     assert command.sandbox_mode == "workspace-write"
-    assert command.uses_full_auto is True
-    assert "--full-auto" in command.argv
+    assert command.uses_workspace_write is True
+    assert command.argv[command.argv.index("-s") + 1] == "workspace-write"
     assert "sandbox_workspace_write.network_access=true" not in config_values
     assert not any(value.startswith("network.allow_unix_sockets=") for value in config_values)
 
@@ -218,8 +217,8 @@ def test_reverse_engineer_tool_enables_unix_socket_network_access_when_live_sock
     config_values = [command.argv[index + 1] for index, value in enumerate(command.argv) if value == "-c"]
 
     assert command.sandbox_mode == "workspace-write"
-    assert command.uses_full_auto is True
-    assert "--full-auto" in command.argv
+    assert command.uses_workspace_write is True
+    assert command.argv[command.argv.index("-s") + 1] == "workspace-write"
     assert "sandbox_workspace_write.network_access=true" in config_values
     assert f'network.allow_unix_sockets=["{socket_root}"]' in config_values
 
