@@ -4,6 +4,25 @@ import tempfile
 
 import pytest
 
+from codex_dobby_mcp.models import RECURSION_GUARD_ENV
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_recursion_guard(monkeypatch: pytest.MonkeyPatch):
+    """Let the suite run inside a Dobby worker.
+
+    ``ensure_not_recursive`` reads the ambient environment, so running these
+    tests inside a Dobby child — exactly what ``validate`` on this repository
+    does — made every test that drives a runner fail with RecursionGuardError.
+    Seventy failures that say nothing about the code under test.
+
+    Running the suite is not a nested Dobby invocation, and the guard's own
+    behaviour is covered by passing explicit environments to
+    ``ensure_not_recursive`` and ``child_environment``, so clearing the
+    inherited variable costs no coverage.
+    """
+    monkeypatch.delenv(RECURSION_GUARD_ENV, raising=False)
+
 
 @pytest.fixture(autouse=True)
 def _contained_private_runtime_root(
