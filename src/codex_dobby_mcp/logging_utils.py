@@ -7,13 +7,24 @@ import sys
 LOGGER_NAME = "codex_dobby_mcp"
 
 
-def configure_logging(level: int = logging.INFO) -> logging.Logger:
+def configure_logging(level: int | None = None) -> logging.Logger:
+    """Attach Dobby's stderr handler, and set the level only when asked.
+
+    ``level=None`` means "ensure logging is configured, leave the level alone".
+    ``get_logger`` calls it that way on every lookup, so passing a default here
+    would reset an explicitly configured level: a caller that asked for DEBUG
+    lost it the next time any module fetched a logger, which is at runner
+    construction, making debug output impossible to keep on.
+    """
     logger = logging.getLogger(LOGGER_NAME)
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logger.addHandler(handler)
-    logger.setLevel(level)
+        if level is None:
+            level = logging.INFO
+    if level is not None:
+        logger.setLevel(level)
     logger.propagate = False
     return logger
 

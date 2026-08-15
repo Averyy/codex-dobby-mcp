@@ -264,3 +264,29 @@ def test_every_tool_publishes_that_it_rejects_unknown_arguments() -> None:
         # Hardening must not disturb the published argument surface.
         assert "repo_root" in tool.parameters["properties"], tool.name
         assert "ctx" not in tool.parameters["properties"], tool.name
+
+
+def test_get_logger_does_not_reset_an_explicitly_configured_level() -> None:
+    """Fetching a logger must not silently turn debug logging back off.
+
+    get_logger() runs at runner construction, so a configure_logging(DEBUG) that
+    got reset to INFO on the next lookup made debug output impossible to keep on.
+    """
+    import logging
+
+    from codex_dobby_mcp.logging_utils import configure_logging, get_logger
+
+    root = logging.getLogger("codex_dobby_mcp")
+    original_level = root.level
+    try:
+        configure_logging(logging.DEBUG)
+        assert root.level == logging.DEBUG
+
+        get_logger("runner")
+        assert root.level == logging.DEBUG, "get_logger reset the configured level"
+
+        # An explicit call still changes it.
+        configure_logging(logging.WARNING)
+        assert root.level == logging.WARNING
+    finally:
+        root.setLevel(original_level)
