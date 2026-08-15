@@ -924,6 +924,12 @@ def test_only_the_per_run_copy_claims_an_embedded_assignment(tmp_path: Path) -> 
         instructions = body["developer_instructions"]
         assert claim not in instructions, packaged.name
         assert "canonical assignment JSON" not in instructions, packaged.name
+        # Nor may they *require* a prefix that only the per-run copy supplies:
+        # direct single-lens review renders these same instructions with no
+        # payload at all, and a reviewer told to follow a missing instruction
+        # spends a caller-visible warning reporting that it is missing.
+        assert "summary-prefix instruction" not in instructions, packaged.name
+        assert "Begin summary exactly with" not in instructions, packaged.name
 
     written = _write_assigned_agent_config(
         REVIEW_AGENTS_ROOT / "review-correctness.toml",
@@ -938,6 +944,8 @@ def test_only_the_per_run_copy_claims_an_embedded_assignment(tmp_path: Path) -> 
     assigned = tomllib.loads(written.read_text(encoding="utf-8"))["developer_instructions"]
     assert claim in assigned
     assert "record the discrepancy in warnings" in assigned
+    # The per-run copy is where the prefix requirement belongs.
+    assert "Begin summary exactly with" in assigned
 
 
 @pytest.mark.parametrize("codepoint", [0xD800, 0xDBFF, 0xDC00, 0xDFFF])
