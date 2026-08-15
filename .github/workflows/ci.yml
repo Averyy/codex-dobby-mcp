@@ -10,10 +10,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # macos-latest is the platform Dobby targets: the default codex binary
+        # path is Homebrew's, and the child sandbox is Seatbelt. Linux stays in
+        # the matrix because it is cheap and catches path assumptions early.
+        os: [macos-latest, ubuntu-latest]
         python-version: ["3.12", "3.13", "3.14"]
 
     steps:
@@ -32,7 +36,7 @@ jobs:
         run: uv run pytest
 
       - name: Build distributions
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.12' && matrix.os == 'macos-latest'
         run: uv build
 
   test-latest-dependencies:

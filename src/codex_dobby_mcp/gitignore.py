@@ -9,8 +9,9 @@ from codex_dobby_mcp.models import CODEX_DOBBY_GITIGNORE_ENTRY
 from codex_dobby_mcp.paths import PathResolutionError
 
 
-# Absent on Windows, where os.open cannot refuse a final-component symlink.
-# The pre-check below covers that platform instead.
+# Present on macOS and Linux, the platforms Dobby supports. Kept as a lookup
+# with a pre-check fallback so a platform without it degrades to a racy check
+# rather than an AttributeError that would break every mutating run.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
