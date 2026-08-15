@@ -105,3 +105,107 @@ def test_gitignore_rejects_a_directory(tmp_path: Path) -> None:
 
     with pytest.raises(PathResolutionError, match="not a regular file"):
         ensure_codex_dobby_ignored(tmp_path)
+
+
+def test_gitignore_append_does_not_insert_a_blank_line(tmp_path: Path) -> None:
+    """A file already ending in one newline is terminated; do not add another."""
+    (tmp_path / ".gitignore").write_text("target/\n", encoding="utf-8")
+
+    assert ensure_codex_dobby_ignored(tmp_path) is True
+
+    assert (tmp_path / ".gitignore").read_text(encoding="utf-8") == (
+        "target/\n.codex-dobby/\n"
+    )
+
+
+def test_gitignore_append_terminates_a_file_without_a_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".gitignore").write_text("target/", encoding="utf-8")
+
+    assert ensure_codex_dobby_ignored(tmp_path) is True
+
+    assert (tmp_path / ".gitignore").read_text(encoding="utf-8") == (
+        "target/\n.codex-dobby/\n"
+    )
+
+
+def test_gitignore_does_not_accept_an_indented_pattern_as_the_entry(
+    tmp_path: Path,
+) -> None:
+    """Leading whitespace is significant, so ` .codex-dobby/` ignores nothing."""
+    (tmp_path / ".gitignore").write_text(" .codex-dobby/\n", encoding="utf-8")
+
+    assert ensure_codex_dobby_ignored(tmp_path) is True
+
+    contents = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+    assert contents == " .codex-dobby/\n.codex-dobby/\n"
+
+
+def test_gitignore_append_survives_a_concurrent_append(tmp_path: Path) -> None:
+    """Another process appending must not be overwritten.
+
+    Positioning at end of file and then writing can be overtaken by a
+    concurrent append; O_APPEND makes each write land atomically at the real
+    end, and .gitignore is shared with the user's own tooling.
+    """
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("target/\n", encoding="utf-8")
+
+    real_open = os.open
+    seen_flags: list[int] = []
+
+    def record_flags(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        seen_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    real_fstat = os.fstat
+    raced = False
+
+    def append_then_fstat(fileno):  # type: ignore[no-untyped-def]
+        nonlocal raced
+        if not raced:
+            raced = True
+            with open(gitignore, "a", encoding="utf-8") as other:
+                other.write("from-another-process/\n")
+        return real_fstat(fileno)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("codex_dobby_mcp.gitignore.os.open", record_flags)
+    monkeypatch.setattr("codex_dobby_mcp.gitignore.os.fstat", append_then_fstat)
+    try:
+        assert ensure_codex_dobby_ignored(tmp_path) is True
+    finally:
+        monkeypatch.undo()
+
+    # The guarantee is structural: O_APPEND makes every write land at the real
+    # end of file, so no interleaving can be constructed that overwrites a
+    # concurrent append. Asserting the flag is what actually discriminates —
+    # a seek-to-EOF implementation passes the content check below by luck of
+    # ordering.
+    assert seen_flags, "os.open was not called"
+    assert seen_flags[0] & os.O_APPEND, "gitignore is not opened for atomic append"
+
+    contents = gitignore.read_text(encoding="utf-8")
+    assert "from-another-process/" in contents, "concurrent append was overwritten"
+    assert contents.rstrip("\n").endswith(".codex-dobby/")
+
+
+def test_gitignore_refuses_symlink_without_o_nofollow(tmp_path: Path) -> None:
+    """Platforms lacking O_NOFOLLOW (Windows) must still refuse a symlink.
+
+    Referencing os.O_NOFOLLOW unconditionally also raised AttributeError there,
+    which would have broken every mutating run on a platform the package
+    advertises support for.
+    """
+    outside = tmp_path / "outside.txt"
+    outside.write_text("", encoding="utf-8")
+    (tmp_path / ".gitignore").symlink_to(outside)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("codex_dobby_mcp.gitignore._O_NOFOLLOW", 0)
+    try:
+        with pytest.raises(PathResolutionError, match="symlinked \\.gitignore"):
+            ensure_codex_dobby_ignored(tmp_path)
+    finally:
+        monkeypatch.undo()

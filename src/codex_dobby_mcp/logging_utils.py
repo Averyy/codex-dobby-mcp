@@ -21,7 +21,10 @@ def configure_logging(level: int | None = None) -> logging.Logger:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logger.addHandler(handler)
-        if level is None:
+        # Only supply the default when no level has been chosen at all.
+        # Keying it on "no handler yet" clobbered a level set directly on the
+        # logger before anything fetched one.
+        if level is None and logger.level == logging.NOTSET:
             level = logging.INFO
     if level is not None:
         logger.setLevel(level)

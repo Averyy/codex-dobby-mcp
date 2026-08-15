@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import tomllib
@@ -235,7 +234,8 @@ def _reverse_engineer_network_overrides(spec: ResolvedInvocation) -> list[str]:
 
     return [
         "sandbox_workspace_write.network_access=true",
-        f"network.allow_unix_sockets={json.dumps([str(root) for root in socket_roots])}",
+        "network.allow_unix_sockets="
+        + _toml_array([str(root) for root in socket_roots]),
     ]
 
 
@@ -257,6 +257,11 @@ _TOML_SHORT_ESCAPES = {
     '"': '\\"',
     "\\": "\\\\",
 }
+
+
+def _toml_array(values: list[str]) -> str:
+    """Render a list of strings as a TOML array of TOML basic strings."""
+    return "[" + ", ".join(_toml_string(value) for value in values) + "]"
 
 
 def _toml_string(value: str) -> str:
@@ -477,4 +482,7 @@ def _toml_key_segment(value: str) -> str:
         for character in value
     ):
         return value
-    return json.dumps(value)
+    # Not json.dumps: it escapes astral characters as surrogate pairs, which
+    # TOML rejects, so an emoji in an MCP server name would make the whole
+    # override invalid and abort the run before Codex starts.
+    return _toml_string(value)

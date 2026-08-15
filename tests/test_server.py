@@ -290,3 +290,32 @@ def test_get_logger_does_not_reset_an_explicitly_configured_level() -> None:
         assert root.level == logging.WARNING
     finally:
         root.setLevel(original_level)
+
+
+def test_configure_logging_keeps_a_level_set_before_any_handler_exists() -> None:
+    """Installing the handler must not overwrite an already chosen level.
+
+    Keying the INFO default on "no handler yet" clobbered a level set directly
+    on the logger before anything fetched one.
+    """
+    import logging
+
+    from codex_dobby_mcp.logging_utils import get_logger
+
+    root = logging.getLogger("codex_dobby_mcp")
+    original_level = root.level
+    original_handlers = list(root.handlers)
+    try:
+        for handler in original_handlers:
+            root.removeHandler(handler)
+        root.setLevel(logging.DEBUG)
+
+        get_logger("runner")
+
+        assert root.level == logging.DEBUG
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in original_handlers:
+            root.addHandler(handler)
+        root.setLevel(original_level)

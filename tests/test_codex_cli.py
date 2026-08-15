@@ -992,3 +992,28 @@ def test_assigned_agent_config_rejects_non_table_nested_values(tmp_path: Path) -
                 message="m",
             ),
         )
+
+
+def test_dynamic_toml_key_segments_survive_astral_characters(tmp_path: Path) -> None:
+    """An emoji in an MCP server name must not produce invalid TOML.
+
+    _toml_key_segment used json.dumps, which escapes astral characters as
+    surrogate pairs. TOML rejects those, so a repo-local config with such a
+    server name made the review disable-overrides unparseable.
+    """
+    from codex_dobby_mcp.codex_cli import _toml_array, _toml_key_segment
+
+    segment = _toml_key_segment("server-\U0001f600")
+    parsed = tomllib.loads(f"mcp_servers.{segment}.enabled = false\n")
+    assert parsed["mcp_servers"]["server-\U0001f600"]["enabled"] is False
+
+    # Plain names stay bare, so existing overrides are unchanged.
+    assert _toml_key_segment("ghidra") == "ghidra"
+
+    rendered = tomllib.loads(
+        "network.allow_unix_sockets=" + _toml_array(["/tmp/sock-\U0001f600", "/tmp/b"]) + "\n"
+    )
+    assert rendered["network"]["allow_unix_sockets"] == [
+        "/tmp/sock-\U0001f600",
+        "/tmp/b",
+    ]

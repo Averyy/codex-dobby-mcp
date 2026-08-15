@@ -9,6 +9,11 @@ from codex_dobby_mcp.models import CODEX_DOBBY_GITIGNORE_ENTRY
 from codex_dobby_mcp.paths import PathResolutionError
 
 
+# Absent on Windows, where os.open cannot refuse a final-component symlink.
+# The pre-check below covers that platform instead.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def ensure_codex_dobby_ignored(repo_root: Path) -> bool:
     """Append Dobby's ignore entry, refusing symlinked or multiply-linked files.
 
@@ -20,10 +25,21 @@ def ensure_codex_dobby_ignored(repo_root: Path) -> bool:
     """
     gitignore_path = repo_root / ".gitignore"
 
+    if _O_NOFOLLOW == 0 and gitignore_path.is_symlink():
+        # Best effort where the open flag does not exist. Racy by nature, which
+        # is why it is only the fallback.
+        raise PathResolutionError(
+            f"Refusing to update symlinked .gitignore: {gitignore_path}"
+        )
+
     try:
-        # O_NOFOLLOW fails rather than following a final-component symlink.
+        # O_APPEND so every write lands atomically at end of file: a plain seek
+        # to EOF can be overtaken by another process appending, and this file is
+        # shared with the user's own tooling.
         descriptor = os.open(
-            gitignore_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644
+            gitignore_path,
+            os.O_RDWR | os.O_APPEND | os.O_CREAT | _O_NOFOLLOW,
+            0o644,
         )
     except OSError as exc:
         if exc.errno in {errno.ELOOP, errno.EMLINK}:
@@ -47,16 +63,21 @@ def ensure_codex_dobby_ignored(repo_root: Path) -> bool:
                 f"Refusing to update multiply-linked .gitignore: {gitignore_path}"
             )
 
-        existing_lines = handle.read().splitlines()
+        existing = handle.read()
+        # rstrip, not strip: leading whitespace is significant in a gitignore
+        # pattern, so " .codex-dobby/" does not ignore the directory and must
+        # not be mistaken for an entry that does.
         if any(
-            line.strip()
+            line.rstrip()
             in {CODEX_DOBBY_GITIGNORE_ENTRY, CODEX_DOBBY_GITIGNORE_ENTRY.rstrip("/")}
-            for line in existing_lines
+            for line in existing.split("\n")
         ):
             return False
 
-        handle.seek(0, os.SEEK_END)
-        if existing_lines and existing_lines[-1] != "":
+        # Decided from the raw text, not splitlines(): a file ending in exactly
+        # one newline already terminates its last entry, and treating it as
+        # unterminated inserted a stray blank line before ours.
+        if existing and not existing.endswith(("\n", "\r")):
             handle.write("\n")
         handle.write(f"{CODEX_DOBBY_GITIGNORE_ENTRY}\n")
 
