@@ -2497,11 +2497,20 @@ def test_duplicate_spawn_of_one_lens_keeps_the_other_lenses_findings(
     assert not lens_issues.coverage
 
     # The caller still receives the surviving lens's findings rather than the
-    # empty quarantine result.
+    # empty quarantine result...
     result = _verified_review_worker_result_from_rollouts(evidence)
     assert result.summary != _quarantined_review_worker_result().summary
     assert regression.child_result is not None
     assert set(regression.child_result.important_facts) <= set(result.important_facts)
+
+    # ...and the duplicated lens's findings do not reach the caller. Asserted on
+    # the caller-visible result, not only on `_rollout_validation_issues`:
+    # removing the redundant global spawn-count check left exclusion resting
+    # solely on `observed_status`'s `spawn_attempt_count != 1`, and weakening
+    # that single predicate leaks a compromised lens's findings while every
+    # other assertion in this test still passes.
+    assert not any("correctness" in fact for fact in result.important_facts)
+    assert not any("correctness" in step for step in result.next_steps)
 
 
 def test_rollout_without_readable_session_metadata_fails_closed(tmp_path: Path) -> None:
@@ -2521,8 +2530,14 @@ def test_rollout_without_readable_session_metadata_fails_closed(tmp_path: Path) 
         },
     )
     stray = codex_home / "sessions" / "2026" / "08" / "12" / "stray.jsonl"
+    # Deliberately a record type `_is_consumed_rollout_record` discards. Real
+    # rollouts are mostly reasoning traces and streaming deltas, so a stray
+    # session can easily contain no consumed record at all. Testing this with a
+    # consumed type instead would also pass under the weaker `elif items:`
+    # predicate and so would not pin the fail-closed rule to file content.
     stray.write_text(
-        json.dumps({"type": "response_item", "payload": {"type": "function_call"}}) + "\n",
+        json.dumps({"type": "reasoning", "payload": {"text": "no session_meta here"}})
+        + "\n",
         encoding="utf-8",
     )
 
@@ -2536,6 +2551,40 @@ def test_rollout_without_readable_session_metadata_fails_closed(tmp_path: Path) 
     )
     assert _verified_review_worker_result_from_rollouts(evidence).summary == (
         _quarantined_review_worker_result().summary
+    )
+
+
+def test_unparseable_session_is_accounted_for_during_truncated_recovery(
+    tmp_path: Path,
+) -> None:
+    """Recovery mode must not become a hole in the fail-closed rule.
+
+    `allow_truncated_tail=True` is used when the run timed out or exited
+    nonzero. A session file whose only line is a truncated `session_meta`
+    parses to nothing under that tolerance, so keying the rule on *parsed*
+    records rather than file content would skip exactly the unaccountable
+    session the rule exists to catch.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    truncated = codex_home / "sessions" / "2026" / "08" / "12" / "truncated.jsonl"
+    # No trailing newline: this is how a truncated tail presents.
+    truncated.write_text('{"type": "session_meta", "payload": {"id": "gh', encoding="utf-8")
+
+    recovered = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+        allow_truncated_tail=True,
+    )
+
+    assert any(
+        "no readable session metadata" in issue for issue in recovered.validation_issues
     )
 
 

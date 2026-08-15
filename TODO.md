@@ -137,6 +137,25 @@ reviewer reviews.
   `ASYNC`) in a dedicated change. `ASYNC240`/`ASYNC221` report ~130 findings
   that need individual judgement about which blocking calls are deliberate.
 
+### The verification chain rests on one property Dobby cannot enforce
+
+Every rollout check assumes the read-only-sandboxed parent Codex process cannot
+write under the private `CODEX_HOME/sessions`. That is Codex/Seatbelt sandbox
+behaviour, not something this repo controls, and Codex writes its own root
+rollout there. If a future Codex ever made `CODEX_HOME` agent-writable, a
+prompt-injected parent could fabricate a child rollout and defeat every check
+above at once. Worth re-confirming against Codex's actual sandbox policy when
+moving the compatibility baseline off `codex-cli 0.147.0`.
+
+### Smaller open items (continued)
+
+- `_result_with_verified_assignment_attestation` proves the child *saw* the
+  correct assignment identity, not that it reviewed that scope, and it does not
+  bind the parent's spawn-message plaintext. The load-bearing scope defence is
+  the out-of-band agent definition plus the child's instruction to prefer it.
+  The code comment that overstated this is corrected; keep the distinction in
+  mind before treating the digest as a scope binding.
+
 - `encrypted_function_args == ["message"]` skips both the canonical-contract
   comparison and the opaque-shape check. That marker is Codex's own record that
   it encrypted the field, and the parent cannot write rollouts, so trusting it

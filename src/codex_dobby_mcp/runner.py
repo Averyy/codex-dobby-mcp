@@ -1689,8 +1689,13 @@ def _spawn_contract_validation_issues(
         and _assignment_digest_from_message(expected_message) is not None
     ):
         # Codex 0.147 marks this schema field `with_encrypted()` and persists
-        # only the provider ciphertext. The exact plaintext is bound later by
-        # the independently correlated child's assignment-digest attestation.
+        # only the provider ciphertext, so the plaintext cannot be compared
+        # here. Note what does and does not follow: the child's attestation
+        # proves it saw the assignment *identity*, not that this spawn message
+        # carried that plaintext, and the parent holds the same digest. What
+        # actually protects scope is that the child receives its canonical
+        # assignment out of band (see _looks_like_opaque_encrypted_message
+        # below) and is instructed to prefer it over any task payload.
         pass
     elif encrypted_function_args not in (None, []):
         issues.append(
@@ -1806,12 +1811,17 @@ def _review_rollout_evidence(
     definitions = selected_review_agent_definitions(agents)
     expected_tasks = {definition.codex_name: definition for definition in definitions}
     rollout_root = codex_home / "sessions"
-    records: list[tuple[dict[str, object], list[dict[str, object]]]] = []
+    records: list[tuple[dict[str, object], list[dict[str, object]], str]] = []
     read_issues: list[str] = []
 
     for rollout_path in sorted(rollout_root.glob("**/*.jsonl")):
         items: list[dict[str, object]] = []
-        parsed_line_count = 0
+        # Whether the file holds anything at all, rather than whether anything
+        # *parsed*. Under `allow_truncated_tail` a session whose only line is a
+        # truncated `session_meta` parses to nothing, and keying the rule below
+        # on parsed records would skip it silently — exactly the unaccountable
+        # session the rule exists to catch.
+        has_content = False
         # Streamed rather than read whole: a multi-lens review with
         # history.persistence=save-all can write hundreds of MB of JSONL, and
         # holding the file text, its split lines, and the parsed items at once
@@ -1819,6 +1829,8 @@ def _review_rollout_evidence(
         try:
             with rollout_path.open("r", encoding="utf-8") as handle:
                 for line_number, raw_line in enumerate(handle, start=1):
+                    if raw_line.strip():
+                        has_content = True
                     # A line without a trailing newline can only be the final
                     # line, which is how a truncated rollout tail presents.
                     complete = raw_line.endswith(("\n", "\r"))
@@ -1831,7 +1843,6 @@ def _review_rollout_evidence(
                             f"Codex rollout {rollout_path.name} has invalid JSON on line {line_number}"
                         )
                         continue
-                    parsed_line_count += 1
                     if isinstance(item, dict) and _is_consumed_rollout_record(item):
                         items.append(item)
         except OSError as exc:
@@ -1847,15 +1858,16 @@ def _review_rollout_evidence(
             None,
         )
         if isinstance(metadata, dict):
-            records.append((metadata, items))
-        elif parsed_line_count:
+            records.append((metadata, items, rollout_path.name))
+        elif has_content:
             # `codex_home` is this run's private runtime, so every rollout under
             # it belongs to this run and must be accounted for as either the
             # root or one expected child. Skipping a file whose `session_meta`
             # is missing or malformed failed *open*: an extra or nested child
             # session could avoid classification entirely and still leave
-            # `manifest_validated` true. A file with no parsed records at all is
-            # not evidence of a session, so only a non-empty one is an issue.
+            # `manifest_validated` true. A file with no content at all is not
+            # evidence of a session — Codex can create a rollout before writing
+            # to it — so only a non-empty one is an issue.
             read_issues.append(
                 f"Codex rollout {rollout_path.name} has no readable session metadata"
             )
@@ -1893,7 +1905,7 @@ def _review_rollout_evidence(
             validation_issues=tuple([*read_issues, issue]),
         )
 
-    root_metadata, root_items = root_records[0]
+    root_metadata, root_items, _root_rollout_name = root_records[0]
     root_thread_id = root_metadata.get("id")
     if not isinstance(root_thread_id, str) or not root_thread_id:
         read_issues.append("Codex root rollout omitted its thread id")
@@ -1918,7 +1930,6 @@ def _review_rollout_evidence(
         )
 
     spawn_attempts: list[str] = []
-    spawn_call_count = 0
     spawn_contract_issues: dict[str, list[str]] = {}
     attestation_issues: dict[str, list[str]] = {}
     started_paths: list[str] = []
@@ -1953,7 +1964,6 @@ def _review_rollout_evidence(
                 collaboration_calls[call_id] = call_name
             if payload.get("name") != "spawn_agent":
                 continue
-            spawn_call_count += 1
             raw_arguments = payload.get("arguments")
             if not isinstance(raw_arguments, str):
                 read_issues.append("v2 spawn attempt omitted string arguments")
@@ -2040,7 +2050,7 @@ def _review_rollout_evidence(
     child_records: dict[str, list[tuple[dict[str, object], list[dict[str, object]]]]] = {}
     unexpected_child_paths: list[str] = []
     root_metadata_ids = {id(record[0]) for record in root_records}
-    for metadata, items in records:
+    for metadata, items, rollout_name in records:
         # Exactly one root record exists by this point; it legitimately carries
         # no `subagent.thread_spawn`. Every *other* session in this run's
         # private runtime must identify itself as an expected child, so a
@@ -2058,7 +2068,10 @@ def _review_rollout_evidence(
             unexpected_child_paths.append(
                 f"<unidentified session {session_id}>"
                 if isinstance(session_id, str) and session_id
-                else "<unidentified session>"
+                # Distinct per file: these are later de-duplicated through a
+                # set, so a shared placeholder would collapse several
+                # unaccounted sessions into a single reported entry.
+                else f"<unidentified session in {rollout_name}>"
             )
             continue
         if thread_spawn.get("parent_thread_id") != root_thread_id:

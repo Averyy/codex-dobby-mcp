@@ -196,20 +196,23 @@ async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools(tmp_p
 @pytest.mark.parametrize(
     "raw",
     [
-        # Round-trips through json.dumps unchanged, so it passes even when the
-        # SDK does re-parse. Kept as the control for the cases below.
+        # Controls. These survive even the buggy annotation — a top-level
+        # scalar is skipped by pre_parse_json outright (`true` included, since
+        # bool is a subclass of int), and these containers happen to round-trip
+        # through json.dumps unchanged. They must keep passing.
         '{"ticket": "ABC-1"}',
         "[1, 2, 3]",
         "plain prose",
         "42",
-        # Each of these is destroyed by a decode/re-encode round trip.
+        "true",
+        '{"deep": {"tab": "a\\tb"}}',
+        # Discriminators. Each is corrupted by a decode/re-encode round trip,
+        # so each fails if the annotation ever stops being exactly `str`.
         '{\n  "pretty": true\n}',  # layout collapsed onto one line
         '{"n": 1e3}',  # 1e3 reformatted to 1000.0
         '{"d": 1, "d": 2}',  # duplicate key silently dropped
         '{"accent": "caf\\u00e9"}',  # \uXXXX unescaped to a literal é
-        '{"deep": {"tab": "a\\tb"}}',
         "null",  # decodes to None, i.e. the argument vanishes entirely
-        "true",
     ],
 )
 def test_important_context_reaches_the_worker_byte_for_byte(raw: str) -> None:
