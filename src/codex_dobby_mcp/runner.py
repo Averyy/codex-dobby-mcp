@@ -1811,6 +1811,7 @@ def _review_rollout_evidence(
 
     for rollout_path in sorted(rollout_root.glob("**/*.jsonl")):
         items: list[dict[str, object]] = []
+        parsed_line_count = 0
         # Streamed rather than read whole: a multi-lens review with
         # history.persistence=save-all can write hundreds of MB of JSONL, and
         # holding the file text, its split lines, and the parsed items at once
@@ -1830,6 +1831,7 @@ def _review_rollout_evidence(
                             f"Codex rollout {rollout_path.name} has invalid JSON on line {line_number}"
                         )
                         continue
+                    parsed_line_count += 1
                     if isinstance(item, dict) and _is_consumed_rollout_record(item):
                         items.append(item)
         except OSError as exc:
@@ -1846,6 +1848,17 @@ def _review_rollout_evidence(
         )
         if isinstance(metadata, dict):
             records.append((metadata, items))
+        elif parsed_line_count:
+            # `codex_home` is this run's private runtime, so every rollout under
+            # it belongs to this run and must be accounted for as either the
+            # root or one expected child. Skipping a file whose `session_meta`
+            # is missing or malformed failed *open*: an extra or nested child
+            # session could avoid classification entirely and still leave
+            # `manifest_validated` true. A file with no parsed records at all is
+            # not evidence of a session, so only a non-empty one is an issue.
+            read_issues.append(
+                f"Codex rollout {rollout_path.name} has no readable session metadata"
+            )
 
     root_records = [
         record
@@ -2026,16 +2039,27 @@ def _review_rollout_evidence(
 
     child_records: dict[str, list[tuple[dict[str, object], list[dict[str, object]]]]] = {}
     unexpected_child_paths: list[str] = []
+    root_metadata_ids = {id(record[0]) for record in root_records}
     for metadata, items in records:
+        # Exactly one root record exists by this point; it legitimately carries
+        # no `subagent.thread_spawn`. Every *other* session in this run's
+        # private runtime must identify itself as an expected child, so a
+        # malformed or absent spawn identity is counted as an unexpected
+        # session rather than skipped. Skipping let an unaccounted child session
+        # pass while `manifest_validated` stayed true.
+        if id(metadata) in root_metadata_ids:
+            continue
         source = metadata.get("source")
-        if not isinstance(source, dict):
-            continue
-        subagent = source.get("subagent")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
         thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
-        if not isinstance(thread_spawn, dict):
-            continue
-        agent_path = thread_spawn.get("agent_path")
+        agent_path = thread_spawn.get("agent_path") if isinstance(thread_spawn, dict) else None
         if not isinstance(agent_path, str):
+            session_id = metadata.get("id")
+            unexpected_child_paths.append(
+                f"<unidentified session {session_id}>"
+                if isinstance(session_id, str) and session_id
+                else "<unidentified session>"
+            )
             continue
         if thread_spawn.get("parent_thread_id") != root_thread_id:
             unexpected_child_paths.append(agent_path)
@@ -2048,15 +2072,15 @@ def _review_rollout_evidence(
     unexpected_children = sorted((set(child_records) - expected_paths) | set(unexpected_child_paths))
     if unexpected_attempts:
         read_issues.append("unexpected v2 spawn attempts: " + ", ".join(unexpected_attempts))
-    if spawn_call_count > len(definitions):
-        # Only an *excess* is a global integrity problem: it means the parent
-        # ran something beyond the selected lenses. A shortfall removes a lens
-        # and nothing else, so it is reported per-lens as coverage loss by
-        # _rollout_validation_issues rather than quarantining every lens that
-        # did deliver. Duplicate attempts for one lens are caught there too.
-        read_issues.append(
-            f"v2 root emitted {spawn_call_count} spawn attempts; expected at most {len(definitions)}"
-        )
+    # A raw excess spawn count is deliberately *not* a global issue. Every way
+    # the count can exceed the selected lenses is already attributed more
+    # precisely: a spawn of a task Dobby never selected is `unexpected_attempts`
+    # above, a spawn whose arguments could not be parsed already appended its
+    # own read issue where it was read, and a *duplicate* spawn of a selected
+    # lens is a per-lens integrity failure raised by `_rollout_validation_issues`
+    # (`spawn_attempt_count > 1`). Quarantining globally here contradicted
+    # AGENTS.md and discarded the independently verified findings of every lens
+    # that was spawned exactly once and delivered normally.
     if unexpected_started:
         read_issues.append("unexpected v2 started tasks: " + ", ".join(unexpected_started))
     if unexpected_children:

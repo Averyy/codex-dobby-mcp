@@ -8,7 +8,7 @@ from typing import Annotated
 
 from mcp import types as mcp_types
 from mcp.server.mcpserver import Context, MCPServer
-from pydantic import AfterValidator, BeforeValidator, Field
+from pydantic import AfterValidator, BeforeValidator, Field, WithJsonSchema
 
 from codex_dobby_mcp._version import __version__
 from codex_dobby_mcp.background_runs import BackgroundRunManager
@@ -30,24 +30,38 @@ from codex_dobby_mcp.runner import CodexRunner
 
 
 def _restore_json_pre_parsed_text(value: object) -> object:
-    """Undo the SDK's JSON pre-parse for optional free-text arguments.
+    """Normalise free-text arguments the SDK may have transformed.
 
     ``FuncMetadata.pre_parse_json`` JSON-decodes any string argument whose
-    annotation is not exactly ``str`` (python-sdk #3055, present in 1.x and
-    2.x). An optional ``str | None`` parameter carrying JSON-looking text —
-    pasting a JSON snippet into important_context is the obvious case — is
-    therefore decoded into a dict or list and then rejected by validation with
-    a confusing "Input should be a valid string". Re-serialise it so the
-    caller's argument survives instead of failing the call.
+    annotation is not *exactly* ``str`` (python-sdk #3055, present in 1.x and
+    2.x). ``ImportantContextParam`` therefore annotates plain ``str`` so the
+    pre-parse is skipped and the caller's text arrives byte for byte; see the
+    note there. This validator handles what is left: an explicit ``null`` from
+    a client following the advertised nullable schema, and a client that sends
+    a real JSON object instead of a string.
     """
+    if value is None:
+        return ""
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return value
 
 
+# The annotation must stay exactly ``str``. ``pre_parse_json`` rewrites any
+# string argument whose annotation is not ``str`` — so ``str | None`` would
+# silently turn important_context='{"n": 1e3, "d": 1, "d": 2}' into
+# '{"n": 1000.0, "d": 2}' (whitespace collapsed, duplicate key dropped, number
+# reformatted, \uXXXX unescaped) and important_context='null' into no argument
+# at all. ``WithJsonSchema`` keeps the published wire contract nullable, and
+# the ``BeforeValidator`` above maps an explicit null back to "". Callers still
+# see the empty string as "no context": ``_request_from_params`` restores None.
 ImportantContextParam = Annotated[
-    str | None,
+    str,
     BeforeValidator(_restore_json_pre_parsed_text),
+    WithJsonSchema({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+    # Pydantic would otherwise publish the internal "" default. The advertised
+    # wire contract must not change just because the annotation did.
+    Field(json_schema_extra={"default": None}),
 ]
 
 
@@ -147,7 +161,7 @@ def _request_from_params(
     prompt: str,
     repo_root: str | None = None,
     files: list[str] | None = None,
-    important_context: ImportantContextParam = None,
+    important_context: ImportantContextParam = "",
     timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.PLAN],
     extra_roots: list[str] | None = None,
     model: str | None = None,
@@ -159,7 +173,7 @@ def _request_from_params(
         prompt=prompt,
         repo_root=repo_root,
         files=files or [],
-        important_context=important_context,
+        important_context=important_context or None,
         timeout_seconds=timeout_seconds,
         extra_roots=extra_roots or [],
         model=model,
@@ -259,7 +273,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.PLAN],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -284,7 +298,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.RESEARCH],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -309,7 +323,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.BRAINSTORM],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -334,7 +348,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.BUILD],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -361,7 +375,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.VALIDATE],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -386,7 +400,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int | None = None,
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -417,7 +431,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVERSE_ENGINEER],
         extra_roots: list[str] | None = None,
         model: str | None = None,
@@ -445,7 +459,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         prompt: str,
         repo_root: RepoRootParam,
         files: list[str] | None = None,
-        important_context: ImportantContextParam = None,
+        important_context: ImportantContextParam = "",
         timeout_seconds: int | None = None,
         extra_roots: list[str] | None = None,
         model: str | None = None,

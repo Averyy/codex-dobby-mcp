@@ -45,9 +45,32 @@ Migrate Dobby from the maintenance-only MCP Python SDK 1.x line to the stable 2.
 
 ## Completed on 2026-08-14
 
-The MCP SDK 2.x migration above is implemented; its verification checklist is
-recorded there and all of it ran except the live Codex test, a real Claude
-client smoke test, and the Linux CI matrix.
+The MCP SDK 2.x migration above is implemented and its verification checklist
+has now run in full, including `CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live
+tests/test_live_codex_v2.py` and a real Claude Code client smoke test. That
+smoke test drove a live three-lens orchestrated review end to end against
+codex-cli 0.147.0 and returned `manifest_validated: true`,
+`coverage_complete: true`, `execution_evidence: codex_session_rollouts`, and
+3/3 delivered child results. The Linux CI matrix still only runs in CI.
+
+## Completed on 2026-08-15
+
+- `important_context` reaches the worker byte for byte. The SDK's
+  `pre_parse_json` rewrites any string argument whose annotation is not
+  *exactly* `str`, so the previous `str | None` annotation silently reformatted
+  JSON-shaped context and turned the literal text `null` into no argument at
+  all. The parameter is now annotated plain `str` with a `WithJsonSchema` that
+  keeps the published nullable contract byte-identical, verified by diffing all
+  eleven published input schemas before and after.
+- A duplicate spawn of a selected lens no longer quarantines the whole review.
+  The global `spawn_call_count > len(definitions)` check double-counted an event
+  that `_rollout_validation_issues` already reports per lens, contradicting
+  AGENTS.md and discarding every other lens's verified findings.
+- Sessions Dobby cannot account for fail closed. A rollout file with no readable
+  `session_meta`, and a non-root session whose `thread_spawn.agent_path` is
+  missing or non-string, were both skipped silently and could leave
+  `manifest_validated: true` beside an unaccounted child session. An entirely
+  empty rollout file is still not treated as a session.
 
 The review findings that previously filled this file are fixed, each with a
 regression test verified to fail when its fix is reverted:
@@ -113,6 +136,25 @@ reviewer reviews.
 - Consider widening the ruff rule selection (import sorting, `UP`, `SIM`,
   `ASYNC`) in a dedicated change. `ASYNC240`/`ASYNC221` report ~130 findings
   that need individual judgement about which blocking calls are deliberate.
+
+- `encrypted_function_args == ["message"]` skips both the canonical-contract
+  comparison and the opaque-shape check. That marker is Codex's own record that
+  it encrypted the field, and the parent cannot write rollouts, so trusting it
+  is deliberate; the plaintext is bound afterwards by the child's out-of-band
+  assignment and attested digest. It would only fail open if a future Codex
+  marked the field encrypted while persisting plaintext. Adding a shape check
+  there is nearly free today but risks quarantining valid reviews if the
+  provider format rotates — the same calibration problem as the item above, and
+  blocked on the same real-ciphertext capture.
+
+- `_reject_unknown_tool_arguments` reaches into `server._tool_manager`,
+  `tool.fn_metadata.arg_model`, and `tool.parameters`. The SDK exposes no public
+  hook for `extra="forbid"` (python-sdk #3067), and dropping the guard would
+  silently restore whole-repo runs from a misspelled `files`. The declared range
+  is `mcp>=2.0.0,<3`, so a compatible 2.x release could change those internals
+  and break `create_server()` at import. The latest-dependency CI lane exercises
+  exactly this path, so the breakage surfaces there rather than at a user's
+  first call; revisit if the SDK ever adds a supported hook.
 
 - Scope substitution is bound by instruction, not made impossible. The child
   holds the authoritative assignment and is told to report a conflicting task

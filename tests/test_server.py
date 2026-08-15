@@ -11,6 +11,7 @@ from codex_dobby_mcp import server as server_module
 from codex_dobby_mcp.models import DEFAULT_TOOL_TIMEOUT_SECONDS, ReviewAgent, ToolName
 from codex_dobby_mcp.server import (
     _effective_start_run_timeout,
+    _request_from_params,
     create_server,
 )
 
@@ -193,21 +194,34 @@ async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools(tmp_p
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    "raw",
     [
-        ('{"ticket": "ABC-1"}', '{"ticket": "ABC-1"}'),
-        ("[1, 2, 3]", "[1, 2, 3]"),
-        ("plain prose", "plain prose"),
-        ("42", "42"),
+        # Round-trips through json.dumps unchanged, so it passes even when the
+        # SDK does re-parse. Kept as the control for the cases below.
+        '{"ticket": "ABC-1"}',
+        "[1, 2, 3]",
+        "plain prose",
+        "42",
+        # Each of these is destroyed by a decode/re-encode round trip.
+        '{\n  "pretty": true\n}',  # layout collapsed onto one line
+        '{"n": 1e3}',  # 1e3 reformatted to 1000.0
+        '{"d": 1, "d": 2}',  # duplicate key silently dropped
+        '{"accent": "caf\\u00e9"}',  # \uXXXX unescaped to a literal é
+        '{"deep": {"tab": "a\\tb"}}',
+        "null",  # decodes to None, i.e. the argument vanishes entirely
+        "true",
     ],
 )
-def test_important_context_survives_the_sdk_json_pre_parse(raw: str, expected: str) -> None:
-    """JSON-looking context text must reach the worker, not be rejected.
+def test_important_context_reaches_the_worker_byte_for_byte(raw: str) -> None:
+    """Context text must arrive exactly as the caller wrote it.
 
-    The SDK JSON-decodes any string argument whose annotation is not exactly
-    ``str`` (python-sdk #3055), so an optional ``str | None`` parameter given
-    JSON-looking text arrived as a dict/list and was then rejected with
-    "Input should be a valid string".
+    ``FuncMetadata.pre_parse_json`` JSON-decodes any string argument whose
+    annotation is not exactly ``str`` (python-sdk #3055). Under an optional
+    ``str | None`` annotation that silently rewrote the caller's text —
+    collapsing layout, reformatting numbers, dropping duplicate keys,
+    unescaping ``\\uXXXX`` — and turned the literal text ``null`` into no
+    argument at all. ``ImportantContextParam`` annotates plain ``str`` so the
+    pre-parse never fires.
     """
     server = create_server()
     plan_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["plan"]
@@ -218,7 +232,43 @@ def test_important_context_survives_the_sdk_json_pre_parse(raw: str, expected: s
     )
     arguments = metadata.arg_model.model_validate(pre_parsed)
 
-    assert arguments.important_context == expected
+    assert arguments.important_context == raw
+
+
+def test_absent_important_context_is_none_not_empty_string() -> None:
+    """The empty-string default must not reach the worker as context.
+
+    ``ImportantContextParam`` defaults to "" so its annotation can stay exactly
+    ``str``; downstream still expects ``None`` when the caller passed nothing,
+    including when a client sends an explicit ``null``.
+    """
+    assert _request_from_params(prompt="p", repo_root="/tmp/repo").important_context is None
+    assert (
+        _request_from_params(
+            prompt="p", repo_root="/tmp/repo", important_context=""
+        ).important_context
+        is None
+    )
+    assert (
+        _request_from_params(
+            prompt="p", repo_root="/tmp/repo", important_context="ticket ABC-1"
+        ).important_context
+        == "ticket ABC-1"
+    )
+
+
+def test_explicit_null_important_context_is_accepted_over_the_wire() -> None:
+    """The published schema is nullable, so an explicit null must validate."""
+    server = create_server()
+    plan_tool = {tool.name: tool for tool in server._tool_manager.list_tools()}["plan"]
+    metadata = plan_tool.fn_metadata
+
+    pre_parsed = metadata.pre_parse_json(
+        {"prompt": "do it", "repo_root": "/tmp/repo", "important_context": None}
+    )
+    arguments = metadata.arg_model.model_validate(pre_parsed)
+
+    assert arguments.important_context == ""
 
 
 def test_important_context_schema_is_still_a_nullable_string() -> None:

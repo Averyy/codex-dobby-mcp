@@ -2428,8 +2428,190 @@ def test_v2_review_rollouts_reject_extra_malformed_spawn_attempt(
         [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
     )
 
+    # The unparseable spawn is itself a global failure: it cannot be attributed
+    # to a lens. The raw spawn *count* deliberately is not — see
+    # test_duplicate_spawn_of_one_lens_keeps_the_other_lenses_findings.
     assert "v2 spawn attempt contained malformed JSON arguments" in evidence.validation_issues
-    assert "v2 root emitted 3 spawn attempts; expected at most 2" in evidence.validation_issues
+
+
+def test_duplicate_spawn_of_one_lens_keeps_the_other_lenses_findings(
+    tmp_path: Path,
+) -> None:
+    """A duplicate spawn is per-lens integrity loss, never a global quarantine.
+
+    AGENTS.md lists duplicate spawns among the deviations that "exclude that
+    lens entirely ... but the lenses that passed still return their
+    independently verified findings", and reserves whole-review quarantine for
+    a *global* evidence failure. A raw `spawn_call_count > len(definitions)`
+    check contradicted that: spawning one lens twice discarded every other
+    lens's verified findings too.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root_rollout = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    duplicate = next(
+        item
+        for item in items
+        if item.get("payload", {}).get("name") == "spawn_agent"
+        and "correctness" in item["payload"].get("arguments", "")
+    )
+    items.append(json.loads(json.dumps(duplicate)))
+    root_rollout.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    # No global quarantine: the review is still evaluated lens by lens.
+    assert evidence.validation_issues == ()
+
+    by_task = {agent.task_name: agent for agent in evidence.agents}
+    correctness = by_task["dobby_review_correctness"]
+    regression = by_task["dobby_review_regression"]
+
+    # The duplicated lens is excluded as an integrity failure...
+    assert correctness.spawn_attempt_count == 2
+    assert any(
+        "spawn attempts" in issue
+        for issue in _rollout_validation_issues(
+            correctness, ReviewAgentExecutionStatus.COMPLETED
+        ).integrity
+    )
+    # ...and the untouched lens is untouched.
+    assert regression.spawn_attempt_count == 1
+    lens_issues = _rollout_validation_issues(
+        regression, ReviewAgentExecutionStatus.COMPLETED
+    )
+    assert not lens_issues.integrity
+    assert not lens_issues.coverage
+
+    # The caller still receives the surviving lens's findings rather than the
+    # empty quarantine result.
+    result = _verified_review_worker_result_from_rollouts(evidence)
+    assert result.summary != _quarantined_review_worker_result().summary
+    assert regression.child_result is not None
+    assert set(regression.child_result.important_facts) <= set(result.important_facts)
+
+
+def test_rollout_without_readable_session_metadata_fails_closed(tmp_path: Path) -> None:
+    """An unaccountable rollout file must quarantine, not be skipped.
+
+    `codex_home` is the run's private runtime, so every rollout under it
+    belongs to this run. Silently dropping a file whose `session_meta` is
+    missing let an extra or nested child session escape classification while
+    `manifest_validated` stayed true.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    stray = codex_home / "sessions" / "2026" / "08" / "12" / "stray.jsonl"
+    stray.write_text(
+        json.dumps({"type": "response_item", "payload": {"type": "function_call"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert any(
+        "no readable session metadata" in issue for issue in evidence.validation_issues
+    )
+    assert _verified_review_worker_result_from_rollouts(evidence).summary == (
+        _quarantined_review_worker_result().summary
+    )
+
+
+def test_empty_rollout_file_is_not_treated_as_a_session(tmp_path: Path) -> None:
+    """A file with no records is not evidence of a session, so it must not fail.
+
+    Guards the fail-closed rule above from over-firing on a rollout Codex has
+    created but not yet written to.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    (codex_home / "sessions" / "2026" / "08" / "12" / "empty.jsonl").write_text(
+        "", encoding="utf-8"
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert evidence.validation_issues == ()
+
+
+def test_child_session_without_spawn_identity_is_an_unexpected_session(
+    tmp_path: Path,
+) -> None:
+    """A non-root session that cannot prove it is an expected child fails closed.
+
+    Previously a child rollout whose `source.subagent.thread_spawn.agent_path`
+    was missing or non-string was skipped by the classification loop, so an
+    unaccounted child session left no trace in `validation_issues`.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    rogue = codex_home / "sessions" / "2026" / "08" / "12" / "rogue.jsonl"
+    rogue.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "rogue-thread",
+                    "session_id": "rogue-thread",
+                    "originator": "codex_exec",
+                    "thread_source": "subagent",
+                    # Well-formed session metadata that simply never identifies
+                    # which spawn produced it.
+                    "source": {"subagent": {"thread_spawn": {"agent_path": None}}},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+
+    assert any(
+        "unexpected or nested v2 child sessions" in issue
+        for issue in evidence.validation_issues
+    )
+    assert "rogue-thread" in " ".join(evidence.validation_issues)
 
 
 def test_v2_review_rollouts_allow_only_truncated_final_record_during_recovery(
