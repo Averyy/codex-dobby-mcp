@@ -155,6 +155,11 @@ unkillable, so a test for it would assert nothing:
 
 - `@dataclass(frozen=True)` -> `frozen=False` on six dataclasses. Nothing
   mutates these instances, so immutability has no observable effect.
+- `_resolve`'s `elif tool == ToolName.REVIEW and review_uses_orchestrator(...)`.
+  An earlier guard raises when a non-review tool carries `agents`, so by this
+  line either the tool is REVIEW (both operands true) or `agents` is empty
+  (both false). Pinned indirectly by
+  `test_agents_on_a_non_review_tool_are_rejected_outright`.
 - `_salvage_exec_trace`'s `i = j + 1 if j > i + 1 else i + 1`. `j` is
   initialised to `i + 2` and the inner loop only increments it, so the guard is
   a tautology and the `else` arm is unreachable.
