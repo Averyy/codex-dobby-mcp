@@ -147,6 +147,30 @@ prompt-injected parent could fabricate a child rollout and defeat every check
 above at once. Worth re-confirming against Codex's actual sandbox policy when
 moving the compatibility baseline off `codex-cli 0.147.0`.
 
+### Known-equivalent mutants (do not "fix" with tests)
+
+Mutation testing over every executed comparison, boolean operator, `not`, and
+bool constant reports these as surviving. Each was checked and is genuinely
+unkillable, so a test for it would assert nothing:
+
+- `@dataclass(frozen=True)` -> `frozen=False` on six dataclasses. Nothing
+  mutates these instances, so immutability has no observable effect.
+- `write_json(..., by_alias=True)` at `runner.py` line 890. `FileDiff` is the
+  only aliased model, so `by_alias` is observable — but that write is
+  immediately overwritten by the one in `run_resolved`, whose own mutant *is*
+  killed by `test_result_json_artifact_uses_camelcase_for_file_diffs`. The
+  redundant write is worth removing on its own merits; both callers serialise
+  the same response back-to-back.
+- `_review_timeout_plan`'s `if wrap_up_seconds >= available_seconds:`. The
+  `ge=300` timeout floor makes `available_seconds` at least 270 while
+  `wrap_up_seconds` is capped at 120, so the branch is unreachable, as its
+  comment already notes.
+
+The remaining survivors are concentrated in salvage, stall-diagnostic, and
+event-mapping text — paths that produce a human-readable message rather than a
+verdict. Worth revisiting, but a wrong value there misleads a reader instead of
+changing what Dobby returns.
+
 ### Smaller open items (continued)
 
 - `_result_with_verified_assignment_attestation` proves the child *saw* the

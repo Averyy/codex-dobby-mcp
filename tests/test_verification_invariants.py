@@ -505,3 +505,74 @@ def test_prompt_relative_path_extraction_excludes_absolute_tokens(
     from codex_dobby_mcp.paths import prompt_referenced_relative_paths
 
     assert prompt_referenced_relative_paths(text) == expected
+
+
+# ------------------------------------------- quarantine diagnostics accuracy
+def _healthy_evidence(**overrides):
+    """Evidence for a lens that did everything right."""
+    from codex_dobby_mcp.runner import ReviewRolloutAgentEvidence
+
+    base = dict(
+        review_agent="correctness",
+        task_name="dobby_review_correctness",
+        agent_role="dobby_review_correctness",
+        spawn_attempt_count=1,
+        started_count=1,
+        child_thread_ids=("child-1",),
+        child_roles=("dobby_review_correctness",),
+        child_multi_agent_versions=("disabled",),
+        started_thread_ids=("child-1",),
+        delivered_count=1,
+        terminal_event_count=1,
+        child_result=WorkerResult.model_validate_json(_worker_payload()),
+    )
+    base.update(overrides)
+    return ReviewRolloutAgentEvidence(**base)
+
+
+def test_healthy_evidence_produces_no_issues() -> None:
+    """Control: without this, every case below could pass for the wrong reason."""
+    from codex_dobby_mcp.models import ReviewAgentExecutionStatus
+    from codex_dobby_mcp.runner import _rollout_validation_issues
+
+    issues = _rollout_validation_issues(
+        _healthy_evidence(), ReviewAgentExecutionStatus.COMPLETED
+    )
+    assert not issues.integrity
+    assert not issues.coverage
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_token",
+    [
+        ({"spawn_attempt_count": 0}, "spawn_attempts=0"),
+        ({"started_count": 0}, "started_events=0"),
+        ({"child_thread_ids": ()}, "child_sessions=0"),
+        ({"started_thread_ids": ("other",)}, "started_child_thread_match=false"),
+        ({"child_roles": ("wrong_role",)}, "expected_child_role=false"),
+        ({"child_multi_agent_versions": ("v2",)}, "child_multi_agent_disabled=false"),
+        ({"delivered_count": 0}, "final_deliveries=0"),
+        ({"terminal_event_count": 0}, "terminal_events=0"),
+        ({"child_result": None}, "matching_terminal_result=false"),
+    ],
+)
+def test_quarantine_message_names_the_evidence_that_failed(
+    overrides: dict, expected_token: str
+) -> None:
+    """Kills the `!= 1` / `is None` comparisons that build `missing_or_mismatched`.
+
+    These do not change the verdict — `observed_status` decides that
+    independently — so a wrong one produces a *misleading* explanation rather
+    than a wrong result. That still matters: when a review is quarantined the
+    rollouts proving why are deleted moments later, so this string can be the
+    only surviving account of the cause.
+    """
+    from codex_dobby_mcp.models import ReviewAgentExecutionStatus
+    from codex_dobby_mcp.runner import _rollout_validation_issues
+
+    issues = _rollout_validation_issues(
+        _healthy_evidence(**overrides), ReviewAgentExecutionStatus.COMPLETED
+    )
+
+    rendered = " ".join(issues.integrity) + " " + " ".join(issues.coverage)
+    assert expected_token in rendered, rendered
