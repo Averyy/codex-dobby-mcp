@@ -18,3 +18,8 @@ wheels/
 .tmp-ghidra/
 notes/
 .notes/
+
+# Coverage data (binary, machine-local)
+.coverage
+.coverage.*
+coverage-html/
