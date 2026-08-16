@@ -155,6 +155,11 @@ unkillable, so a test for it would assert nothing:
 
 - `@dataclass(frozen=True)` -> `frozen=False` on six dataclasses. Nothing
   mutates these instances, so immutability has no observable effect.
+- `_sandbox_violation_from_line`'s `if not candidates and isinstance(payload,
+  str):` fallback is unreachable. `_sandbox_violation_candidates` already
+  returns `[value]` for any string, including `""`, so `not candidates` is
+  never true when the payload is a string. Dead defensive code rather than a
+  test gap; safe to delete in a cleanup change.
 - `write_json(..., by_alias=True)` at `runner.py` line 890. `FileDiff` is the
   only aliased model, so `by_alias` is observable — but that write is
   immediately overwritten by the one in `run_resolved`, whose own mutant *is*
