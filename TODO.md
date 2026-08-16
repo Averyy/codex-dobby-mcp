@@ -155,6 +155,9 @@ unkillable, so a test for it would assert nothing:
 
 - `@dataclass(frozen=True)` -> `frozen=False` on six dataclasses. Nothing
   mutates these instances, so immutability has no observable effect.
+- `_salvage_exec_trace`'s `i = j + 1 if j > i + 1 else i + 1`. `j` is
+  initialised to `i + 2` and the inner loop only increments it, so the guard is
+  a tautology and the `else` arm is unreachable.
 - `_sandbox_violation_from_line`'s `if not candidates and isinstance(payload,
   str):` fallback is unreachable. `_sandbox_violation_candidates` already
   returns `[value]` for any string, including `""`, so `not candidates` is
