@@ -576,3 +576,95 @@ def test_quarantine_message_names_the_evidence_that_failed(
 
     rendered = " ".join(issues.integrity) + " " + " ".join(issues.coverage)
     assert expected_token in rendered, rendered
+
+
+# ------------------------------------------- child mutation-claim extraction
+@pytest.mark.parametrize(
+    "payload",
+    ["not json at all", '"a bare string"', "[1, 2, 3]", "null"],
+)
+def test_unusable_child_payload_claims_no_file_diffs(payload: str) -> None:
+    """Kills `return (), False` -> `return (), True`.
+
+    A child payload that cannot be read is not evidence that the child wrote
+    files. Claiming it did turns an unparseable result into a *file mutation*
+    integrity failure, which excludes the lens for the wrong reason.
+    """
+    from codex_dobby_mcp.runner import _child_reported_mutations
+
+    assert _child_reported_mutations(payload) == ((), False)
+
+
+def test_child_mutation_paths_ignore_non_string_entries() -> None:
+    """Kills `isinstance(path, str) and path` -> `or`.
+
+    With `or`, a non-string entry (or an empty string) is admitted and later
+    rendered into the integrity message as a claimed mutated path.
+    """
+    from codex_dobby_mcp.runner import _child_reported_mutations
+
+    import json as _json
+
+    payload = _json.dumps(
+        {"files_changed": ["real.py", "", None, 7, {"nested": 1}, "also_real.py"]}
+    )
+    paths, has_file_diffs = _child_reported_mutations(payload)
+
+    assert paths == ("real.py", "also_real.py")
+    assert has_file_diffs is False
+
+
+def test_child_file_diffs_are_detected_and_their_paths_extracted() -> None:
+    import json as _json
+
+    from codex_dobby_mcp.runner import _child_reported_mutations
+
+    paths, has_file_diffs = _child_reported_mutations(
+        _json.dumps({"file_diffs": [{"path": "touched.py"}, {"no_path": 1}]})
+    )
+
+    assert has_file_diffs is True
+    assert paths == ("touched.py",)
+
+    # An empty list is not a claim.
+    assert _child_reported_mutations(_json.dumps({"file_diffs": []}))[1] is False
+
+
+def test_strict_parse_rejects_a_malformed_file_diff_entry() -> None:
+    """Kills `not isinstance(file_diffs, list) or any(...)` -> `and`.
+
+    With `and`, a *list* of malformed entries short-circuits to False and the
+    payload is accepted, so a child result carrying diffs that do not match the
+    published FileDiff shape would be treated as verified.
+    """
+    import json as _json
+
+    base = _json.loads(_worker_payload())
+    base["file_diffs"] = [{"path": "a.py"}]  # missing oldText/newText/truncated
+
+    assert _strict_worker_result(_json.dumps(base)) is None
+
+    base["file_diffs"] = [
+        {"path": "a.py", "oldText": None, "newText": "x", "truncated": False}
+    ]
+    assert _strict_worker_result(_json.dumps(base)) is not None
+
+
+def test_spawn_message_must_not_be_blank() -> None:
+    """Kills `not isinstance(message, str) or not message.strip()` -> `and`."""
+    from codex_dobby_mcp.review_agents import selected_review_agent_definitions
+    from codex_dobby_mcp.runner import _spawn_contract_validation_issues
+
+    definition = selected_review_agent_definitions(
+        [ReviewAgent.CORRECTNESS, ReviewAgent.SECURITY]
+    )[0]
+    arguments = {
+        "task_name": definition.codex_name,
+        "agent_type": definition.codex_name,
+        "fork_turns": "none",
+        "message": "   ",
+    }
+
+    issues = _spawn_contract_validation_issues(arguments, definition, "expected", None)
+
+    assert any("spawn message was empty" in issue for issue in issues)

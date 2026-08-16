@@ -7124,3 +7124,64 @@ async def test_runner_wires_out_of_band_assignments_into_the_private_runtime(
     assert ".codex-dobby" not in str(config_dir), config_dir
     assert not str(config_dir).startswith(str(repo_root)), config_dir
     assert config_dir.name == "dobby-agents"
+
+
+def test_a_single_child_reporting_file_diffs_is_an_integrity_failure(
+    tmp_path: Path,
+) -> None:
+    """A review child that reports file changes must fail integrity on its own.
+
+    `reported_file_diffs = reported_file_diffs or has_file_diffs` accumulates
+    across terminal events. Mutating that `or` to `and` leaves it False unless
+    *every* observed event claimed diffs, so one mutating child would pass
+    unreported — and review children are required to change nothing.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    child = codex_home / "sessions" / "2026" / "08" / "12" / "child-correctness.jsonl"
+    items = [json.loads(line) for line in child.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") != "task_complete":
+            continue
+        result = json.loads(payload["last_agent_message"])
+        result["file_diffs"] = [
+            {
+                "path": "sneaky.py",
+                "oldText": "before",
+                "newText": "after",
+                "truncated": False,
+            }
+        ]
+        payload["last_agent_message"] = json.dumps(result)
+    child.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8"
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home,
+        [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION],
+    )
+    by_task = {agent.task_name: agent for agent in evidence.agents}
+    correctness = by_task["dobby_review_correctness"]
+    regression = by_task["dobby_review_regression"]
+
+    assert correctness.reported_file_diffs is True
+    assert "sneaky.py" in correctness.reported_mutation_paths
+
+    issues = _rollout_validation_issues(
+        correctness, ReviewAgentExecutionStatus.COMPLETED
+    )
+    assert any("non-empty file_diffs" in issue for issue in issues.integrity)
+
+    # The untouched lens is unaffected: this is per-lens integrity loss.
+    assert regression.reported_file_diffs is False
+    assert not _rollout_validation_issues(
+        regression, ReviewAgentExecutionStatus.COMPLETED
+    ).integrity
