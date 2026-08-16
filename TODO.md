@@ -155,6 +155,16 @@ unkillable, so a test for it would assert nothing:
 
 - `@dataclass(frozen=True)` -> `frozen=False` on six dataclasses. Nothing
   mutates these instances, so immutability has no observable effect.
+- Two branch guards in the rollout reader, both made unreachable by
+  `_is_consumed_rollout_record`, which admits only `response_item` payloads
+  `function_call` / `function_call_output` / `agent_message` and `event_msg`
+  payloads `sub_agent_activity` / `task_complete`:
+  `item.get("type") == "response_item" and payload.get("type") ==
+  "agent_message"` — the only records that differ under `or` are either
+  `continue`d by an earlier branch or never consumed; and
+  `isinstance(call_id, str) and isinstance(call_name, str)` when building the
+  call-id map, because the lookup that reads it re-checks both the key type and
+  the exact name, so a malformed entry can never be retrieved.
 - `_resolve`'s `elif tool == ToolName.REVIEW and review_uses_orchestrator(...)`.
   An earlier guard raises when a non-review tool carries `agents`, so by this
   line either the tool is REVIEW (both operands true) or `agents` is empty

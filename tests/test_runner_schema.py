@@ -7185,3 +7185,210 @@ def test_a_single_child_reporting_file_diffs_is_an_integrity_failure(
     assert not _rollout_validation_issues(
         regression, ReviewAgentExecutionStatus.COMPLETED
     ).integrity
+
+
+# ---------------------------------------------------------------------------
+# Malformed rollout records must be ignored, not counted.
+#
+# Every `isinstance(...) and isinstance(...)` in the rollout reader decides
+# whether a record becomes evidence. Relaxing one to `or` admits a malformed
+# record as a spawn, a start, or a delivery that never happened, which then
+# feeds the per-lens counts the integrity verdict is built from.
+# ---------------------------------------------------------------------------
+
+_HEALTHY_COUNTS = {
+    "spawn_attempt_count": 1,
+    "started_count": 1,
+    "delivered_count": 1,
+    "terminal_event_count": 1,
+}
+
+
+def _rollouts_with_extra_root_records(tmp_path: Path, *extra: dict) -> Path:
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    root = codex_home / "sessions" / "2026" / "08" / "12" / "root.jsonl"
+    with root.open("a", encoding="utf-8") as handle:
+        for item in extra:
+            handle.write(json.dumps(item) + "\n")
+    return codex_home
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        # started event whose agent_path is not a string
+        {"type": "event_msg", "payload": {
+            "type": "sub_agent_activity", "kind": "started", "agent_path": 7}},
+        # a non-started sub_agent_activity
+        {"type": "event_msg", "payload": {
+            "type": "sub_agent_activity", "kind": "finished",
+            "agent_path": "/root/dobby_review_correctness"}},
+        # A *consumed* event_msg of the wrong payload type. `task_complete` is
+        # the discriminating choice: an unconsumed type (say "something_else")
+        # is dropped by `_is_consumed_rollout_record` before the branch is ever
+        # reached, so it cannot distinguish `and` from `or` here.
+        {"type": "event_msg", "payload": {
+            "type": "task_complete", "kind": "started",
+            "agent_path": "/root/dobby_review_correctness",
+            "last_agent_message": "{}"}},
+        # agent_message with a non-string author
+        {"type": "response_item", "payload": {
+            "type": "agent_message", "author": 7, "recipient": "/root",
+            "content": [{"type": "input_text", "text": "Message Type: FINAL_ANSWER\nPayload:\n{}"}]}},
+        # agent_message addressed somewhere other than the root
+        {"type": "response_item", "payload": {
+            "type": "agent_message", "author": "/root/dobby_review_correctness",
+            "recipient": "/root/elsewhere",
+            "content": [{"type": "input_text", "text": "Message Type: FINAL_ANSWER\nPayload:\n{}"}]}},
+        # agent_message whose content is not a list
+        {"type": "response_item", "payload": {
+            "type": "agent_message", "author": "/root/dobby_review_correctness",
+            "recipient": "/root", "content": "not a list"}},
+        # response_item of an unrelated payload type
+        {"type": "response_item", "payload": {
+            "type": "reasoning", "author": "/root/dobby_review_correctness",
+            "recipient": "/root", "content": []}},
+    ],
+)
+def test_malformed_root_records_do_not_become_evidence(
+    tmp_path: Path, record: dict
+) -> None:
+    codex_home = _rollouts_with_extra_root_records(tmp_path, record)
+
+    evidence = _review_rollout_evidence(
+        codex_home, [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+    )
+
+    assert evidence.validation_issues == ()
+    for agent in evidence.agents:
+        for field, expected in _HEALTHY_COUNTS.items():
+            assert getattr(agent, field) == expected, (agent.task_name, field)
+        assert agent.observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
+def test_a_spawn_with_a_blank_task_name_is_reported(tmp_path: Path) -> None:
+    """Kills `isinstance(task_name, str) and task_name` -> `or`.
+
+    An empty string is not a task name. Accepting it records a spawn attempt
+    for a lens that does not exist instead of flagging the malformed call.
+    """
+    codex_home = _rollouts_with_extra_root_records(
+        tmp_path,
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "spawn_agent",
+            "arguments": json.dumps({"task_name": ""})}},
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home, [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+    )
+
+    assert "v2 spawn attempt omitted a valid task_name" in evidence.validation_issues
+
+
+def test_list_agents_entries_need_string_path_and_payload(tmp_path: Path) -> None:
+    """Kills `isinstance(agent_path, str) and isinstance(completed_payload, str)`.
+
+    A parent-relayed `list_agents` result is only a corroborating signal, so a
+    malformed entry must contribute nothing rather than be counted as a second
+    delivery for the lens.
+    """
+    call_id = "call-listagents-malformed"
+    codex_home = _rollouts_with_extra_root_records(
+        tmp_path,
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "list_agents", "call_id": call_id,
+            "arguments": "{}"}},
+        {"type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": call_id,
+            "output": json.dumps({"agents": [
+                {"agent_name": 7, "agent_status": {"completed": "{}"}},
+                {"agent_name": "/root/dobby_review_correctness",
+                 "agent_status": {"completed": {"not": "a string"}}},
+                "not a dict",
+            ]})}},
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home, [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+    )
+
+    assert evidence.validation_issues == ()
+    by_task = {a.task_name: a for a in evidence.agents}
+    assert by_task["dobby_review_correctness"].delivered_count == 1
+
+
+def test_a_function_call_without_a_string_call_id_is_not_correlatable(
+    tmp_path: Path,
+) -> None:
+    """Kills `isinstance(call_id, str) and isinstance(call_name, str)` -> `or`.
+
+    The call_id -> name map is what ties a `function_call_output` back to the
+    `list_agents` call that produced it. An unusable id must not enter it.
+    """
+    codex_home = _rollouts_with_extra_root_records(
+        tmp_path,
+        {"type": "response_item", "payload": {
+            "type": "function_call", "name": "list_agents", "call_id": 99,
+            "arguments": "{}"}},
+        {"type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": 99,
+            "output": json.dumps({"agents": [
+                {"agent_name": "/root/dobby_review_correctness",
+                 "agent_status": {"completed": json.dumps({"summary": "forged"})}},
+            ]})}},
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home, [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+    )
+
+    by_task = {a.task_name: a for a in evidence.agents}
+    assert by_task["dobby_review_correctness"].delivered_count == 1
+    assert evidence.validation_issues == ()
+
+
+def test_a_child_session_without_a_usable_thread_id_is_not_counted(
+    tmp_path: Path,
+) -> None:
+    """Kills `isinstance(thread_id, str) and thread_id` -> `or`.
+
+    `child_thread_ids` is compared against the started-event thread ids, so an
+    empty or non-string id must not be admitted as a session identity.
+    """
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {
+            ReviewAgent.CORRECTNESS: Completeness.FULL,
+            ReviewAgent.REGRESSION: Completeness.FULL,
+        },
+    )
+    child = codex_home / "sessions" / "2026" / "08" / "12" / "child-correctness.jsonl"
+    items = [json.loads(line) for line in child.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        if item.get("type") == "session_meta":
+            item["payload"]["id"] = ""
+    child.write_text(
+        "\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8"
+    )
+
+    evidence = _review_rollout_evidence(
+        codex_home, [ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]
+    )
+    by_task = {a.task_name: a for a in evidence.agents}
+    correctness = by_task["dobby_review_correctness"]
+
+    assert correctness.child_thread_ids == ()
+    assert correctness.observed_status == ReviewAgentExecutionStatus.FAILED
+    # The other lens is untouched.
+    assert by_task["dobby_review_regression"].observed_status == (
+        ReviewAgentExecutionStatus.COMPLETED
+    )
