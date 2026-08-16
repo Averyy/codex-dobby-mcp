@@ -322,3 +322,186 @@ def test_out_of_band_assignments_only_for_real_fan_out(
     )
 
     assert bool(assignments) is expect_assignments
+
+
+# ============================================================ round two
+# A second mutation pass over the committed suite surfaced these. Same rule as
+# above: each test names the mutant it kills.
+
+
+# --------------------------------------------------------- model defaults
+def test_danger_defaults_to_false() -> None:
+    """Kills `danger: bool = False` -> `True`.
+
+    `danger` is what selects the `danger-full-access` sandbox. Every caller
+    that omits it must get the safe value, and nothing asserted that: flipping
+    the default passed the entire suite while silently removing sandboxing
+    from every run.
+    """
+    assert InvocationRequest(prompt="p").danger is False
+
+    repo = Path("/tmp")
+    del repo  # the default matters even before any path resolution
+    from codex_dobby_mcp.models import ResolvedInvocation
+
+    assert "danger" in InvocationRequest.model_fields
+    assert InvocationRequest.model_fields["danger"].default is False
+    assert ResolvedInvocation.model_fields["fetchaller_available"].default is False
+    assert ResolvedInvocation.model_fields["ghidra_available"].default is False
+    assert ResolvedInvocation.model_fields["gitignore_updated"].default is False
+
+
+def test_danger_default_produces_a_sandboxed_command(tmp_path: Path) -> None:
+    """The safe default must reach the actual codex invocation, not just the model."""
+    repo = _git_repo(tmp_path)
+    runner = _runner(repo)
+    spec = runner._resolve(ToolName.BUILD, InvocationRequest(prompt="build"))
+
+    command = build_codex_command(
+        spec,
+        "/opt/homebrew/bin/codex",
+        spec.artifacts.output_schema_json,
+        review_agent_assets_root(ASSETS),
+    )
+
+    assert command.sandbox_mode == "workspace-write"
+    assert "danger-full-access" not in command.argv
+
+
+@pytest.mark.parametrize(
+    "model_name, field, expected",
+    [
+        ("WorkerResult", "refused", False),
+        ("FileDiff", "truncated", False),
+        ("ToolResponse", "raw_output_available", True),
+    ],
+)
+def test_response_contract_defaults(model_name: str, field: str, expected: bool) -> None:
+    """Kills the bool-default flips on the caller-visible response contract."""
+    from codex_dobby_mcp import models as models_module
+
+    model = getattr(models_module, model_name)
+    assert model.model_fields[field].default is expected
+
+
+# ------------------------------------------------- persisted artifact aliases
+def test_file_diffs_are_persisted_under_their_camelCase_aliases() -> None:
+    """Kills `model_dump(mode="json", by_alias=True)` -> `by_alias=False`.
+
+    `FileDiff` is the one model with aliases, so `by_alias` is not cosmetic:
+    without it `result.json` and the MCP response carry `old_text`/`new_text`
+    instead of the documented `oldText`/`newText`, silently breaking the ACP
+    consumers that read the artifact.
+    """
+    from codex_dobby_mcp.models import FileDiff
+
+    dumped = FileDiff(path="a.py", old_text="a", new_text="b").model_dump(
+        mode="json", by_alias=True
+    )
+
+    assert "oldText" in dumped and "newText" in dumped
+    assert "old_text" not in dumped and "new_text" not in dumped
+
+
+# ------------------------------------------------------- MCP disable overrides
+def test_every_configured_mcp_server_is_disabled_for_review(tmp_path: Path) -> None:
+    """Kills `not isinstance(server_name, str) or server_name in seen` -> `and`.
+
+    Review runs must disable every inherited MCP server. With `and`, a name
+    already seen is emitted again rather than skipped, so the dedupe that keeps
+    the override list bounded stops working.
+    """
+    from codex_dobby_mcp.codex_cli import _mcp_disable_overrides
+
+    home = tmp_path / "config.toml"
+    home.write_text(
+        "[mcp_servers.fetchaller]\ncommand = 'x'\n"
+        "[mcp_servers.ghidra]\ncommand = 'y'\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    # The repo-level config redeclares `fetchaller`. Overrides are collected
+    # from both files, so this is what actually exercises the `seen` dedupe;
+    # two distinct names in a single file never reach it.
+    (repo / ".codex").mkdir(parents=True)
+    (repo / ".codex" / "config.toml").write_text(
+        "[mcp_servers.fetchaller]\ncommand = 'z'\n", encoding="utf-8"
+    )
+
+    overrides = _mcp_disable_overrides(repo, home_config_path=home, disable_all=True)
+
+    assert sorted(overrides) == [
+        "mcp_servers.fetchaller.enabled=false",
+        "mcp_servers.ghidra.enabled=false",
+    ]
+    # Exactly one override per server: no duplicates.
+    assert len(overrides) == len(set(overrides))
+
+
+def test_mcp_server_name_needing_quoting_is_still_disabled(tmp_path: Path) -> None:
+    """A server name that is not a bare TOML key must still be disabled safely."""
+    from codex_dobby_mcp.codex_cli import _mcp_disable_overrides
+
+    home = tmp_path / "config.toml"
+    home.write_text('["my server.v2"]\n', encoding="utf-8")
+    home.write_text(
+        '[mcp_servers."my server.v2"]\ncommand = "x"\n', encoding="utf-8"
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    overrides = _mcp_disable_overrides(repo, home_config_path=home, disable_all=True)
+
+    assert overrides == ['mcp_servers."my server.v2".enabled=false']
+
+
+# --------------------------------------------------------------- path tokens
+@pytest.mark.parametrize(
+    "value, expect_absolute_input",
+    [("/already/absolute/x.py", True), ("rel/dir/x.py", False)],
+)
+def test_resolve_path_only_rebases_relative_values(
+    tmp_path: Path, value: str, expect_absolute_input: bool
+) -> None:
+    """Kills `if not candidate.is_absolute():` -> `if candidate.is_absolute():`."""
+    from codex_dobby_mcp.paths import resolve_path
+
+    resolved = resolve_path(value, tmp_path)
+
+    if expect_absolute_input:
+        assert resolved == Path(value)
+        assert not str(resolved).startswith(str(tmp_path))
+    else:
+        assert str(resolved).startswith(str(tmp_path.resolve()))
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("see src/app/main.py for detail", ["src/app/main.py"]),
+        ("see `src/app/main.py` for detail", ["src/app/main.py"]),
+        # Absolute and ~ tokens are deliberately excluded: they are not
+        # repo-relative, so they must not drive repo inference.
+        #
+        # These must be BACKTICKED. The bare-token regex already refuses a
+        # leading `/` or `~`, so a bare absolute path never reaches the guard
+        # under test and cannot distinguish it from a broken one. Only the
+        # backtick branch feeds such a token to `_accept`.
+        ("see `/etc/passwd.py` for detail", []),
+        ("see `~/secrets/key.py` for detail", []),
+        ("see /etc/passwd.py for detail", []),
+        ("see ~/secrets/key.py for detail", []),
+    ],
+)
+def test_prompt_relative_path_extraction_excludes_absolute_tokens(
+    text: str, expected: list[str]
+) -> None:
+    """Kills the `or` -> `and` in `not token or startswith("/") or startswith("~")`.
+
+    Repo inference refuses to run against an unrelated cwd based on these
+    tokens, so admitting an absolute path here would let prompt text point
+    resolution outside the caller's repository.
+    """
+    from codex_dobby_mcp.paths import prompt_referenced_relative_paths
+
+    assert prompt_referenced_relative_paths(text) == expected
