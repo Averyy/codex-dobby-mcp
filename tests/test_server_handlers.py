@@ -340,3 +340,52 @@ async def test_wait_sink_message_is_none_for_a_non_string_title() -> None:
     await sink({}, 2, "task-A")
 
     assert [n.params.message for n in session.sent] == [None, None]
+
+
+# ------------------------------------------------------ sandboxing defaults
+def test_every_tool_publishes_danger_false_by_default() -> None:
+    """`danger` selects codex's `danger-full-access` sandbox.
+
+    The default lives in five places — the model field and four tool
+    signatures — and only the model one was pinned, so a drift in any tool
+    signature removed sandboxing from that tool with the whole suite green.
+    Asserting on the *published schema* covers every site at once, whatever
+    the Python default is spelled as.
+    """
+    from codex_dobby_mcp.models import DEFAULT_DANGER
+    from codex_dobby_mcp.server import create_server
+
+    assert DEFAULT_DANGER is False
+
+    server = create_server()
+    exposing = {
+        tool.name: tool.parameters["properties"]["danger"]
+        for tool in server._tool_manager.list_tools()
+        if "danger" in tool.parameters.get("properties", {})
+    }
+
+    # `build` and `reverse_engineer` expose it, plus `start_run` which can
+    # launch either. `validate` deliberately does not: it is a mutating tool
+    # that still never offers an unsandboxed mode.
+    assert set(exposing) == {"build", "reverse_engineer", "start_run"}
+    for name, schema in exposing.items():
+        assert schema.get("default") is False, f"{name} publishes danger={schema.get('default')!r}"
+        assert schema.get("type") == "boolean", name
+
+
+@pytest.mark.asyncio
+async def test_omitting_danger_keeps_every_mutating_tool_sandboxed(wired) -> None:
+    """The published default must survive into the resolved request."""
+    _server, tools, runner, _bg, repo = wired
+
+    from mcp.server.mcpserver import Context
+
+    for name in ("build", "reverse_engineer"):
+        runner.calls.clear()
+        await tools[name].run({"prompt": "p", "repo_root": str(repo)}, Context())
+        assert runner.calls[0]["request"].danger is False, name
+
+    # validate never offers the flag, so its request must still be sandboxed.
+    runner.calls.clear()
+    await tools["validate"].run({"prompt": "p", "repo_root": str(repo)}, Context())
+    assert runner.calls[0]["request"].danger is False

@@ -14,6 +14,7 @@ from codex_dobby_mcp._version import __version__
 from codex_dobby_mcp.background_runs import BackgroundRunManager
 from codex_dobby_mcp.models import (
     AsyncRunHandle,
+    DEFAULT_DANGER,
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     InvocationRequest,
     SUPPORTED_REVIEW_AGENTS_TEXT,
@@ -167,7 +168,7 @@ def _request_from_params(
     model: str | None = None,
     reasoning_effort: str | None = None,
     agents: list[ReviewAgent] | None = None,
-    danger: bool = False,
+    danger: bool = DEFAULT_DANGER,
 ) -> InvocationRequest:
     return InvocationRequest(
         prompt=prompt,
@@ -353,7 +354,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         extra_roots: list[str] | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
-        danger: bool = False,
+        danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> ToolResponse:
         """Implement a change, run focused verification, and report results. Recommended timeout: 20 minutes (1200s)."""
@@ -436,7 +437,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         extra_roots: list[str] | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
-        danger: bool = False,
+        danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> ToolResponse:
         """Use reverse-engineering tooling and broader roots to investigate binaries. Recommended timeout: 30 minutes (1800s)."""
@@ -465,7 +466,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         model: str | None = None,
         reasoning_effort: str | None = None,
         agents: ReviewAgentsParam = None,
-        danger: bool = False,
+        danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> AsyncRunHandle:
         """Start a Dobby tool in the background and return immediately with a task id. Wait for this specific call to return before looking up its run; independent start_run calls may execute in parallel. Then use wait_run(task_id=...) for one run or wait_run(task_ids=[...]) to be woken by whichever finishes first. Multi-agent review defaults to 1200 seconds when timeout_seconds is omitted. get_run/list_runs remain available for a non-blocking peek."""

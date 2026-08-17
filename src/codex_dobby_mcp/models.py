@@ -147,6 +147,10 @@ CODEX_DOBBY_GITIGNORE_ENTRY = ".codex-dobby/"
 RECURSION_GUARD_ENV = "CODEX_DOBBY_ACTIVE"
 READ_ONLY_TOOLS = frozenset({ToolName.PLAN, ToolName.RESEARCH, ToolName.BRAINSTORM, ToolName.REVIEW})
 MUTATING_TOOLS = frozenset({ToolName.BUILD, ToolName.VALIDATE, ToolName.REVERSE_ENGINEER})
+# Sandboxing is the default. `danger=True` selects codex's
+# `danger-full-access` sandbox, so this value is a security boundary and
+# the tool signatures that expose it must not drift from the model.
+DEFAULT_DANGER = False
 DEFAULT_REVIEW_AGENTS = (ReviewAgent.GENERALIST,)
 DEFAULT_REASONING_EFFORTS: dict[ToolName, ReasoningEffort] = {
     ToolName.BUILD: ReasoningEffort.HIGH,
@@ -178,7 +182,7 @@ class InvocationRequest(BaseModel):
     model: str | None = None
     reasoning_effort: ReasoningEffort | None = None
     agents: list[ReviewAgent] = Field(default_factory=list)
-    danger: bool = False
+    danger: bool = DEFAULT_DANGER
 
     @field_validator("files", "extra_roots")
     @classmethod
