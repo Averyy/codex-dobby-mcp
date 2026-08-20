@@ -64,6 +64,51 @@ jobs:
           --with pytest-asyncio
           pytest -o pythonpath=
 
+  live-codex-flags:
+    # The one lane that talks to the real codex CLI. It exists because Dobby
+    # passed --full-auto for years after codex-cli removed it: the unit tests
+    # asserted the flag was emitted, only the real binary could say it was no
+    # longer accepted. macos-latest because macOS is the platform Dobby targets.
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Install the latest codex CLI
+        # @openai/codex is distributed on npm as a small JS shim that selects a
+        # platform-native binary via optionalDependencies; the runner's
+        # preinstalled Node satisfies its `node >= 16` requirement. The version
+        # deliberately floats on the `latest` dist-tag, unlike everything else
+        # in this file: the lane's entire purpose is to detect when a new codex
+        # release changes the flag surface Dobby emits against, and pinning an
+        # exact version would freeze the very drift it exists to catch.
+        run: npm install -g @openai/codex@latest
+
+      - name: Report the codex version under test
+        # Fails the lane immediately if the install produced a broken binary,
+        # and records which upstream version a red run was red against.
+        run: codex --version
+
+      - name: Run live flag tests
+        # DOBBY_REQUIRE_LIVE=1 turns "codex missing => skip" into a hard
+        # failure (tests/conftest.py), so a broken install can never masquerade
+        # as a green lane. live_auth tests need real credentials and stay
+        # local-only; everything else marked live runs here. If the marker
+        # expression ever matches nothing, pytest exits 5 and the lane fails
+        # rather than passing vacuously.
+        env:
+          DOBBY_REQUIRE_LIVE: "1"
+        run: uv run pytest -m "live and not live_auth" -rs
+
   lint:
     runs-on: ubuntu-latest
 

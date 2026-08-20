@@ -311,4 +311,6 @@ The default suite includes a sanitized production-shape rollout corpus captured 
 CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live tests/test_live_codex_v2.py
 ```
 
+Tests marked `live` validate the flags Dobby emits against the real `codex exec --help`. On a machine without codex they skip cleanly. CI runs them in a dedicated lane against the latest published `@openai/codex` with `DOBBY_REQUIRE_LIVE=1`, which turns any skip of a no-auth live test — including a missing codex — into a hard failure, so upstream flag drift is caught and the lane can never silently degrade into a skip. Tests additionally marked `live_auth` need an authenticated Codex CLI and remain local-only.
+
 Release tags must exactly match `project.version`; for version `0.1.4`, publish tag `v0.1.4`. The publish workflow checks this before both testing and building. A release candidate is ready only after the normal test suite, the live v2 smoke test, `uv build`, and an installed-wheel MCP initialize check all pass. `AGENTS.md`, `CHANGELOG.md`, release checks, tests, and the sanitized v2 corpus are included in the source distribution so downstream maintainers and coding agents receive the same operating guidance.

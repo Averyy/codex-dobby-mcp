@@ -31,5 +31,6 @@
 - SDK 2.x never answers a request the client cancelled via `notifications/cancelled`, so Dobby carries no cancellation monkey-patch. If that upstream behaviour ever regresses, fix it upstream rather than re-adding a patch module.
 - Progress notifications use the SDK 2.x shapes: request `_meta` is a `RequestParamsMeta` TypedDict read with `meta.get("progress_token")`, and `ProgressNotification` is sent directly to `session.send_notification` with no `ServerNotification` wrapper. The wire payload is unchanged — `_meta.acpEvent`, `taskId`, and `perTaskCount` are a client-visible contract.
 - Run `uv run pytest`, then `CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live tests/test_live_codex_v2.py` with an authenticated Codex CLI before deploying a new Codex CLI compatibility baseline.
+- CI's `live-codex-flags` lane runs the no-auth `live` tests against the latest published `@openai/codex` with `DOBBY_REQUIRE_LIVE=1`, under which any skip of a no-auth live test is a failure. Do not add a skip condition to a `live` test expecting CI to tolerate it; tests that genuinely need credentials must also carry the `live_auth` marker.
 - Run `uv build` and verify the wheel over stdio. The MCP initialize response must advertise Dobby's package version, not the MCP SDK version.
 - Tag releases exactly as `v<project.version>`. The publish workflow rejects any mismatch.

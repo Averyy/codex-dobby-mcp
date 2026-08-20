@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 
 import pytest
@@ -14,13 +12,20 @@ from codex_dobby_mcp.server import create_runner
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CODEX_BINARY = os.environ.get("CODEX_BINARY") or shutil.which("codex")
+
+# danger is only exposed on the mutating tools, so only those combinations
+# exist to test; generating the impossible ones just to skip them would leave
+# skips in the CI live lane, where any skip of a live test is a failure.
+_DANGER_TOOLS = (ToolName.BUILD, ToolName.REVERSE_ENGINEER)
+_FLAG_CASES = [(tool, False) for tool in ToolName] + [
+    (tool, True) for tool in _DANGER_TOOLS
+]
 
 
-def _accepted_flags() -> set[str]:
+def _accepted_flags(codex_binary: str) -> set[str]:
     """Every long/short option `codex exec` advertises in its help output."""
     help_text = subprocess.run(
-        [CODEX_BINARY, "exec", "--help"],
+        [codex_binary, "exec", "--help"],
         capture_output=True,
         text=True,
         check=True,
@@ -30,11 +35,9 @@ def _accepted_flags() -> set[str]:
 
 
 @pytest.mark.live
-@pytest.mark.skipif(CODEX_BINARY is None, reason="codex CLI not on PATH")
-@pytest.mark.parametrize("tool", list(ToolName))
-@pytest.mark.parametrize("danger", [False, True])
+@pytest.mark.parametrize(("tool", "danger"), _FLAG_CASES)
 def test_generated_flags_are_accepted_by_the_installed_codex(
-    tool: ToolName, danger: bool
+    codex_binary: str, tool: ToolName, danger: bool
 ) -> None:
     """Every flag Dobby emits must exist in the installed codex CLI.
 
@@ -43,9 +46,6 @@ def test_generated_flags_are_accepted_by_the_installed_codex(
     happily asserted the flag was present. Unit tests cannot catch that; only
     the real CLI can say what it accepts.
     """
-    if danger and tool not in {ToolName.BUILD, ToolName.REVERSE_ENGINEER}:
-        pytest.skip("danger is only exposed on the mutating tools")
-
     runner = create_runner(REPO_ROOT)
     spec = runner.prepare(
         tool,
@@ -57,12 +57,12 @@ def test_generated_flags_are_accepted_by_the_installed_codex(
     )
     command = build_codex_command(
         spec,
-        CODEX_BINARY,
+        codex_binary,
         spec.artifacts.output_schema_json,
         runner.review_agents_root,
     )
 
-    accepted = _accepted_flags()
+    accepted = _accepted_flags(codex_binary)
     emitted = {
         argument
         for argument in command.argv
@@ -77,10 +77,11 @@ def test_generated_flags_are_accepted_by_the_installed_codex(
 
 
 @pytest.mark.live
-@pytest.mark.skipif(CODEX_BINARY is None, reason="codex CLI not on PATH")
-def test_sandbox_values_are_accepted_by_the_installed_codex() -> None:
+def test_sandbox_values_are_accepted_by_the_installed_codex(
+    codex_binary: str,
+) -> None:
     help_text = subprocess.run(
-        [CODEX_BINARY, "exec", "--help"],
+        [codex_binary, "exec", "--help"],
         capture_output=True,
         text=True,
         check=True,

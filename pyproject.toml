@@ -61,8 +61,12 @@ select = ["E4", "E7", "E9", "F", "B"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# --strict-markers: a typo'd marker must be a collection error, not a test
+# that silently drops out of the CI live lane's `-m` selection.
+addopts = ["--strict-markers"]
 markers = [
-    "live: opt-in tests that require an authenticated local Codex CLI",
+    "live: tests that exercise the real codex CLI; skipped when it is absent unless DOBBY_REQUIRE_LIVE=1 makes that a failure",
+    "live_auth: live tests that additionally need an authenticated Codex CLI; opt in with CODEX_DOBBY_RUN_LIVE_V2=1, never run in CI",
 ]
 
 [tool.uv.build-backend]

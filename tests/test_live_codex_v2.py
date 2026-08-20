@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.live
+@pytest.mark.live_auth
 @pytest.mark.skipif(
     not RUN_LIVE_V2,
     reason="set CODEX_DOBBY_RUN_LIVE_V2=1 to use the authenticated Codex CLI",

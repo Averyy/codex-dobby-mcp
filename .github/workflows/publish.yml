@@ -27,8 +27,39 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+  live-codex-flags:
+    # Shipping a release with upstream codex flag drift is exactly the failure
+    # the live tests exist to catch, and the plain `test` job above runs on a
+    # runner with no codex installed — there the live tests skip. This lane
+    # installs the latest published codex CLI and makes those skips illegal,
+    # so a release can never be gated by checks that silently did not run.
+    # See ci.yml's lane of the same name for the install and pinning rationale.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Install the latest codex CLI
+        run: npm install -g @openai/codex@latest
+
+      - name: Report the codex version under test
+        run: codex --version
+
+      - name: Run live flag tests
+        env:
+          DOBBY_REQUIRE_LIVE: "1"
+        run: uv run pytest -m "live and not live_auth" -rs
+
   publish:
-    needs: test
+    needs: [test, live-codex-flags]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,6 +84,6 @@ jobs:
         run: uv build
 
       - name: Publish package distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@v1.13.0
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0
         with:
           packages-dir: dist/
