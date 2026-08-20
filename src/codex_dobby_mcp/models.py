@@ -141,6 +141,11 @@ def parse_review_agents_input(value: object) -> list[ReviewAgent] | None:
 
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_TIMEOUT_SECONDS = 600
+# Floor for any explicit timeout. The prompt-side exploration tiers assume
+# budgets below this are unreachable, and the README restates the bound, so
+# a drifted copy would either resurrect dead prompt tiers or make the docs
+# lie about what validates.
+MIN_TIMEOUT_SECONDS = 300
 DEFAULT_TOOL_TIMEOUT_SECONDS: dict["ToolName", int] = {}  # populated after ToolName definition
 CODEX_DOBBY_DIRNAME = ".codex-dobby"
 CODEX_DOBBY_GITIGNORE_ENTRY = ".codex-dobby/"
@@ -152,13 +157,16 @@ MUTATING_TOOLS = frozenset({ToolName.BUILD, ToolName.VALIDATE, ToolName.REVERSE_
 # the tool signatures that expose it must not drift from the model.
 DEFAULT_DANGER = False
 DEFAULT_REVIEW_AGENTS = (ReviewAgent.GENERALIST,)
+# ToolName.REVIEW is deliberately absent: the runner resolves a direct review
+# through REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT and fixes an orchestrated
+# review parent at LOW, so an entry here would be dead code that is free to
+# contradict the real default (it did: HIGH, while direct review runs medium).
 DEFAULT_REASONING_EFFORTS: dict[ToolName, ReasoningEffort] = {
     ToolName.BUILD: ReasoningEffort.HIGH,
     ToolName.RESEARCH: ReasoningEffort.MEDIUM,
     ToolName.BRAINSTORM: ReasoningEffort.HIGH,
     ToolName.PLAN: ReasoningEffort.HIGH,
     ToolName.VALIDATE: ReasoningEffort.MEDIUM,
-    ToolName.REVIEW: ReasoningEffort.HIGH,
     ToolName.REVERSE_ENGINEER: ReasoningEffort.HIGH,
 }
 DEFAULT_TOOL_TIMEOUT_SECONDS.update({
@@ -170,6 +178,22 @@ DEFAULT_TOOL_TIMEOUT_SECONDS.update({
     ToolName.REVIEW: 600,
     ToolName.REVERSE_ENGINEER: 1800,
 })
+# Budget for a multi-agent (v2 orchestrated) review whichever entry point
+# launches it. `review` and `start_run` resolve an omitted timeout through the
+# same helper, so a drifted copy in either tool would silently give one entry
+# point a different budget for identical work.
+MULTI_AGENT_REVIEW_TIMEOUT_SECONDS = 1200
+# How long `wait_run` blocks before returning a still-running lookup. This is
+# published in the tool schema and restated in its prose and the README, so a
+# drifted copy changes how long every omitted-timeout wait blocks with nothing
+# failing.
+DEFAULT_WAIT_RUN_TIMEOUT_SECONDS = 540
+# Upper clamp on `wait_run` blocking, chosen to match Claude Code's
+# MCP_TOOL_TIMEOUT default (100_000_000 ms). Raising it past a client's
+# tools/call ceiling makes long waits die client-side; lowering it silently
+# caps them server-side, so the clamp, the tool prose, and the README must
+# agree.
+MAX_WAIT_RUN_TIMEOUT_SECONDS = 100_000
 
 
 class InvocationRequest(BaseModel):
@@ -177,7 +201,7 @@ class InvocationRequest(BaseModel):
     repo_root: str | None = None
     files: list[str] = Field(default_factory=list)
     important_context: str | None = None
-    timeout_seconds: int = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=300)
+    timeout_seconds: int = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=MIN_TIMEOUT_SECONDS)
     extra_roots: list[str] = Field(default_factory=list)
     model: str | None = None
     reasoning_effort: ReasoningEffort | None = None

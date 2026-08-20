@@ -389,3 +389,94 @@ async def test_omitting_danger_keeps_every_mutating_tool_sandboxed(wired) -> Non
     runner.calls.clear()
     await tools["validate"].run({"prompt": "p", "repo_root": str(repo)}, Context())
     assert runner.calls[0]["request"].danger is False
+
+
+# ------------------------------------------------------- timeout defaults
+def test_every_tool_publishes_its_own_timeout_default() -> None:
+    """Each direct tool's published timeout must be its own budget.
+
+    The per-tool default is written once in DEFAULT_TOOL_TIMEOUT_SECONDS but
+    referenced by ToolName key in every tool signature, so `research` quietly
+    inheriting plan's 600s was a one-token drift the whole suite missed.
+    Asserting the *published schema* (and pinning the dict itself, the way
+    DEFAULT_DANGER pins False) covers every signature at once, however the
+    default is spelled.
+    """
+    from codex_dobby_mcp.models import (
+        DEFAULT_TOOL_TIMEOUT_SECONDS,
+        MULTI_AGENT_REVIEW_TIMEOUT_SECONDS,
+    )
+
+    assert DEFAULT_TOOL_TIMEOUT_SECONDS == {
+        ToolName.PLAN: 600,
+        ToolName.RESEARCH: 1200,
+        ToolName.BRAINSTORM: 600,
+        ToolName.BUILD: 1200,
+        ToolName.VALIDATE: 600,
+        ToolName.REVIEW: 600,
+        ToolName.REVERSE_ENGINEER: 1800,
+    }
+    assert MULTI_AGENT_REVIEW_TIMEOUT_SECONDS == 1200
+
+    server = server_module.create_server()
+    tools = {t.name: t for t in server._tool_manager.list_tools()}
+
+    for name in ("plan", "research", "brainstorm", "build", "validate", "reverse_engineer"):
+        expected = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName(name)]
+        schema = tools[name].parameters["properties"]["timeout_seconds"]
+        assert schema.get("default") == expected, (name, schema.get("default"))
+        # The description interpolates the same constant; a re-hardcoded stale
+        # phrase must fail here even though the schema default is right.
+        assert f"({expected}s)" in tools[name].description, name
+
+    # review and start_run publish no fixed default: an omitted timeout is
+    # resolved by _effective_start_run_timeout to the tool's default or the
+    # multi-agent budget.
+    for name in ("review", "start_run"):
+        schema = tools[name].parameters["properties"]["timeout_seconds"]
+        assert schema.get("default") is None, name
+
+    assert (
+        f"Defaults to {DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVIEW]} seconds, "
+        f"or {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds for multi-agent review"
+    ) in tools["review"].description
+    assert (
+        f"Multi-agent review defaults to {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds" in tools["start_run"].description
+    )
+    assert f"Multi-agent start_run defaults to {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds" in server.instructions
+
+
+def test_wait_run_publishes_its_default_and_clamp() -> None:
+    """wait_run's blocking budget is a client-visible contract.
+
+    The 540s default lived only in the signature and its prose; flipping it to
+    60 left the whole suite green while every omitted-timeout wait_run changed
+    behaviour. The clamp bound is also restated in prose, which must not drift
+    from the value the handler enforces.
+    """
+    from codex_dobby_mcp.models import (
+        DEFAULT_WAIT_RUN_TIMEOUT_SECONDS,
+        MAX_WAIT_RUN_TIMEOUT_SECONDS,
+    )
+
+    assert DEFAULT_WAIT_RUN_TIMEOUT_SECONDS == 540
+    assert MAX_WAIT_RUN_TIMEOUT_SECONDS == 100_000
+
+    server = server_module.create_server()
+    tools = {t.name: t for t in server._tool_manager.list_tools()}
+    schema = tools["wait_run"].parameters["properties"]["timeout_seconds"]
+    assert schema.get("default") == DEFAULT_WAIT_RUN_TIMEOUT_SECONDS
+
+    description = tools["wait_run"].description
+    assert f"Default {DEFAULT_WAIT_RUN_TIMEOUT_SECONDS}s" in description
+    assert f"{MAX_WAIT_RUN_TIMEOUT_SECONDS:_}s" in description
+
+
+@pytest.mark.asyncio
+async def test_omitting_wait_run_timeout_uses_the_published_default(wired) -> None:
+    """The schema default must be what actually reaches the wait."""
+    from mcp.server.mcpserver import Context
+
+    _server, tools, _runner, bg, repo = wired
+    await tools["wait_run"].run({"repo_root": str(repo)}, Context())
+    assert bg.calls[0][2]["timeout_seconds"] == 540

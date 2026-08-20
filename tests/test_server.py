@@ -245,16 +245,24 @@ def test_absent_important_context_is_none_not_empty_string() -> None:
     ``str``; downstream still expects ``None`` when the caller passed nothing,
     including when a client sends an explicit ``null``.
     """
-    assert _request_from_params(prompt="p", repo_root="/tmp/repo").important_context is None
     assert (
         _request_from_params(
-            prompt="p", repo_root="/tmp/repo", important_context=""
+            prompt="p", repo_root="/tmp/repo", timeout_seconds=600
         ).important_context
         is None
     )
     assert (
         _request_from_params(
-            prompt="p", repo_root="/tmp/repo", important_context="ticket ABC-1"
+            prompt="p", repo_root="/tmp/repo", timeout_seconds=600, important_context=""
+        ).important_context
+        is None
+    )
+    assert (
+        _request_from_params(
+            prompt="p",
+            repo_root="/tmp/repo",
+            timeout_seconds=600,
+            important_context="ticket ABC-1",
         ).important_context
         == "ticket ABC-1"
     )
@@ -441,3 +449,79 @@ def test_event_sink_is_built_only_when_the_caller_asked_for_progress() -> None:
     assert params.message == "rg TODO"
     # _meta.acpEvent is a client-visible contract.
     assert params.meta["acpEvent"] == {"type": "tool_call", "title": "rg TODO"}
+
+
+def test_readme_restates_the_published_defaults() -> None:
+    """README.md hand-restates the default table and budgets; they must match the code.
+
+    The README cannot interpolate, so this is the drift guard: every number or
+    default it states is rebuilt here from the constants. It already caught one
+    real drift — the dead DEFAULT_REASONING_EFFORTS entry claiming review ran
+    at high effort while the runner actually resolves direct review to medium.
+    """
+    from codex_dobby_mcp.models import (
+        DEFAULT_MODEL,
+        DEFAULT_REASONING_EFFORTS,
+        DEFAULT_WAIT_RUN_TIMEOUT_SECONDS,
+        MAX_WAIT_RUN_TIMEOUT_SECONDS,
+        MIN_TIMEOUT_SECONDS,
+        MULTI_AGENT_REVIEW_TIMEOUT_SECONDS,
+        READ_ONLY_TOOLS,
+        ReasoningEffort,
+    )
+    from codex_dobby_mcp.review_agents import (
+        REVIEW_SUBAGENT_DEFAULT_MODEL,
+        REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT,
+    )
+
+    # Pin the per-tool reasoning decisions themselves (review is resolved via
+    # the subagent default instead; see models.DEFAULT_REASONING_EFFORTS).
+    assert DEFAULT_REASONING_EFFORTS == {
+        ToolName.PLAN: ReasoningEffort.HIGH,
+        ToolName.RESEARCH: ReasoningEffort.MEDIUM,
+        ToolName.BRAINSTORM: ReasoningEffort.HIGH,
+        ToolName.BUILD: ReasoningEffort.HIGH,
+        ToolName.VALIDATE: ReasoningEffort.MEDIUM,
+        ToolName.REVERSE_ENGINEER: ReasoningEffort.HIGH,
+    }
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+    def sandbox_cell(tool: ToolName) -> str:
+        return "read-only" if tool in READ_ONLY_TOOLS else "`-s workspace-write`"
+
+    for tool in (
+        ToolName.PLAN,
+        ToolName.RESEARCH,
+        ToolName.BRAINSTORM,
+        ToolName.VALIDATE,
+        ToolName.BUILD,
+        ToolName.REVERSE_ENGINEER,
+    ):
+        row = (
+            f"| `{tool.value}` | {DEFAULT_TOOL_TIMEOUT_SECONDS[tool]}s "
+            f"| {DEFAULT_REASONING_EFFORTS[tool].value} | {sandbox_cell(tool)} |"
+        )
+        assert row in readme, row
+
+    review_row = (
+        f"| `review` | {DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVIEW]}s default, "
+        f"{MULTI_AGENT_REVIEW_TIMEOUT_SECONDS}s recommended for multi-agent "
+        f"| {REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT.value} | {sandbox_cell(ToolName.REVIEW)} |"
+    )
+    assert review_row in readme
+
+    assert f"use `timeout_seconds={MULTI_AGENT_REVIEW_TIMEOUT_SECONDS}` for multi-agent review" in readme
+    assert f"normally with `timeout_seconds={MULTI_AGENT_REVIEW_TIMEOUT_SECONDS}`" in readme
+    assert f"multi-agent review automatically uses {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds" in readme
+    assert f"default {DEFAULT_WAIT_RUN_TIMEOUT_SECONDS}s / {DEFAULT_WAIT_RUN_TIMEOUT_SECONDS // 60} min" in readme
+    assert f"clamped to `[1, {MAX_WAIT_RUN_TIMEOUT_SECONDS:_}]`" in readme
+    assert f"capped at {MAX_WAIT_RUN_TIMEOUT_SECONDS:_}s" in readme
+    assert f"must be at least {MIN_TIMEOUT_SECONDS}s" in readme
+    assert "`generalist` (default)" in readme
+
+    # The README claims one default model "for all tools and review subagents".
+    # That sentence is only true while the two deliberately separate knobs
+    # agree; if they ever diverge, update the README and this test together.
+    assert REVIEW_SUBAGENT_DEFAULT_MODEL == DEFAULT_MODEL
+    assert f"Default model is `{DEFAULT_MODEL}` for all tools and review subagents" in readme

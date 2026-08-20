@@ -16,7 +16,10 @@ from codex_dobby_mcp.models import (
     AsyncRunHandle,
     DEFAULT_DANGER,
     DEFAULT_TOOL_TIMEOUT_SECONDS,
+    DEFAULT_WAIT_RUN_TIMEOUT_SECONDS,
     InvocationRequest,
+    MAX_WAIT_RUN_TIMEOUT_SECONDS,
+    MULTI_AGENT_REVIEW_TIMEOUT_SECONDS,
     SUPPORTED_REVIEW_AGENTS_TEXT,
     ReviewAgent,
     RunListResponse,
@@ -122,8 +125,20 @@ def _effective_start_run_timeout(
     if timeout_seconds is not None:
         return timeout_seconds
     if tool == ToolName.REVIEW and review_uses_orchestrator(agents):
-        return 1200
+        return MULTI_AGENT_REVIEW_TIMEOUT_SECONDS
     return DEFAULT_TOOL_TIMEOUT_SECONDS[tool]
+
+
+def _recommended_timeout_phrase(tool: ToolName) -> str:
+    """Render a tool's default budget for its published description.
+
+    The number is interpolated from DEFAULT_TOOL_TIMEOUT_SECONDS so the tool
+    prose cannot restate a stale value.
+    """
+    seconds = DEFAULT_TOOL_TIMEOUT_SECONDS[tool]
+    if seconds % 60 == 0:
+        return f"Recommended timeout: {seconds // 60} minutes ({seconds}s)."
+    return f"Recommended timeout: {seconds} seconds."
 
 
 def _reject_unknown_tool_arguments(server: MCPServer) -> None:
@@ -163,7 +178,9 @@ def _request_from_params(
     repo_root: str | None = None,
     files: list[str] | None = None,
     important_context: ImportantContextParam = "",
-    timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.PLAN],
+    # No default on purpose: every tool passes its own resolved budget, so a
+    # fallback here would be unreachable in production yet free to drift.
+    timeout_seconds: int,
     extra_roots: list[str] | None = None,
     model: str | None = None,
     reasoning_effort: str | None = None,
@@ -266,10 +283,17 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
     server = MCPServer(
         "codex-dobby-mcp",
         version=__version__,
-        instructions="Delegate scoped work to codex exec and return concise structured results. Always pass the absolute path of the caller's active git worktree as repo_root; Dobby deliberately does not guess or default it. Important: short timeouts cause failures. Use the selected tool's default timeout or longer; do not override it lower unless you have a specific reason. Review is direct with zero or one effective agent; pass two or more canonical agents for Codex multi-agent v2. Multi-agent start_run defaults to 1200 seconds when timeout_seconds is omitted. For long review, research, build, validate, or reverse_engineer work, prefer start_run plus wait_run. Always wait for each start_run to return its task_id before looking up that run; independent start_run calls may run in parallel. wait_run blocks until done or until its own timeout_seconds elapses, then re-call it as wait_run(task_ids=<the returned pending_task_ids>). If the caller is Claude Code and you want the parent to keep working instead of blocking in wait_run, schedule a poll of get_run via /loop or ScheduleWakeup. Use get_run/list_runs for a non-blocking peek or to recover a task id after a caller-side timeout. For multi-agent results, manifest_validated proves structural integrity while coverage_complete proves every lens completed; each reviewer's scope is delivered directly by Dobby rather than through the parent. Runs accept no further input once started.",
+        instructions=f"Delegate scoped work to codex exec and return concise structured results. Always pass the absolute path of the caller's active git worktree as repo_root; Dobby deliberately does not guess or default it. Important: short timeouts cause failures. Use the selected tool's default timeout or longer; do not override it lower unless you have a specific reason. Review is direct with zero or one effective agent; pass two or more canonical agents for Codex multi-agent v2. Multi-agent start_run defaults to {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds when timeout_seconds is omitted. For long review, research, build, validate, or reverse_engineer work, prefer start_run plus wait_run. Always wait for each start_run to return its task_id before looking up that run; independent start_run calls may run in parallel. wait_run blocks until done or until its own timeout_seconds elapses, then re-call it as wait_run(task_ids=<the returned pending_task_ids>). If the caller is Claude Code and you want the parent to keep working instead of blocking in wait_run, schedule a poll of get_run via /loop or ScheduleWakeup. Use get_run/list_runs for a non-blocking peek or to recover a task id after a caller-side timeout. For multi-agent results, manifest_validated proves structural integrity while coverage_complete proves every lens completed; each reviewer's scope is delivered directly by Dobby rather than through the parent. Runs accept no further input once started.",
     )
 
-    @server.tool(name="plan", structured_output=True)
+    @server.tool(
+        name="plan",
+        structured_output=True,
+        description=(
+            "Break down a task and propose a scoped plan without editing files. "
+            f"{_recommended_timeout_phrase(ToolName.PLAN)}"
+        ),
+    )
     async def plan(
         prompt: str,
         repo_root: RepoRootParam,
@@ -281,7 +305,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         reasoning_effort: str | None = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Break down a task and propose a scoped plan without editing files. Recommended timeout: 10 minutes (600s)."""
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
@@ -294,7 +317,14 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.PLAN, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="research", structured_output=True)
+    @server.tool(
+        name="research",
+        structured_output=True,
+        description=(
+            "Investigate code, docs, and context in read-only mode and report findings. "
+            f"{_recommended_timeout_phrase(ToolName.RESEARCH)}"
+        ),
+    )
     async def research(
         prompt: str,
         repo_root: RepoRootParam,
@@ -306,7 +336,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         reasoning_effort: str | None = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Investigate code, docs, and context in read-only mode and report findings. Recommended timeout: 20 minutes (1200s)."""
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
@@ -319,7 +348,14 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.RESEARCH, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="brainstorm", structured_output=True)
+    @server.tool(
+        name="brainstorm",
+        structured_output=True,
+        description=(
+            "Evaluate an idea, scope an MVP, and recommend whether it is worth building. "
+            f"{_recommended_timeout_phrase(ToolName.BRAINSTORM)}"
+        ),
+    )
     async def brainstorm(
         prompt: str,
         repo_root: RepoRootParam,
@@ -331,7 +367,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         reasoning_effort: str | None = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Evaluate an idea, scope an MVP, and recommend whether it is worth building. Recommended timeout: 10 minutes (600s)."""
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
@@ -344,7 +379,14 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.BRAINSTORM, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="build", structured_output=True)
+    @server.tool(
+        name="build",
+        structured_output=True,
+        description=(
+            "Implement a change, run focused verification, and report results. "
+            f"{_recommended_timeout_phrase(ToolName.BUILD)}"
+        ),
+    )
     async def build(
         prompt: str,
         repo_root: RepoRootParam,
@@ -357,7 +399,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Implement a change, run focused verification, and report results. Recommended timeout: 20 minutes (1200s)."""
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
@@ -371,7 +412,14 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.BUILD, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="validate", structured_output=True)
+    @server.tool(
+        name="validate",
+        structured_output=True,
+        description=(
+            "Run existing repo validation commands (build, test, lint) and report the results. "
+            f"{_recommended_timeout_phrase(ToolName.VALIDATE)}"
+        ),
+    )
     async def validate(
         prompt: str,
         repo_root: RepoRootParam,
@@ -383,7 +431,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         reasoning_effort: str | None = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Run existing repo validation commands (build, test, lint) and report the results. Recommended timeout: 10 minutes (600s)."""
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
@@ -396,7 +443,21 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.VALIDATE, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="review", structured_output=True)
+    @server.tool(
+        name="review",
+        structured_output=True,
+        description=(
+            "Review code directly with zero or one effective agent, or pass two or more canonical agents "
+            "to fan out through Codex multi-agent v2. Dobby verifies v2 support and independently "
+            "correlates each manifest entry with Codex session rollouts. In review_details, "
+            "manifest_validated proves the fan-out was structurally honest and coverage_complete proves "
+            "every selected lens completed. Each reviewer receives its scope directly from Dobby through "
+            "its own private agent definition, not through the orchestrating parent. "
+            f"Defaults to {DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVIEW]} seconds, "
+            f"or {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds for multi-agent review, "
+            "when timeout_seconds is omitted."
+        ),
+    )
     async def review(
         prompt: str,
         repo_root: RepoRootParam,
@@ -409,7 +470,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         agents: ReviewAgentsParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Review code directly with zero or one effective agent, or pass two or more canonical agents to fan out through Codex multi-agent v2. Dobby verifies v2 support and independently correlates each manifest entry with Codex session rollouts. In review_details, manifest_validated proves the fan-out was structurally honest and coverage_complete proves every selected lens completed. Each reviewer receives its scope directly from Dobby through its own private agent definition, not through the orchestrating parent. Defaults to 600 seconds, or 1200 seconds for multi-agent review, when timeout_seconds is omitted."""
         # Same default as start_run: a multi-agent fan-out through the same
         # orchestrator needs the same budget whichever entry point launched it.
         request = _request_from_params(
@@ -427,7 +487,14 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.REVIEW, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="reverse_engineer", structured_output=True)
+    @server.tool(
+        name="reverse_engineer",
+        structured_output=True,
+        description=(
+            "Use reverse-engineering tooling and broader roots to investigate binaries. "
+            f"{_recommended_timeout_phrase(ToolName.REVERSE_ENGINEER)}"
+        ),
+    )
     async def reverse_engineer(
         prompt: str,
         repo_root: RepoRootParam,
@@ -440,7 +507,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> ToolResponse:
-        """Use reverse-engineering tooling and broader roots to investigate binaries. Recommended timeout: 30 minutes (1800s)."""
         request = _request_from_params(
             prompt=prompt,
             repo_root=repo_root,
@@ -454,7 +520,18 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
         return await runner.run(ToolName.REVERSE_ENGINEER, request, event_sink=_build_event_sink(ctx))
 
-    @server.tool(name="start_run", structured_output=True)
+    @server.tool(
+        name="start_run",
+        structured_output=True,
+        description=(
+            "Start a Dobby tool in the background and return immediately with a task id. Wait for this "
+            "specific call to return before looking up its run; independent start_run calls may execute "
+            "in parallel. Then use wait_run(task_id=...) for one run or wait_run(task_ids=[...]) to be "
+            "woken by whichever finishes first. "
+            f"Multi-agent review defaults to {MULTI_AGENT_REVIEW_TIMEOUT_SECONDS} seconds "
+            "when timeout_seconds is omitted. get_run/list_runs remain available for a non-blocking peek."
+        ),
+    )
     async def start_run(
         tool: ToolName,
         prompt: str,
@@ -469,7 +546,6 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> AsyncRunHandle:
-        """Start a Dobby tool in the background and return immediately with a task id. Wait for this specific call to return before looking up its run; independent start_run calls may execute in parallel. Then use wait_run(task_id=...) for one run or wait_run(task_ids=[...]) to be woken by whichever finishes first. Multi-agent review defaults to 1200 seconds when timeout_seconds is omitted. get_run/list_runs remain available for a non-blocking peek."""
         effective_timeout_seconds = _effective_start_run_timeout(
             tool,
             timeout_seconds,
@@ -500,17 +576,33 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         resolved_repo_root = resolve_repo_root(runner.spawn_root, repo_root)
         return background_runs.get(resolved_repo_root, task_id)
 
-    @server.tool(name="wait_run", structured_output=True)
+    @server.tool(
+        name="wait_run",
+        structured_output=True,
+        description=(
+            "Call after start_run to block until a background run finishes. Pass task_id for one run, "
+            "task_ids=[...] to wait for whichever of several finishes FIRST, or omit both to wait on every "
+            "currently-live run for the repo. On completion returns the winning run's final ToolResponse "
+            "(pending_task_ids lists any still-running siblings); on timeout returns a RUNNING lookup whose "
+            "summary says to keep calling wait_run with pending_task_ids until one finishes. Background "
+            "tasks are shielded from waiter cancellation, so re-calling never loses work. "
+            f"Default {DEFAULT_WAIT_RUN_TIMEOUT_SECONDS}s ({DEFAULT_WAIT_RUN_TIMEOUT_SECONDS // 60} min); "
+            f"clamped to [1, {MAX_WAIT_RUN_TIMEOUT_SECONDS:_}s / ~{MAX_WAIT_RUN_TIMEOUT_SECONDS / 3600:.1f}h], "
+            "matching Claude Code's MCP_TOOL_TIMEOUT default. Pick timeout_seconds below your own MCP "
+            "client's tools/call ceiling — Claude Code defaults to ~28h (the full clamp is usable); Codex "
+            "CLI defaults to 60s per [mcp_servers.<id>].tool_timeout_sec (raise that first); Claude Desktop "
+            "/ Cursor / Cline / Continue vary."
+        ),
+    )
     async def wait_run(
         repo_root: RepoRootParam,
         task_id: str | None = None,
         task_ids: list[str] | None = None,
-        timeout_seconds: int = 540,
+        timeout_seconds: int = DEFAULT_WAIT_RUN_TIMEOUT_SECONDS,
         ctx: Context | None = None,
     ) -> RunLookupResponse:
-        """Call after start_run to block until a background run finishes. Pass task_id for one run, task_ids=[...] to wait for whichever of several finishes FIRST, or omit both to wait on every currently-live run for the repo. On completion returns the winning run's final ToolResponse (pending_task_ids lists any still-running siblings); on timeout returns a RUNNING lookup whose summary says to keep calling wait_run with pending_task_ids until one finishes. Background tasks are shielded from waiter cancellation, so re-calling never loses work. Default 540s (9 min); clamped to [1, 100_000s / ~27.8h], matching Claude Code's MCP_TOOL_TIMEOUT default. Pick timeout_seconds below your own MCP client's tools/call ceiling — Claude Code defaults to ~28h (the full clamp is usable); Codex CLI defaults to 60s per [mcp_servers.<id>].tool_timeout_sec (raise that first); Claude Desktop / Cursor / Cline / Continue vary."""
         resolved_repo_root = resolve_repo_root(runner.spawn_root, repo_root)
-        clamped = max(1, min(int(timeout_seconds), 100_000))
+        clamped = max(1, min(int(timeout_seconds), MAX_WAIT_RUN_TIMEOUT_SECONDS))
         return await background_runs.wait(
             resolved_repo_root,
             task_id=task_id,
