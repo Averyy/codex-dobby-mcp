@@ -1,0 +1,480 @@
+{
+ "recorded": "2026-08-16",
+ "commit": "05ebfe54106c567b4baced93ae08de633776bf2f",
+ "tool": "scripts/mutation_test.py",
+ "note": "Full-sweep baseline. Survivors listed here are expected and do not fail the CI mutation lane; the subset proven semantically unkillable is documented in TODO.md under 'Known-equivalent mutants'. Refresh with: uv run python scripts/mutation_test.py sweep --update-baseline",
+ "mutants": 812,
+ "killed": 743,
+ "survived": 69,
+ "score_percent": 91.5,
+ "per_file": {
+  "background_runs.py": {
+   "killed": 44,
+   "survived": 9
+  },
+  "codex_cli.py": {
+   "killed": 36,
+   "survived": 1
+  },
+  "events.py": {
+   "killed": 49,
+   "survived": 1
+  },
+  "gitignore.py": {
+   "killed": 12,
+   "survived": 0
+  },
+  "logging_utils.py": {
+   "killed": 6,
+   "survived": 0
+  },
+  "models.py": {
+   "killed": 15,
+   "survived": 0
+  },
+  "paths.py": {
+   "killed": 59,
+   "survived": 2
+  },
+  "prompts.py": {
+   "killed": 9,
+   "survived": 2
+  },
+  "review_agents.py": {
+   "killed": 2,
+   "survived": 1
+  },
+  "runner.py": {
+   "killed": 475,
+   "survived": 51
+  },
+  "safeguards.py": {
+   "killed": 2,
+   "survived": 0
+  },
+  "server.py": {
+   "killed": 32,
+   "survived": 2
+  },
+  "snapshot_worker.py": {
+   "killed": 2,
+   "survived": 0
+  }
+ },
+ "survivors": [
+  {
+   "file": "background_runs.py",
+   "line": 176,
+   "op": "And->Or",
+   "text": "if event_sink is not None and not entry.task.done():"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 208,
+   "op": "IsNot->Is",
+   "text": "if subscriber_queue is not None and entry is not None and subscriber_queue in entry.subscribers:"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 208,
+   "op": "IsNot->Is",
+   "text": "if subscriber_queue is not None and entry is not None and subscriber_queue in entry.subscribers:"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 212,
+   "op": "drop not",
+   "text": "if forward_task is not None and not forward_task.done():"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 256,
+   "op": "IsNot->Is",
+   "text": "if event_sink is not None:"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 277,
+   "op": "drop not",
+   "text": "if not fut.done():"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 383,
+   "op": "True->False",
+   "text": "write_json(spec.artifacts.result_json, response.model_dump(mode=\"json\", by_alias=True))"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 394,
+   "op": "True->False",
+   "text": "write_json(spec.artifacts.result_json, response.model_dump(mode=\"json\", by_alias=True))"
+  },
+  {
+   "file": "background_runs.py",
+   "line": 665,
+   "op": "drop not",
+   "text": "if not spec.ghidra_available:"
+  },
+  {
+   "file": "codex_cli.py",
+   "line": 18,
+   "op": "True->False",
+   "text": "@dataclass(frozen=True)"
+  },
+  {
+   "file": "events.py",
+   "line": 143,
+   "op": "Or->And",
+   "text": "if isinstance(path, str) and (isinstance(old_text, str) or isinstance(new_text, str)):"
+  },
+  {
+   "file": "paths.py",
+   "line": 237,
+   "op": "Or->And",
+   "text": "if not path.exists() or not path.is_dir():"
+  },
+  {
+   "file": "paths.py",
+   "line": 410,
+   "op": "True->False",
+   "text": "serialized = json.dumps(payload, indent=2, sort_keys=True) + \"\\n\""
+  },
+  {
+   "file": "prompts.py",
+   "line": 389,
+   "op": "Or->And",
+   "text": "if not isinstance(instructions, str) or not instructions.strip():"
+  },
+  {
+   "file": "prompts.py",
+   "line": 404,
+   "op": "GtE->Gt",
+   "text": "if wrap_up_seconds >= available_seconds:"
+  },
+  {
+   "file": "review_agents.py",
+   "line": 9,
+   "op": "True->False",
+   "text": "@dataclass(frozen=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 110,
+   "op": "True->False",
+   "text": "@dataclass(frozen=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 166,
+   "op": "True->False",
+   "text": "@dataclass(frozen=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 221,
+   "op": "True->False",
+   "text": "@dataclass(frozen=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 232,
+   "op": "True->False",
+   "text": "@dataclass(frozen=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 295,
+   "op": "True->False",
+   "text": "write_json(spec.artifacts.result_json, preflight_response.model_dump(mode=\"json\", by_alias=True))"
+  },
+  {
+   "file": "runner.py",
+   "line": 300,
+   "op": "False->True",
+   "text": "cancelled = False"
+  },
+  {
+   "file": "runner.py",
+   "line": 302,
+   "op": "And->Or",
+   "text": "if spec.tool == ToolName.REVIEW and review_uses_orchestrator("
+  },
+  {
+   "file": "runner.py",
+   "line": 359,
+   "op": "IsNot->Is",
+   "text": "if scratch_issue is not None and response is not None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 400,
+   "op": "And->Or",
+   "text": "elif ("
+  },
+  {
+   "file": "runner.py",
+   "line": 462,
+   "op": "False->True",
+   "text": "timeout_hit = False"
+  },
+  {
+   "file": "runner.py",
+   "line": 542,
+   "op": "True->False",
+   "text": "recovered_review_from_rollouts = True"
+  },
+  {
+   "file": "runner.py",
+   "line": 545,
+   "op": "Is->IsNot",
+   "text": "if worker_result is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 738,
+   "op": "And->Or",
+   "text": "if exit_code not in (0, None) and not stall_hit and not timeout_hit:"
+  },
+  {
+   "file": "runner.py",
+   "line": 744,
+   "op": "Is->IsNot",
+   "text": "if stop_reason is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 756,
+   "op": "drop not",
+   "text": "elif not review_execution_diagnostics.all_completed:"
+  },
+  {
+   "file": "runner.py",
+   "line": 757,
+   "op": "True->False",
+   "text": "recoverable_orchestration_only = True"
+  },
+  {
+   "file": "runner.py",
+   "line": 800,
+   "op": "Is->IsNot",
+   "text": "if stop_reason is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 807,
+   "op": "Is->IsNot",
+   "text": "if stop_reason is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 809,
+   "op": "In->NotIn",
+   "text": "if tool in READ_ONLY_TOOLS and spec.gitignore_updated:"
+  },
+  {
+   "file": "runner.py",
+   "line": 838,
+   "op": "Eq->NotEq",
+   "text": "elif recoverable_orchestration_only and completeness == Completeness.FULL:"
+  },
+  {
+   "file": "runner.py",
+   "line": 890,
+   "op": "True->False",
+   "text": "write_json(spec.artifacts.result_json, response.model_dump(mode=\"json\", by_alias=True))"
+  },
+  {
+   "file": "runner.py",
+   "line": 981,
+   "op": "True->False",
+   "text": "write_json(spec.artifacts.result_json, stub.model_dump(mode=\"json\", by_alias=True))"
+  },
+  {
+   "file": "runner.py",
+   "line": 1008,
+   "op": "True->False",
+   "text": "write_json(spec.artifacts.result_json, response.model_dump(mode=\"json\", by_alias=True))"
+  },
+  {
+   "file": "runner.py",
+   "line": 1109,
+   "op": "And->Or",
+   "text": "elif tool == ToolName.REVIEW and review_uses_orchestrator(request.agents):"
+  },
+  {
+   "file": "runner.py",
+   "line": 1414,
+   "op": "Lt->LtE",
+   "text": "if len(entry) < 4:"
+  },
+  {
+   "file": "runner.py",
+   "line": 1846,
+   "op": "And->Or",
+   "text": "if isinstance(item, dict) and _is_consumed_rollout_record(item):"
+  },
+  {
+   "file": "runner.py",
+   "line": 1910,
+   "op": "Or->And",
+   "text": "if not isinstance(root_thread_id, str) or not root_thread_id:"
+  },
+  {
+   "file": "runner.py",
+   "line": 1921,
+   "op": "Or->And",
+   "text": "rendered_versions = \", \".join("
+  },
+  {
+   "file": "runner.py",
+   "line": 1963,
+   "op": "And->Or",
+   "text": "if isinstance(call_id, str) and isinstance(call_name, str):"
+  },
+  {
+   "file": "runner.py",
+   "line": 2030,
+   "op": "And->Or",
+   "text": "if item.get(\"type\") == \"response_item\" and payload.get(\"type\") == \"agent_message\":"
+  },
+  {
+   "file": "runner.py",
+   "line": 2293,
+   "op": "Or->And",
+   "text": "rendered_roles = \", \".join(role or \"<missing>\" for role in evidence.child_roles)"
+  },
+  {
+   "file": "runner.py",
+   "line": 2702,
+   "op": "drop not",
+   "text": "if not candidates and isinstance(payload, str):"
+  },
+  {
+   "file": "runner.py",
+   "line": 3076,
+   "op": "Gt->GtE",
+   "text": "i = j + 1 if j > i + 1 else i + 1"
+  },
+  {
+   "file": "runner.py",
+   "line": 3142,
+   "op": "True->False",
+   "text": "payload = worker_result.model_dump(mode=\"json\", by_alias=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 3316,
+   "op": "And->Or",
+   "text": "if process_task.done() and not process_task.cancelled():"
+  },
+  {
+   "file": "runner.py",
+   "line": 3428,
+   "op": "IsNot->Is",
+   "text": "if scratch_root is not None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 3430,
+   "op": "IsNot->Is",
+   "text": "if private_root is not None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 3507,
+   "op": "Or->And",
+   "text": "if not source.is_file() or not os.access(source, os.R_OK):"
+  },
+  {
+   "file": "runner.py",
+   "line": 3583,
+   "op": "Lt->LtE",
+   "text": "while end < len(payload) and payload[end] not in _CONFIG_PATH_DELIMITERS:"
+  },
+  {
+   "file": "runner.py",
+   "line": 3632,
+   "op": "Eq->NotEq",
+   "text": "elif reference.parent == source_root:"
+  },
+  {
+   "file": "runner.py",
+   "line": 3648,
+   "op": "True->False",
+   "text": "target_item.parent.mkdir(parents=True, exist_ok=True)"
+  },
+  {
+   "file": "runner.py",
+   "line": 3820,
+   "op": "True->False",
+   "text": "path.mkdir(parents=True, mode=0o700)"
+  },
+  {
+   "file": "runner.py",
+   "line": 3859,
+   "op": "IsNot->Is",
+   "text": "if self._handle is not None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 3903,
+   "op": "False->True",
+   "text": "line = (json.dumps(event, ensure_ascii=False) + \"\\n\").encode(\"utf-8\")"
+  },
+  {
+   "file": "runner.py",
+   "line": 3950,
+   "op": "Is->IsNot",
+   "text": "if getattr(process, \"returncode\", None) is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 3971,
+   "op": "False->True",
+   "text": "stall_flag: list[bool] = [False]"
+  },
+  {
+   "file": "runner.py",
+   "line": 3999,
+   "op": "Is->IsNot",
+   "text": "if getattr(process, \"returncode\", None) is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 4003,
+   "op": "And->Or",
+   "text": "if stall_flag[0] and cleanup_timeout is None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 4027,
+   "op": "GtE->Gt",
+   "text": "if idle >= threshold_seconds:"
+  },
+  {
+   "file": "runner.py",
+   "line": 4082,
+   "op": "IsNot->Is",
+   "text": "if tracker is not None:"
+  },
+  {
+   "file": "runner.py",
+   "line": 4172,
+   "op": "False->True",
+   "text": "return (None, False)"
+  },
+  {
+   "file": "server.py",
+   "line": 145,
+   "op": "True->False",
+   "text": "tool.parameters = arg_model.model_json_schema(by_alias=True)"
+  },
+  {
+   "file": "server.py",
+   "line": 246,
+   "op": "Or->And",
+   "text": "message = event.get(\"title\") or event.get(\"type\")"
+  }
+ ]
+}

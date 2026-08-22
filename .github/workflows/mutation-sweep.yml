@@ -1,0 +1,58 @@
+name: Mutation sweep
+
+on:
+  schedule:
+    # Weekly, Monday 06:17 UTC. Weekly rather than nightly because every PR
+    # already mutation-tests its own changed lines (ci.yml); this sweep exists
+    # to catch the one class the incremental lane cannot attribute to a diff —
+    # a change to one line weakening the tests that guard an UNchanged line —
+    # and that drift accumulates over weeks, not hours. The odd minute avoids
+    # GitHub's top-of-hour scheduler congestion.
+    - cron: "17 6 * * 1"
+  # On demand, e.g. to confirm a refresh of scripts/mutation_baseline.json.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-sweep:
+    # macos-latest so kills match the environment the baseline was recorded in:
+    # macOS is the platform Dobby targets, and the suite's platform- and
+    # codex-dependent tests must behave as they did when the baseline survivor
+    # list was measured, or unrelated mutants would resurface as fake decay.
+    runs-on: macos-latest
+    # ~800 mutants at the runner's core count is on the order of an hour or
+    # two; the six-hour default would let a wedged run burn the whole budget.
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --group dev --group mutation
+
+      - name: Install the latest codex CLI
+        # Same reasoning as ci.yml's mutation lane: the recorded baseline is
+        # measured against the full suite, live tests included, so the sweep
+        # must run them too.
+        run: npm install -g @openai/codex@latest
+
+      - name: Report the codex version under test
+        run: codex --version
+
+      - name: Run the full mutation sweep
+        # Fails on any survivor scripts/mutation_baseline.json does not
+        # excuse: decay becomes a red run instead of a silently rotting score.
+        # The full survivor report with per-file counts is in this step's log.
+        # DOBBY_REQUIRE_LIVE=1: a broken codex install must be a loud baseline
+        # failure, never silently skipped live tests and fake survivors.
+        env:
+          DOBBY_REQUIRE_LIVE: "1"
+        run: uv run python scripts/mutation_test.py sweep --check

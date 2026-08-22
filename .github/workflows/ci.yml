@@ -109,6 +109,54 @@ jobs:
           DOBBY_REQUIRE_LIVE: "1"
         run: uv run pytest -m "live and not live_auth" -rs
 
+  mutation-changed-lines:
+    # Mutation-tests only the lines this PR changed: scripts/mutation_test.py
+    # flips one executed comparison, boolean operator, `not`, or bool constant
+    # at a time and some test must fail. A survivor that the recorded baseline
+    # (scripts/mutation_baseline.json) does not excuse fails the job — the PR
+    # must add a killing test or, for a provably equivalent mutant, a TODO.md
+    # registry entry plus a baseline refresh. Pull requests only: a push to
+    # main has no reviewable diff to attribute mutants to, and the scheduled
+    # full sweep (mutation-sweep.yml) watches for drift there.
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # The incremental mode diffs against merge-base(origin/<base>, HEAD),
+          # so the base branch's history must exist locally.
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --group dev --group mutation
+
+      - name: Install the latest codex CLI
+        # The recorded mutation baseline is measured against the full suite,
+        # live tests included, so this lane installs codex exactly as the
+        # live-codex-flags lane does. Without it, a mutant whose only killer
+        # is a live test would resurface here as a false "new survivor".
+        run: npm install -g @openai/codex@latest
+
+      - name: Report the codex version under test
+        run: codex --version
+
+      - name: Mutation-test the changed lines
+        # DOBBY_REQUIRE_LIVE=1 turns a missing or broken codex into a loud
+        # baseline failure (exit 2) instead of silently skipped live tests
+        # that would misreport live-killed mutants as survivors.
+        env:
+          DOBBY_REQUIRE_LIVE: "1"
+        run: >-
+          uv run python scripts/mutation_test.py sweep
+          --since "origin/${{ github.base_ref }}" --check
+
   lint:
     runs-on: ubuntu-latest
 
@@ -122,4 +170,4 @@ jobs:
           python-version: "3.12"
 
       - name: Lint
-        run: uvx ruff check src tests
+        run: uvx ruff check src tests scripts

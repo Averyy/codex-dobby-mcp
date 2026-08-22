@@ -45,6 +45,11 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
 ]
+# Only needed by scripts/mutation_test.py, which uses coverage to restrict
+# mutants to lines the suite actually executes.
+mutation = [
+    "coverage>=7.6",
+]
 
 [tool.ruff]
 target-version = "py312"

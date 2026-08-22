@@ -149,9 +149,15 @@ moving the compatibility baseline off `codex-cli 0.147.0`.
 
 ### Known-equivalent mutants (do not "fix" with tests)
 
-Mutation testing over every executed comparison, boolean operator, `not`, and
-bool constant reports these as surviving. Each was checked and is genuinely
-unkillable, so a test for it would assert nothing:
+Mutation testing (`scripts/mutation_test.py`, see AGENTS.md) over every
+executed comparison, boolean operator, `not`, and bool constant reports these
+as surviving. Each was checked and is genuinely unkillable, so a test for it
+would assert nothing. The machine-readable survivor list that the CI mutation
+lane consults — these equivalents and the not-yet-killed remainder alike — is
+`scripts/mutation_baseline.json`; this section stays the home of the proofs.
+When a new survivor is genuinely equivalent, record the proof here and refresh
+the baseline with `uv run python scripts/mutation_test.py sweep
+--update-baseline`. A survivor with no entry here is presumed a test gap:
 
 - `@dataclass(frozen=True)` -> `frozen=False` on six dataclasses. Nothing
   mutates these instances, so immutability has no observable effect.

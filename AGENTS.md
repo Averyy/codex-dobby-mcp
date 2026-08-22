@@ -7,6 +7,35 @@
 - Run the focused tests for changed code, then `uv run pytest` before handing off a runtime change.
 - Keep `README.md`, MCP tool descriptions, schemas, prompts, and tests synchronized when changing a public request or response contract.
 
+## Mutation testing
+
+The suite's strength is scored by `scripts/mutation_test.py`: it flips one
+executed comparison, boolean operator, `not`, or bool constant at a time, and
+some test must fail. The recorded full-sweep baseline lives in
+`scripts/mutation_baseline.json`; survivors listed there are expected, and the
+subset proven semantically unkillable is documented in TODO.md under
+"Known-equivalent mutants". Both tools snapshot the exact working tree —
+uncommitted changes included — into throwaway git worktrees and never modify
+the real checkout.
+
+- One-time setup: `uv sync --group mutation` (adds `coverage`).
+- Changed lines only, what CI runs on every pull request:
+  `uv run python scripts/mutation_test.py sweep --since origin/main --check`
+- Full sweep (roughly half an hour; CI repeats it weekly via
+  `mutation-sweep.yml`): `uv run python scripts/mutation_test.py sweep --check`
+- Refresh the recorded baseline after a full sweep — never from a `--since`
+  run: `uv run python scripts/mutation_test.py sweep --update-baseline`
+- Prove that named tests kill hand-written mutations:
+  `uv run python scripts/mutation_test.py verify spec.json tests/test_file.py`,
+  where `spec.json` is a JSON list of `{"file", "line", "new", "label"}`
+  objects (file is a basename under `src/codex_dobby_mcp`).
+
+A new survivor on lines you changed fails the CI lane: add a test that kills
+it, or — only if the mutant is provably equivalent — add the proof to TODO.md
+and refresh the baseline in the same change. Baseline matching keys on the
+survivor's source-line text, not its line number, so refactors that move
+known-weak lines do not fail the lane, while edits that rewrite one do.
+
 ## Calling the Dobby MCP tools
 
 - Call the `codex-dobby` MCP tool directly; do not wrap it in another generic Agent/Task subagent.
