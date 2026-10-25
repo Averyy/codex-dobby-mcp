@@ -4,6 +4,8 @@ All notable user-facing changes to Codex Dobby MCP are recorded here.
 
 ## 0.1.4 - unreleased
 
+- Default to GPT-6.1 Sol. Start routine technical tools at medium reasoning, keep reverse engineering at high, and keep the multi-agent coordinator at low. Explicit model and effort overrides still work.
+- Support Codex CLI 0.164 multi-agent review rollouts: correlate v2 child sessions with spawn outputs when started events are absent, cap session slots, and reject reviewer collaboration calls. Retain the Codex 0.147 rollout compatibility fixture.
 - Require an explicit absolute `repo_root` on every MCP tool, including run lookup and wait tools.
 - Move multi-lens review fan-out to Codex multi-agent v2 with deterministic custom reviewer roles, bounded concurrency, and independently verified rollout evidence.
 - Distinguish manifest integrity (`manifest_validated`) from complete review coverage (`coverage_complete`) and salvage only strictly validated delivered child results.

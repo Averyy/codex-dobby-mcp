@@ -190,6 +190,20 @@ class ReviewRolloutAgentEvidence:
     started_thread_ids: tuple[str | None, ...] = ()
     reported_mutation_paths: tuple[str, ...] = ()
     reported_file_diffs: bool = False
+    spawn_output_task_names: tuple[str | None, ...] = ()
+    nested_collaboration_calls: tuple[str, ...] = ()
+
+    @property
+    def child_identity_valid(self) -> bool:
+        if self.child_multi_agent_versions == ("disabled",):
+            return self.started_count == 1 and self.started_thread_ids == self.child_thread_ids
+        if self.child_multi_agent_versions == ("v2",):
+            return (
+                self.started_count in (0, 1)
+                and (not self.started_thread_ids or self.started_thread_ids == self.child_thread_ids)
+                and self.spawn_output_task_names == (f"/root/{self.task_name}",)
+            )
+        return False
 
     @property
     def observed_status(self) -> ReviewAgentExecutionStatus:
@@ -197,16 +211,15 @@ class ReviewRolloutAgentEvidence:
             self.spawn_attempt_count != 1
             or self.spawn_contract_issues
             or self.attestation_issues
-            or self.started_count != 1
             or len(self.child_thread_ids) != 1
-            or self.started_thread_ids != self.child_thread_ids
             or self.child_roles != (self.agent_role,)
-            or self.child_multi_agent_versions != ("disabled",)
+            or not self.child_identity_valid
             or self.terminal_event_count != 1
             or self.delivered_count != 1
             or self.child_result is None
             or self.reported_mutation_paths
             or self.reported_file_diffs
+            or self.nested_collaboration_calls
         ):
             return ReviewAgentExecutionStatus.FAILED
         if self.child_result.refused:
@@ -1930,6 +1943,8 @@ def _review_rollout_evidence(
         )
 
     spawn_attempts: list[str] = []
+    spawn_call_ids: dict[str, str] = {}
+    spawn_output_task_names: dict[str, list[str | None]] = {}
     spawn_contract_issues: dict[str, list[str]] = {}
     attestation_issues: dict[str, list[str]] = {}
     started_paths: list[str] = []
@@ -1976,6 +1991,8 @@ def _review_rollout_evidence(
             task_name = arguments.get("task_name") if isinstance(arguments, dict) else None
             if isinstance(task_name, str) and task_name:
                 spawn_attempts.append(task_name)
+                if isinstance(call_id, str):
+                    spawn_call_ids[call_id] = task_name
                 definition = expected_tasks.get(task_name)
                 if definition is not None:
                     spawn_contract_issues.setdefault(task_name, []).extend(
@@ -1992,6 +2009,18 @@ def _review_rollout_evidence(
         if item.get("type") == "response_item" and payload.get("type") == "function_call_output":
             call_id = payload.get("call_id")
             raw_output = payload.get("output")
+            if isinstance(call_id, str) and call_id in spawn_call_ids:
+                observed_name = None
+                if isinstance(raw_output, str):
+                    try:
+                        parsed_output = json.loads(raw_output)
+                    except json.JSONDecodeError:
+                        parsed_output = None
+                    if isinstance(parsed_output, dict) and isinstance(
+                        parsed_output.get("task_name"), str
+                    ):
+                        observed_name = parsed_output["task_name"]
+                spawn_output_task_names.setdefault(spawn_call_ids[call_id], []).append(observed_name)
             if (
                 not isinstance(call_id, str)
                 or collaboration_calls.get(call_id) != "list_agents"
@@ -2107,6 +2136,7 @@ def _review_rollout_evidence(
         child_thread_ids: list[str] = []
         child_roles: list[str | None] = []
         child_multi_agent_versions: list[str | None] = []
+        nested_collaboration_calls: list[str] = []
         child_results: list[WorkerResult] = []
         terminal_event_count = 0
         reported_mutation_paths: set[str] = set(
@@ -2128,6 +2158,16 @@ def _review_rollout_evidence(
             )
             for item in items:
                 payload = item.get("payload")
+                if (
+                    item.get("type") == "response_item"
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "function_call"
+                    and payload.get("name") in {
+                        "spawn_agent", "followup_task", "send_message", "interrupt_agent",
+                        "list_agents", "wait_agent",
+                    }
+                ):
+                    nested_collaboration_calls.append(payload["name"])
                 if (
                     item.get("type") == "event_msg"
                     and isinstance(payload, dict)
@@ -2202,6 +2242,8 @@ def _review_rollout_evidence(
                 terminal_event_count=terminal_event_count,
                 reported_mutation_paths=tuple(sorted(reported_mutation_paths)),
                 reported_file_diffs=reported_file_diffs,
+                spawn_output_task_names=tuple(spawn_output_task_names.get(task_name, [])),
+                nested_collaboration_calls=tuple(nested_collaboration_calls),
             )
         )
 
@@ -2289,6 +2331,11 @@ def _rollout_validation_issues(
         )
     if evidence.reported_file_diffs:
         integrity.append(f"{evidence.task_name} review child returned non-empty file_diffs")
+    if evidence.nested_collaboration_calls:
+        integrity.append(
+            f"{evidence.task_name} review child attempted collaboration: "
+            + ", ".join(evidence.nested_collaboration_calls)
+        )
     if evidence.child_roles and evidence.child_roles != (evidence.agent_role,):
         rendered_roles = ", ".join(role or "<missing>" for role in evidence.child_roles)
         integrity.append(
@@ -2297,30 +2344,38 @@ def _rollout_validation_issues(
         )
     if (
         evidence.child_multi_agent_versions
-        and evidence.child_multi_agent_versions != ("disabled",)
+        and evidence.child_multi_agent_versions not in {("disabled",), ("v2",)}
     ):
         rendered_versions = ", ".join(
             version or "<missing>" for version in evidence.child_multi_agent_versions
         )
         integrity.append(
-            f"{evidence.task_name} child multi-agent isolation mismatch: expected disabled; "
+            f"{evidence.task_name} child multi-agent mode mismatch: expected disabled or verified v2; "
             f"observed {rendered_versions}"
         )
+    if evidence.child_multi_agent_versions == ("v2",):
+        expected_output = (f"/root/{evidence.task_name}",)
+        if evidence.spawn_output_task_names and evidence.spawn_output_task_names != expected_output:
+            integrity.append(
+                f"{evidence.task_name} spawn output did not match its child path"
+            )
 
     observed_status = evidence.observed_status
     missing_or_mismatched: list[str] = []
     if evidence.spawn_attempt_count != 1:
         missing_or_mismatched.append(f"spawn_attempts={evidence.spawn_attempt_count}")
-    if evidence.started_count != 1:
+    if evidence.child_multi_agent_versions == ("disabled",) and evidence.started_count != 1:
+        missing_or_mismatched.append(f"started_events={evidence.started_count}")
+    if evidence.child_multi_agent_versions == ("v2",) and evidence.started_count not in (0, 1):
         missing_or_mismatched.append(f"started_events={evidence.started_count}")
     if len(evidence.child_thread_ids) != 1:
         missing_or_mismatched.append(f"child_sessions={len(evidence.child_thread_ids)}")
-    if evidence.started_thread_ids != evidence.child_thread_ids:
+    if evidence.started_thread_ids and evidence.started_thread_ids != evidence.child_thread_ids:
         missing_or_mismatched.append("started_child_thread_match=false")
     if evidence.child_roles != (evidence.agent_role,):
         missing_or_mismatched.append("expected_child_role=false")
-    if evidence.child_multi_agent_versions != ("disabled",):
-        missing_or_mismatched.append("child_multi_agent_disabled=false")
+    if not evidence.child_identity_valid:
+        missing_or_mismatched.append("verified_child_identity=false")
     if evidence.delivered_count != 1:
         missing_or_mismatched.append(f"final_deliveries={evidence.delivered_count}")
     if evidence.terminal_event_count != 1:
@@ -3278,7 +3333,7 @@ async def _ensure_multi_agent_v2_available(
     )
     raise RunnerError(
         "Multi-agent review requires a Codex CLI with the `multi_agent_v2` feature "
-        f"(verified with codex-cli 0.147.0). Installed CLI probe failed: {detail}"
+        f"(live-tested with codex-cli 0.164.0). Installed CLI probe failed: {detail}"
     )
 
 

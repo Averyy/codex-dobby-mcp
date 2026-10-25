@@ -139,7 +139,7 @@ def parse_review_agents_input(value: object) -> list[ReviewAgent] | None:
     return parsed
 
 
-DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_MODEL = "gpt-6.1-sol"
 DEFAULT_TIMEOUT_SECONDS = 600
 # Floor for any explicit timeout. The prompt-side exploration tiers assume
 # budgets below this are unreachable, and the README restates the bound, so
@@ -161,11 +161,13 @@ DEFAULT_REVIEW_AGENTS = (ReviewAgent.GENERALIST,)
 # through REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT and fixes an orchestrated
 # review parent at LOW, so an entry here would be dead code that is free to
 # contradict the real default (it did: HIGH, while direct review runs medium).
+# GPT-6.1 Sol starts at medium for routine technical work. Reverse engineering
+# keeps high for sustained, uncertain analysis; callers can override any tool.
 DEFAULT_REASONING_EFFORTS: dict[ToolName, ReasoningEffort] = {
-    ToolName.BUILD: ReasoningEffort.HIGH,
+    ToolName.BUILD: ReasoningEffort.MEDIUM,
     ToolName.RESEARCH: ReasoningEffort.MEDIUM,
-    ToolName.BRAINSTORM: ReasoningEffort.HIGH,
-    ToolName.PLAN: ReasoningEffort.HIGH,
+    ToolName.BRAINSTORM: ReasoningEffort.MEDIUM,
+    ToolName.PLAN: ReasoningEffort.MEDIUM,
     ToolName.VALIDATE: ReasoningEffort.MEDIUM,
     ToolName.REVERSE_ENGINEER: ReasoningEffort.HIGH,
 }

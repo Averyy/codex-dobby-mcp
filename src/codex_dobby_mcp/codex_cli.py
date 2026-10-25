@@ -137,9 +137,11 @@ def _review_agent_overrides(
         # history persistence, so force it on only inside this private,
         # short-lived runtime.
         ("history.persistence", _toml_string("save-all")),
-        # Codex treats this compatibility setting as the child count and adds
-        # the root thread when it resolves the v2 session-wide slot limit.
+        # Older Codex releases use this compatibility child-count setting.
         ("agents.max_concurrent_threads_per_session", str(len(registrations))),
+        # Codex 0.164 reads the v2 session-wide limit from this setting,
+        # including the root thread. Reserve exactly the selected reviewers.
+        ("multi_agent_v2.max_concurrent_threads_per_session", str(len(registrations) + 1)),
         # The private child home inherits the caller's config. Always pin the
         # resolved review model so an inherited default_subagent_model cannot
         # override an explicit model passed to Dobby.

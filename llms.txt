@@ -57,7 +57,8 @@ Per-tool `timeout_seconds`:
 | `reverse_engineer` | 1800 | workspace-write |
 
 - Any explicit `timeout_seconds` must be ≥ 300s. Lower → rejected.
-- Default model: `gpt-5.6-sol` for all tools and review subagents.
+- Default model: `gpt-6.1-sol` for all tools and review subagents.
+- Default reasoning: medium for `plan`, `research`, `brainstorm`, `review`, `validate`, and `build`; high for `reverse_engineer`. The multi-agent review coordinator uses low while reviewers use medium. Pass `reasoning_effort` to override a task default.
 - `danger=true` on `build` / `reverse_engineer` escalates to `danger-full-access`.
 
 ## Rules

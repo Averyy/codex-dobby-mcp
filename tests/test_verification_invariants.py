@@ -542,6 +542,64 @@ def test_healthy_evidence_produces_no_issues() -> None:
     assert not issues.coverage
 
 
+def test_review_child_identity_rejects_unknown_mode() -> None:
+    from codex_dobby_mcp.models import ReviewAgentExecutionStatus
+
+    evidence = _healthy_evidence(child_multi_agent_versions=("unknown",))
+
+    assert evidence.child_identity_valid is False
+    assert evidence.observed_status == ReviewAgentExecutionStatus.FAILED
+
+
+def test_v2_identity_and_spawn_output_diagnostics() -> None:
+    from codex_dobby_mcp.models import ReviewAgentExecutionStatus
+    from codex_dobby_mcp.runner import _rollout_validation_issues
+
+    valid = _healthy_evidence(
+        child_multi_agent_versions=("v2",),
+        started_count=0,
+        started_thread_ids=(),
+        spawn_output_task_names=("/root/dobby_review_correctness",),
+    )
+    assert valid.child_identity_valid
+    assert not _rollout_validation_issues(valid, ReviewAgentExecutionStatus.COMPLETED).integrity
+
+    wrong_output = _healthy_evidence(
+        child_multi_agent_versions=("v2",),
+        started_count=0,
+        started_thread_ids=(),
+        spawn_output_task_names=("/root/other",),
+    )
+    issues = _rollout_validation_issues(wrong_output, ReviewAgentExecutionStatus.COMPLETED)
+    assert any("spawn output did not match its child path" in issue for issue in issues.integrity)
+
+
+def test_started_event_diagnostics_do_not_invent_missing_evidence() -> None:
+    from codex_dobby_mcp.models import ReviewAgentExecutionStatus
+    from codex_dobby_mcp.runner import _rollout_validation_issues
+
+    def detail(**overrides):
+        issues = _rollout_validation_issues(
+            _healthy_evidence(child_result=None, **overrides),
+            ReviewAgentExecutionStatus.COMPLETED,
+        )
+        return " ".join((*issues.integrity, *issues.coverage))
+
+    assert "started_events=0" in detail(started_count=0)
+    assert "started_events=1" not in detail(started_count=1)
+    assert detail(started_count=2).count("started_events=2") == 1
+
+    v2 = {
+        "child_multi_agent_versions": ("v2",),
+        "spawn_output_task_names": ("/root/dobby_review_correctness",),
+    }
+    assert "started_events=0" not in detail(**v2, started_count=0, started_thread_ids=())
+    assert "started_events=2" in detail(**v2, started_count=2, started_thread_ids=("child-1",))
+    assert "started_child_thread_match=false" not in detail(
+        **v2, started_count=0, started_thread_ids=()
+    )
+
+
 @pytest.mark.parametrize(
     "overrides, expected_token",
     [
@@ -550,7 +608,7 @@ def test_healthy_evidence_produces_no_issues() -> None:
         ({"child_thread_ids": ()}, "child_sessions=0"),
         ({"started_thread_ids": ("other",)}, "started_child_thread_match=false"),
         ({"child_roles": ("wrong_role",)}, "expected_child_role=false"),
-        ({"child_multi_agent_versions": ("v2",)}, "child_multi_agent_disabled=false"),
+        ({"child_multi_agent_versions": ("v2",)}, "verified_child_identity=false"),
         ({"delivered_count": 0}, "final_deliveries=0"),
         ({"terminal_event_count": 0}, "terminal_events=0"),
         ({"child_result": None}, "matching_terminal_result=false"),

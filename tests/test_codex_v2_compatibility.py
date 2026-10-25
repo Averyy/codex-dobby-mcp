@@ -41,6 +41,96 @@ def test_captured_codex_0_147_v2_rollouts_remain_compatible(tmp_path: Path) -> N
     assert all(agent.spawn_contract_issues == () for agent in evidence.agents)
 
 
+def test_codex_0_164_v2_child_rollouts_use_spawn_output_identity(tmp_path: Path) -> None:
+    from test_runner_schema import _review_rollout_evidence as synthetic_evidence  # noqa: PLC0415
+    from test_runner_schema import _write_review_rollouts  # noqa: PLC0415
+
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {ReviewAgent.CORRECTNESS: Completeness.FULL, ReviewAgent.REGRESSION: Completeness.FULL},
+        modern_v2=True,
+    )
+
+    evidence = synthetic_evidence(codex_home, AGENTS)
+
+    assert evidence.validation_issues == ()
+    assert [agent.observed_status for agent in evidence.agents] == [
+        ReviewAgentExecutionStatus.COMPLETED,
+        ReviewAgentExecutionStatus.COMPLETED,
+    ]
+    assert all(agent.started_count == 0 for agent in evidence.agents)
+    assert all(agent.child_multi_agent_versions == ("v2",) for agent in evidence.agents)
+    assert all(agent.spawn_output_task_names == (f"/root/{agent.task_name}",) for agent in evidence.agents)
+
+
+def test_codex_0_164_v2_child_cannot_delegate(tmp_path: Path) -> None:
+    from test_runner_schema import _review_rollout_evidence as synthetic_evidence  # noqa: PLC0415
+    from test_runner_schema import _write_review_rollouts  # noqa: PLC0415
+
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {ReviewAgent.CORRECTNESS: Completeness.FULL, ReviewAgent.REGRESSION: Completeness.FULL},
+        modern_v2=True,
+        nested_collaboration=True,
+    )
+
+    evidence = synthetic_evidence(codex_home, AGENTS)
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+    assert evidence.agents[0].nested_collaboration_calls == ("spawn_agent",)
+    assert evidence.agents[1].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
+def test_codex_0_164_v2_spawn_output_must_match_child_path(tmp_path: Path) -> None:
+    from test_runner_schema import _review_rollout_evidence as synthetic_evidence  # noqa: PLC0415
+    from test_runner_schema import _write_review_rollouts  # noqa: PLC0415
+
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {ReviewAgent.CORRECTNESS: Completeness.FULL, ReviewAgent.REGRESSION: Completeness.FULL},
+        modern_v2=True,
+    )
+    root_rollout = next((codex_home / "sessions").rglob("root.jsonl"))
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") == "function_call_output" and payload.get("call_id") == "spawn-correctness":
+            payload["output"] = json.dumps({"task_name": "/root/unexpected"})
+    root_rollout.write_text("\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8")
+
+    evidence = synthetic_evidence(codex_home, AGENTS)
+
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+    assert evidence.agents[1].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
+def test_codex_0_164_non_object_spawn_output_is_ignored(tmp_path: Path) -> None:
+    from test_runner_schema import _review_rollout_evidence as synthetic_evidence  # noqa: PLC0415
+    from test_runner_schema import _write_review_rollouts  # noqa: PLC0415
+
+    codex_home = tmp_path / "codex-home"
+    _write_review_rollouts(
+        codex_home,
+        {ReviewAgent.CORRECTNESS: Completeness.FULL, ReviewAgent.REGRESSION: Completeness.FULL},
+        modern_v2=True,
+    )
+    root_rollout = next((codex_home / "sessions").rglob("root.jsonl"))
+    items = [json.loads(line) for line in root_rollout.read_text(encoding="utf-8").splitlines()]
+    for item in items:
+        payload = item.get("payload", {})
+        if payload.get("type") == "function_call_output" and payload.get("call_id") == "spawn-correctness":
+            payload["output"] = "[]"
+    root_rollout.write_text("\n".join(json.dumps(item) for item in items) + "\n", encoding="utf-8")
+
+    evidence = synthetic_evidence(codex_home, AGENTS)
+
+    assert evidence.agents[0].spawn_output_task_names == (None,)
+    assert evidence.agents[0].observed_status == ReviewAgentExecutionStatus.FAILED
+    assert evidence.agents[1].observed_status == ReviewAgentExecutionStatus.COMPLETED
+
+
 def test_fixture_assignment_digests_bind_the_complete_canonical_json() -> None:
     for message in _expected_spawn_messages().values():
         lines = message.splitlines()

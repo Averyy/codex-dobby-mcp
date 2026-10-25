@@ -184,6 +184,9 @@ def _rollout_evidence(
 def _write_review_rollouts(
     codex_home: Path,
     statuses: dict[ReviewAgent, Completeness | None],
+    *,
+    modern_v2: bool = False,
+    nested_collaboration: bool = False,
 ) -> None:
     """Write a production-shaped v2 rollout tree.
 
@@ -217,38 +220,51 @@ def _write_review_rollouts(
         task_name = f"dobby_review_{agent.value}"
         agent_path = f"/root/{task_name}"
         child_thread_id = f"child-{agent.value}"
-        root_items.append(
-            {
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "name": "spawn_agent",
-                    "arguments": json.dumps(
-                        {
-                            "task_name": task_name,
-                            "agent_type": task_name,
-                            "fork_turns": "none",
-                            "message": "gAAAA" + ("A" * 256),
-                        }
-                    ),
-                },
-            }
-        )
+        spawn_payload = {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "spawn_agent",
+                "arguments": json.dumps(
+                    {
+                        "task_name": task_name,
+                        "agent_type": task_name,
+                        "fork_turns": "none",
+                        "message": "gAAAA" + ("A" * 256),
+                    }
+                ),
+            },
+        }
+        if modern_v2:
+            spawn_payload["payload"]["call_id"] = f"spawn-{agent.value}"
+        root_items.append(spawn_payload)
         if completeness is None:
             # Spawn attempted, child never started. No further rollout
             # evidence exists for this lens.
             continue
-        root_items.append(
-            {
-                "type": "event_msg",
-                "payload": {
-                    "type": "sub_agent_activity",
-                    "agent_path": agent_path,
-                    "agent_thread_id": child_thread_id,
-                    "kind": "started",
-                },
-            }
-        )
+        if modern_v2:
+            root_items.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": f"spawn-{agent.value}",
+                        "output": json.dumps({"task_name": agent_path}),
+                    },
+                }
+            )
+        else:
+            root_items.append(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "sub_agent_activity",
+                        "agent_path": agent_path,
+                        "agent_thread_id": child_thread_id,
+                        "kind": "started",
+                    },
+                }
+            )
         assignment_digest = _fixture_assignment_digest(agent)
         child_result = WorkerResult(
             summary=(
@@ -305,7 +321,7 @@ def _write_review_rollouts(
                     },
                     "thread_source": "subagent",
                     "agent_path": agent_path,
-                    "multi_agent_version": "disabled",
+                    "multi_agent_version": "v2" if modern_v2 else "disabled",
                 },
             },
             {
@@ -316,6 +332,11 @@ def _write_review_rollouts(
                 },
             },
         ]
+        if modern_v2 and nested_collaboration and agent == ReviewAgent.CORRECTNESS:
+            child_items.insert(1, {
+                "type": "response_item",
+                "payload": {"type": "function_call", "name": "spawn_agent", "arguments": "{}"},
+            })
         (sessions_root / f"{child_thread_id}.jsonl").write_text(
             "\n".join(json.dumps(item) for item in child_items) + "\n",
             encoding="utf-8",
@@ -495,8 +516,8 @@ def test_private_runtime_cleanup_failure_is_returned_and_escalates_response(
     assert escalated.important_facts == ["verified finding"]
 
 
-def test_default_reasoning_efforts_include_high_build_and_medium_validate() -> None:
-    assert DEFAULT_REASONING_EFFORTS[ToolName.BUILD] == ReasoningEffort.HIGH
+def test_default_reasoning_efforts_include_medium_build_and_validate() -> None:
+    assert DEFAULT_REASONING_EFFORTS[ToolName.BUILD] == ReasoningEffort.MEDIUM
     assert DEFAULT_REASONING_EFFORTS[ToolName.VALIDATE] == ReasoningEffort.MEDIUM
 
 
@@ -660,7 +681,7 @@ def test_multi_agent_review_uses_low_parent_reasoning_by_default(tmp_path: Path)
         InvocationRequest(prompt="review it", agents=[ReviewAgent.CORRECTNESS, ReviewAgent.REGRESSION]),
     )
 
-    assert spec.model == "gpt-5.6-sol"
+    assert spec.model == "gpt-6.1-sol"
     assert spec.reasoning_effort == ReasoningEffort.LOW
 
 
@@ -867,8 +888,8 @@ def test_short_timeout_plan_uses_medium_reasoning_by_default(tmp_path: Path) -> 
         InvocationRequest(prompt="plan it", timeout_seconds=300),
     )
 
-    assert spec.model == "gpt-5.6-sol"
-    assert spec.reasoning_effort == ReasoningEffort.HIGH
+    assert spec.model == "gpt-6.1-sol"
+    assert spec.reasoning_effort == ReasoningEffort.MEDIUM
 
 
 def test_persist_request_keeps_requested_timeout_and_records_effective_timeout(tmp_path: Path) -> None:
@@ -5950,7 +5971,11 @@ async def test_multi_agent_v2_capability_start_timeout_returns_structured_timeou
         review_agents_root=review_agents_root(assets_root),
     )
 
+    probe_calls = 0
+
     async def timed_out_probe(*_args, **_kwargs) -> None:
+        nonlocal probe_calls
+        probe_calls += 1
         raise asyncio.TimeoutError
 
     monkeypatch.setattr(
@@ -5971,6 +5996,7 @@ async def test_multi_agent_v2_capability_start_timeout_returns_structured_timeou
     assert result.completeness == Completeness.BLOCKED
     assert result.stop_reason == StopReason.TIMEOUT
     assert result.summary == "Codex run timed out after 10 seconds"
+    assert probe_calls == 1
 
 
 @pytest.mark.asyncio

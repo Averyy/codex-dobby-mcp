@@ -25,7 +25,7 @@ It gives Claude a sharper tool surface than a raw shell handoff: planning stays 
 - Python 3.12+
 - `uv`
 - MCP Python SDK 2.x (`mcp[cli]>=2.0.0,<3`), installed automatically as a dependency
-- Codex CLI installed and authenticated. Multi-agent review requires a CLI that lists `multi_agent_v2` in `codex features list`; Dobby verifies this before fan-out and has been tested with `codex-cli 0.147.0`.
+- Codex CLI installed and authenticated. Multi-agent review requires a CLI that lists `multi_agent_v2` in `codex features list`; Dobby verifies this before fan-out. The rollout parser retains a `0.147.0` compatibility fixture, and the authenticated live baseline is `codex-cli 0.164.0`.
 - A git worktree for the target repo
 
 ### Optional MCP dependencies
@@ -130,17 +130,19 @@ For clients with a short `tools/call` ceiling (Claude Desktop ~60s, unconfigured
 
 ## Defaults
 
-Default model is `gpt-5.6-sol` for all tools and review subagents. Any explicit `timeout_seconds` must be at least 300s.
+Default model is `gpt-6.1-sol` for all tools and review subagents. Any explicit `timeout_seconds` must be at least 300s.
 
 | Tool | Timeout | Reasoning | Sandbox |
 | --- | --- | --- | --- |
-| `plan` | 600s | high | read-only |
+| `plan` | 600s | medium | read-only |
 | `research` | 1200s | medium | read-only |
-| `brainstorm` | 600s | high | read-only |
+| `brainstorm` | 600s | medium | read-only |
 | `review` | 600s default, 1200s recommended for multi-agent | medium | read-only |
 | `validate` | 600s | medium | `-s workspace-write` |
-| `build` | 1200s | high | `-s workspace-write` |
+| `build` | 1200s | medium | `-s workspace-write` |
 | `reverse_engineer` | 1800s | high | `-s workspace-write` |
+
+These defaults start GPT-6.1 Sol at medium for most technical work, following [OpenAI's model selection guidance](https://developers.openai.com/api/docs/guides/model-selection). Reverse engineering uses high for deeper analysis. Pass `reasoning_effort` to override a default for a specific task.
 
 `build` and `reverse_engineer` switch to `danger-full-access` when `danger=true`.
 
@@ -151,7 +153,7 @@ Default model is `gpt-5.6-sol` for all tools and review subagents. Any explicit 
 - Child Codex runs inherit the parent's environment, but Dobby seeds a private per-run `CODEX_HOME` under the system temp directory (`.../codex-dobby/<task-id>/codex-home`) instead of pointing children at the user's global Codex home directly.
 - `research` prefers codebase evidence and uses fetchaller MCP tools when available. If fetchaller is not installed or not configured for the run, the worker is told not to call it and to continue without web MCP support.
 - `validate` runs in the `workspace-write` sandbox with `approval_policy="never"` because validation often needs temp or cache writes; the worker prompt still forbids source edits and commits.
-- `review` uses a direct single-lens path for one agent, or explicitly enables Codex multi-agent v2 for multiple. The v2 parent spawns one deterministic task per selected custom reviewer with the exact custom role, a canonical assignment bound to the requested repo/task/files/context, and `fork_turns="none"`, then collects parent-observed completion results. Codex 0.147 intentionally persists the `message` tool argument as opaque provider ciphertext, so Dobby requires every other spawn field to remain exact, accepts only a single high-entropy opaque message value provisionally, and binds it to a SHA-256 assignment identity attested by the independently correlated child terminal result. Before accepting the execution manifest, Dobby also cross-checks root v2 mode, canonical child task/thread/role, disabled child delegation, one strict read-only terminal JSON result, and an identical completed payload observed by the parent through v2 agent state. Global evidence failures quarantine all findings. The wrapper strips the internal attestation and reconstructs returned findings, next steps, warnings, and per-agent summaries from verified child results instead of trusting parent-authored synthesis. Review runs disable every inherited MCP server, and reviewer role configs disable child delegation. Single-agent review defaults to `gpt-5.6-sol` at `medium` reasoning. Multi-agent review uses the resolved model with a `low`-reasoning orchestration parent and `medium` reviewer children by default; an explicit reasoning override applies to reviewers while the parent stays `low`.
+- `review` uses a direct single-lens path for one agent, or explicitly enables Codex multi-agent v2 for multiple. The v2 parent spawns one deterministic task per selected custom reviewer with the exact custom role, a canonical assignment bound to the requested repo/task/files/context, and `fork_turns="none"`, then collects parent-observed completion results. Codex 0.147 intentionally persists the `message` tool argument as opaque provider ciphertext, so Dobby requires every other spawn field to remain exact, accepts only a single high-entropy opaque message value provisionally, and binds it to a SHA-256 assignment identity attested by the independently correlated child terminal result. Before accepting the execution manifest, Dobby also cross-checks root v2 mode, canonical child task/thread/role, verified child identity and no child collaboration calls, one strict read-only terminal JSON result, and an identical completed payload observed by the parent through v2 agent state. Global evidence failures quarantine all findings. The wrapper strips the internal attestation and reconstructs returned findings, next steps, warnings, and per-agent summaries from verified child results instead of trusting parent-authored synthesis. Review runs disable every inherited MCP server, and Dobby caps v2 session slots and rejects any reviewer collaboration call. Codex 0.164 keeps children in v2 mode and may omit started events, so Dobby correlates each spawn output with the child session path. Single-agent review defaults to `gpt-6.1-sol` at `medium` reasoning. Multi-agent review uses the resolved model with a `low`-reasoning orchestration parent and `medium` reviewer children by default; an explicit reasoning override applies to reviewers while the parent stays `low`.
 - `reverse_engineer` includes a Ghidra MCP workflow only when Ghidra is installed and configured for the run. When Dobby can discover Ghidra from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`), it adds the configured Ghidra MCP helper repo as a writable helper root. When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run. If Ghidra is not installed or not configured, the worker is told not to call `mcp__ghidra__*`.
 - `reverse_engineer` responses include `reverse_engineer_details.ghidra`, which reports whether Ghidra was configured, whether the run used direct MCP calls or the mounted helper fallback, and which Ghidra calls were observed.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.
@@ -305,7 +307,7 @@ uv run mcp dev src/codex_dobby_mcp/server.py:app
 uv run python -m codex_dobby_mcp
 ```
 
-The default suite includes a sanitized production-shape rollout corpus captured from a successful `codex-cli 0.147.0` multi-agent v2 run. Before deploying against a new Codex CLI release, also run the authenticated opt-in smoke test:
+The default suite includes a sanitized production-shape rollout corpus captured from a successful `codex-cli 0.147.0` multi-agent v2 run and synthetic coverage for the `0.164.0` child-session shape. Before deploying against a new Codex CLI release, also run the authenticated opt-in smoke test:
 
 ```bash
 CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live tests/test_live_codex_v2.py

@@ -245,6 +245,7 @@ def test_review_tool_injects_selected_custom_agents(tmp_path: Path) -> None:
     assert "features.multi_agent_v2=true" in config_values
     assert "agents.enabled=true" in config_values
     assert "agents.max_concurrent_threads_per_session=2" in config_values
+    assert "multi_agent_v2.max_concurrent_threads_per_session=3" in config_values
     assert 'history.persistence="save-all"' in config_values
     assert "features.multi_agent=true" not in config_values
     assert not any(value.startswith("agents.max_depth=") for value in config_values)

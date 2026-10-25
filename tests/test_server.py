@@ -477,10 +477,10 @@ def test_readme_restates_the_published_defaults() -> None:
     # Pin the per-tool reasoning decisions themselves (review is resolved via
     # the subagent default instead; see models.DEFAULT_REASONING_EFFORTS).
     assert DEFAULT_REASONING_EFFORTS == {
-        ToolName.PLAN: ReasoningEffort.HIGH,
+        ToolName.PLAN: ReasoningEffort.MEDIUM,
         ToolName.RESEARCH: ReasoningEffort.MEDIUM,
-        ToolName.BRAINSTORM: ReasoningEffort.HIGH,
-        ToolName.BUILD: ReasoningEffort.HIGH,
+        ToolName.BRAINSTORM: ReasoningEffort.MEDIUM,
+        ToolName.BUILD: ReasoningEffort.MEDIUM,
         ToolName.VALIDATE: ReasoningEffort.MEDIUM,
         ToolName.REVERSE_ENGINEER: ReasoningEffort.HIGH,
     }

@@ -1,5 +1,8 @@
 # TODO
 
+The SDK 2.x migration checklist below is historical; it was completed on
+2026-08-14. Current work is listed under "Open".
+
 ## Migrate to MCP Python SDK 2.x
 
 Migrate Dobby from the maintenance-only MCP Python SDK 1.x line to the stable 2.x line in a dedicated change. Do not combine the migration with unrelated runner or Codex orchestration work.
@@ -129,7 +132,9 @@ reviewer reviews.
 - `tests/fixtures/codex-0.147-v2-review` still captures only the all-completed
   case. A real partial-failure capture would let the never-delivered and
   spawn-contract paths be checked against genuine Codex output rather than the
-  synthetic writer. Mitigated for now by
+  synthetic writer. Codex 0.164 child-session variants also have synthetic
+  coverage, while the authenticated live smoke test covers a successful run.
+  Mitigated for now by
   `test_synthetic_rollout_writer_still_models_the_captured_shape`, which fails
   if the writer stops modelling any record or field the real capture contains.
 
@@ -141,11 +146,11 @@ reviewer reviews.
 
 Every rollout check assumes the read-only-sandboxed parent Codex process cannot
 write under the private `CODEX_HOME/sessions`. That is Codex/Seatbelt sandbox
-behaviour, not something this repo controls, and Codex writes its own root
+  behaviour, not something this repo controls, and Codex writes its own root
 rollout there. If a future Codex ever made `CODEX_HOME` agent-writable, a
 prompt-injected parent could fabricate a child rollout and defeat every check
-above at once. Worth re-confirming against Codex's actual sandbox policy when
-moving the compatibility baseline off `codex-cli 0.147.0`.
+  above at once. The sandbox policy still needs a dedicated re-check against
+  the current `codex-cli 0.164.0` baseline, then against each future baseline.
 
 ### Known-equivalent mutants (do not "fix" with tests)
 

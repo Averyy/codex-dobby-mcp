@@ -15,7 +15,7 @@ class ReviewAgentDefinition:
     filename: str
 
 
-REVIEW_SUBAGENT_DEFAULT_MODEL = "gpt-5.6-sol"
+REVIEW_SUBAGENT_DEFAULT_MODEL = "gpt-6.1-sol"
 REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT = ReasoningEffort.MEDIUM
 
 
