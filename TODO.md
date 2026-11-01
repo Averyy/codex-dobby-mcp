@@ -112,6 +112,108 @@ regression test verified to fail when its fix is reverted:
 
 ## Open
 
+### Runs stall before their first output item, and nothing recovers them (seen 2026-10-26)
+
+Reported from a Claude Code session in `~/Code/awire` (codex-cli 0.164.0,
+model `gpt-6.1-sol`, `reasoning_effort` medium, read-only `review` runs).
+Between 16:02 and 16:06 UTC, **5 of 6 review runs were killed as stalled**:
+
+| Run | Started (UTC) | Launched with | Outcome |
+|---|---|---|---|
+| `8ee48dec…` (security) | 16:02:49.6 | 4 others within 3 s | completed normally |
+| `08575f91…` (correctness) | 16:02:50.4 | same batch | stalled |
+| `b85f4a4b…` (regression) | 16:02:49.9 | same batch | stalled |
+| `9bb560fe…` (ux) | 16:02:49.9 | same batch | stalled |
+| `4ed3d39e…` (correctness, other scope) | 16:02:52.5 | same batch | stalled |
+| `3f6d586b…` (correctness retry) | 16:06:16 | **alone**, after the batch was killed | stalled |
+
+Run dirs: `~/Code/awire/.codex-dobby/runs/<id>/`.
+
+Every stalled run looks the same. stdout holds only `thread.started` and
+`turn.started` (101 bytes). stderr ends with the first model response's
+`response.in_progress` and `responsesapi.websocket_timing` TRACE lines
+(339 bytes), then there is no output at all for 180 s, not even reasoning
+events. The watchdog then kills it (`exit_code -15`, `stop_reason: stall`,
+`completeness: blocked`). The run that completed got its first output item
+about 7 s after `response.in_progress`. The prompts were small and never
+reached a tool call, so the repo under review can't be the cause.
+
+**Not purely concurrency:** the last run was launched alone, after the
+batch had died, and stalled the same way. Root cause not established. It
+could be the Codex CLI's websocket responses transport hanging after
+`in_progress`, a server-side stream that never progresses, or something in
+how Dobby spawns or configures the session. To tell these apart, reproduce
+with plain `codex exec` (no Dobby) on the same model/effort while the
+problem is active, and compare against a non-websocket transport if the CLI
+allows forcing one.
+
+What Dobby could do regardless of the cause:
+
+- **Retry a run that stalled before producing any output item.** Nothing ran
+  yet, so for read-only tools (`review`, `research`, `plan`, `validate`,
+  `brainstorm`) one automatic retry is safe. Today the caller has to notice
+  `stop_reason: stall`, re-issue the run, and wait out a second 180 s window.
+  Surface the retry in `warnings` so it stays visible.
+- **Use a shorter first-output deadline.** The stall threshold
+  (`_CODEX_STALL_THRESHOLD_SECONDS = 180.0`, `runner.py`) treats "never
+  started streaming" the same as "went quiet mid-run". A separate, shorter
+  deadline for the first output item (e.g. 60 s after `turn.started`) would
+  fail or retry these much sooner.
+- **Name the condition in the error.** "Codex produced no stdout or stderr
+  activity for 180 seconds" is accurate, but saying the model stream never
+  progressed past `response.in_progress` (no output items) would let the
+  caller tell this apart from a long-running tool or a hung command.
+- **Consider a concurrency cap or queue for `start_run`.** Five runs started
+  within 3 s and only the first survived. It isn't proven to be the cause (the
+  solo retry failed too), but a configurable per-account limit would rule it
+  out and protect against provider-side session limits.
+
+**Investigation (2026-11-01, codex-cli 0.165.0): not reproducible, no code
+change.** Five concurrent plain `codex exec` runs using the exact stalled
+prompts each produced a first item in 6-7 s. Five concurrent Dobby `review`
+runs and four two-lens runs all completed. The stalled runs' stderr shows the
+first response finishing (`responsesapi.websocket_timing`) and then no
+`codex.response.metadata` for the next request, while the healthy run starts
+that second response within about a second. That points at the Codex CLI
+websocket transport or the provider, not Dobby's command or config. If it
+recurs, capture it with plain `codex exec` first; the mitigations above stay
+valid but are unproven.
+
+### A child agent's collaboration call discards that lens's whole review (seen 2026-10-26)
+
+A two-lens multi-agent `review` (`agents: ["correctness", "regression"]`, run
+`3dcc753c0f204975a5214544cd91efd7` in `~/Code/awire/.codex-dobby/runs/`) ended
+with `status: error` and `manifest_validated: false`:
+`dobby_review_regression review child attempted collaboration: send_message,
+send_message` (raised by the integrity check around `runner.py:2336`). The
+correctness child's findings were still returned, but the regression lens
+produced nothing, so the caller had to re-run it as a separate single-lens
+review.
+
+Rejecting a child that tries to collaborate is correct, since the manifest
+integrity depends on it. The cost is that one disobedient child loses the
+whole lens with no retry. Options: re-run just that child once with a
+stronger "do not call collaboration tools" reminder, or tell the caller
+exactly which lens to re-run on its own. Also worth checking whether the
+child prompt or tool exposure makes `send_message` available at all; a
+child that can't see the tool can't call it.
+
+**Investigation and fix (2026-11-01).** Codex 0.165 gives every review child
+the full collaboration toolset (`spawn_agent`, `send_message`, `followup_task`,
+`wait_agent`, `list_agents`, `interrupt_agent`) and injects a
+`<multi_agent_role>` message telling it to use them, even though Dobby's child
+agent config sets `features.multi_agent_v2 = false` and `agents.enabled =
+false`: the child rollouts still report `multi_agent_version: v2`. Setting
+`multi_agent_v2.disable_direct_message` / `usage_hint_enabled` in the per-run
+child config, and `disable_direct_message` / `subagent_usage_hint_text` as
+session overrides, changed nothing (the first also dropped the child's role and
+broke the spawn contract), so the tools cannot be hidden from this side. The
+failure itself did not recur in 10 further two-lens runs. Done: a lens with no
+usable result now adds a `next_steps` entry naming it and the single-lens
+`review` call that re-runs it (`_rerun_lens_next_steps`). Not done: an
+automatic retry, because folding a second run's findings into a manifest that
+vouches for one run would blur what the rollout evidence verified.
+
 ### Tightening the ciphertext shape check needs a real capture
 
 `_looks_like_opaque_encrypted_message` accepts any run of 128+ characters from

@@ -72,6 +72,7 @@ from codex_dobby_mcp.runner import (
     _salvage_worker_result_from_trace,
     _shielded_terminate_process,
     _stall_diagnostics,
+    _rerun_lens_next_steps,
     _stall_threshold_for_effort,
     _strict_child_worker_result,
     _strict_worker_result,
@@ -7420,3 +7421,60 @@ def test_a_child_session_without_a_usable_thread_id_is_not_counted(
     assert by_task["dobby_review_regression"].observed_status == (
         ReviewAgentExecutionStatus.COMPLETED
     )
+
+
+def _manifest_details(statuses: dict[ReviewAgent, ReviewAgentExecutionStatus]) -> ReviewDetails:
+    from codex_dobby_mcp.models import (
+        ReviewAgentExecution,
+        ReviewExecutionManifest,
+        ReviewOrchestrationProtocol,
+    )
+
+    return ReviewDetails(
+        requested_review_agents=list(statuses),
+        effective_review_agents=list(statuses),
+        orchestration_protocol=ReviewOrchestrationProtocol.MULTI_AGENT_V2,
+        execution_manifest=ReviewExecutionManifest(
+            protocol=ReviewOrchestrationProtocol.MULTI_AGENT_V2,
+            agents=[
+                ReviewAgentExecution(
+                    review_agent=agent,
+                    task_name=f"dobby_review_{agent.value}",
+                    status=status,
+                    summary="summary",
+                )
+                for agent, status in statuses.items()
+            ],
+        ),
+    )
+
+
+def test_rerun_lens_next_steps_names_every_lens_without_usable_coverage() -> None:
+    steps = _rerun_lens_next_steps(
+        _manifest_details(
+            {
+                ReviewAgent.CORRECTNESS: ReviewAgentExecutionStatus.COMPLETED,
+                ReviewAgent.REGRESSION: ReviewAgentExecutionStatus.FAILED,
+                ReviewAgent.SECURITY: ReviewAgentExecutionStatus.BLOCKED,
+                ReviewAgent.ARCHITECTURE: ReviewAgentExecutionStatus.PARTIAL,
+            }
+        )
+    )
+
+    assert len(steps) == 2
+    assert 'agents=["regression"]' in steps[0]
+    assert 'agents=["security"]' in steps[1]
+    # Completed and partial lenses delivered something; they are not re-run.
+    assert not any("correctness" in step or "architecture" in step for step in steps)
+
+
+def test_rerun_lens_next_steps_is_empty_without_a_failed_lens_or_manifest() -> None:
+    all_ok = _manifest_details(
+        {
+            ReviewAgent.CORRECTNESS: ReviewAgentExecutionStatus.COMPLETED,
+            ReviewAgent.REGRESSION: ReviewAgentExecutionStatus.PARTIAL,
+        }
+    )
+    assert _rerun_lens_next_steps(all_ok) == []
+    assert _rerun_lens_next_steps(ReviewDetails()) == []
+    assert _rerun_lens_next_steps(None) == []

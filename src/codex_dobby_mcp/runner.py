@@ -859,6 +859,12 @@ class CodexRunner:
             completeness = Completeness.PARTIAL
         important_facts = worker_result.important_facts if worker_result else []
         next_steps = worker_result.next_steps if worker_result else []
+        review_details = _review_details_for_spec(
+            spec,
+            worker_result=worker_result,
+            diagnostics=review_execution_diagnostics,
+        )
+        next_steps = _merge_preserving_order(next_steps, _rerun_lens_next_steps(review_details))
 
         # Diff reconstruction shells out to ``git show`` and reads files
         # off disk, so move it to a thread for the same reason as the
@@ -893,11 +899,7 @@ class CodexRunner:
             model=spec.model,
             reasoning_effort=spec.reasoning_effort,
             stop_reason=stop_reason,
-            review_details=_review_details_for_spec(
-                spec,
-                worker_result=worker_result,
-                diagnostics=review_execution_diagnostics,
-            ),
+            review_details=review_details,
             reverse_engineer_details=_reverse_engineer_details_for_run(spec, stdout=stdout, stderr=stderr),
         )
         write_json(spec.artifacts.result_json, response.model_dump(mode="json", by_alias=True))
@@ -1240,6 +1242,31 @@ class CodexRunner:
         if exit_code is not None:
             return f"Codex exited with status {exit_code}"
         return "Codex run failed before producing output"
+
+
+def _rerun_lens_next_steps(review_details: ReviewDetails | None) -> list[str]:
+    """Name each lens that delivered nothing and how to re-run it alone.
+
+    A multi-agent review that loses a lens (a child that tried to collaborate,
+    never delivered, or failed an evidence check) still returns the other
+    lenses' verified findings, but the caller otherwise has to work out which
+    lens is missing. A single-lens review takes the direct path, which has no
+    child orchestration to fail, so it is the cheapest recovery. The advice is
+    deliberately a next step rather than an automatic retry: folding a second
+    run's findings into a manifest that vouches for one run would blur what
+    the rollout evidence actually verified.
+    """
+    manifest = review_details.execution_manifest if review_details is not None else None
+    if manifest is None:
+        return []
+    unusable = {ReviewAgentExecutionStatus.FAILED, ReviewAgentExecutionStatus.BLOCKED}
+    return [
+        f"The `{agent.review_agent.value}` lens returned no usable result. Re-run it on its "
+        f'own with `review` and `agents=["{agent.review_agent.value}"]`; a single-lens '
+        "review runs directly, without multi-agent orchestration."
+        for agent in manifest.agents
+        if agent.status in unusable
+    ]
 
 
 def _review_details_for_spec(
