@@ -132,6 +132,18 @@ For clients with a short `tools/call` ceiling (Claude Desktop ~60s, unconfigured
 
 Default model is `gpt-6.1-sol` for all tools and review subagents. Any explicit `timeout_seconds` must be at least 300s.
 
+Pass `model` to pick a different one. The tool schema advertises these known IDs, but the field is a free string, so any other ID Codex accepts is passed through unchanged:
+
+| `model` | Notes |
+| --- | --- |
+| `gpt-6.1-sol` | Default. Latest workhorse model for coding and everyday work. |
+| `gpt-6-astra` | Frontier intelligence for the most demanding work. |
+| `gpt-6.1-terra` | GPT-6.1 Terra Codex model. |
+| `gpt-6-sol` | Previous-generation workhorse model. |
+| `gpt-6-luna` | Fast and affordable model for easier tasks. Does not support `ultra`. |
+
+`reasoning_effort` accepts `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+
 | Tool | Timeout | Reasoning | Sandbox |
 | --- | --- | --- | --- |
 | `plan` | 600s | medium | read-only |
@@ -139,10 +151,10 @@ Default model is `gpt-6.1-sol` for all tools and review subagents. Any explicit 
 | `brainstorm` | 600s | medium | read-only |
 | `review` | 600s default, 1200s recommended for multi-agent | medium | read-only |
 | `validate` | 600s | medium | `-s workspace-write` |
-| `build` | 1200s | medium | `-s workspace-write` |
+| `build` | 1200s | high | `-s workspace-write` |
 | `reverse_engineer` | 1800s | high | `-s workspace-write` |
 
-These defaults start GPT-6.1 Sol at medium for most technical work, following [OpenAI's model selection guidance](https://developers.openai.com/api/docs/guides/model-selection). Reverse engineering uses high for deeper analysis. Pass `reasoning_effort` to override a default for a specific task.
+These defaults start GPT-6.1 Sol at medium for most technical work, following [OpenAI's model selection guidance](https://developers.openai.com/api/docs/guides/model-selection). Build and reverse engineering use high for code-writing and deeper analysis. Pass `reasoning_effort` to override a default for a specific task: lower it (`low`) for easy, well-scoped work such as a quick lookup or a simple `research` question, and raise it for hard or high-stakes ones.
 
 `build` and `reverse_engineer` switch to `danger-full-access` when `danger=true`.
 

@@ -3038,7 +3038,7 @@ def _timeout_warning(spec: ResolvedInvocation, fallback_timeout_seconds: int | N
 
 
 def _stall_threshold_for_effort(effort: ReasoningEffort | None) -> float:
-    if effort in (ReasoningEffort.HIGH, ReasoningEffort.XHIGH):
+    if effort in (ReasoningEffort.HIGH, ReasoningEffort.XHIGH, ReasoningEffort.MAX, ReasoningEffort.ULTRA):
         return _CODEX_STALL_THRESHOLD_HIGH_EFFORT_SECONDS
     return _CODEX_STALL_THRESHOLD_SECONDS
 

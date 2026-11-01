@@ -516,8 +516,8 @@ def test_private_runtime_cleanup_failure_is_returned_and_escalates_response(
     assert escalated.important_facts == ["verified finding"]
 
 
-def test_default_reasoning_efforts_include_medium_build_and_validate() -> None:
-    assert DEFAULT_REASONING_EFFORTS[ToolName.BUILD] == ReasoningEffort.MEDIUM
+def test_default_reasoning_efforts_include_high_build_and_medium_validate() -> None:
+    assert DEFAULT_REASONING_EFFORTS[ToolName.BUILD] == ReasoningEffort.HIGH
     assert DEFAULT_REASONING_EFFORTS[ToolName.VALIDATE] == ReasoningEffort.MEDIUM
 
 
@@ -6688,6 +6688,8 @@ def test_stall_threshold_for_effort_scales_with_effort() -> None:
     assert _stall_threshold_for_effort(ReasoningEffort.MEDIUM) == 180.0
     assert _stall_threshold_for_effort(ReasoningEffort.HIGH) == 300.0
     assert _stall_threshold_for_effort(ReasoningEffort.XHIGH) == 300.0
+    assert _stall_threshold_for_effort(ReasoningEffort.MAX) == 300.0
+    assert _stall_threshold_for_effort(ReasoningEffort.ULTRA) == 300.0
     assert _stall_threshold_for_effort(None) == 180.0
 
 

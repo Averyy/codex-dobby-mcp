@@ -14,13 +14,16 @@ from codex_dobby_mcp._version import __version__
 from codex_dobby_mcp.background_runs import BackgroundRunManager
 from codex_dobby_mcp.models import (
     AsyncRunHandle,
+    CodexModel,
     DEFAULT_DANGER,
+    DEFAULT_MODEL,
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     DEFAULT_WAIT_RUN_TIMEOUT_SECONDS,
     InvocationRequest,
     MAX_WAIT_RUN_TIMEOUT_SECONDS,
     MULTI_AGENT_REVIEW_TIMEOUT_SECONDS,
     SUPPORTED_REVIEW_AGENTS_TEXT,
+    ReasoningEffort,
     ReviewAgent,
     RunListResponse,
     RunLookupResponse,
@@ -83,6 +86,34 @@ ReviewAgentsParam = Annotated[
         ],
     ),
 ]
+
+ModelParam = Annotated[
+    str | None,
+    Field(
+        description=(
+            f"Codex model ID. Omit for the default (`{DEFAULT_MODEL}`). Known models: "
+            + ", ".join(f"`{m.value}`" for m in CodexModel)
+            + ". Any other ID Codex accepts is passed through unchanged."
+        ),
+        examples=[m.value for m in CodexModel],
+    ),
+]
+
+ReasoningEffortParam = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Reasoning effort override. Omit for the tool's default. Supported values: "
+            + ", ".join(f"`{e.value}`" for e in ReasoningEffort)
+            + ". Lower it for easy, well-scoped work (a quick lookup, a simple `research` "
+            "question, a small mechanical change) to finish faster and cheaper; raise it for "
+            "hard, ambiguous, or high-stakes tasks. `ultra` is not supported by every model "
+            "(e.g. `gpt-6-luna`)."
+        ),
+        examples=[e.value for e in ReasoningEffort],
+    ),
+]
+
 
 def _validate_repo_root_param(value: str) -> str:
     normalized = value.strip()
@@ -301,8 +332,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.PLAN],
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
         request = _request_from_params(
@@ -332,8 +363,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.RESEARCH],
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
         request = _request_from_params(
@@ -363,8 +394,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.BRAINSTORM],
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
         request = _request_from_params(
@@ -394,8 +425,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.BUILD],
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> ToolResponse:
@@ -427,8 +458,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.VALIDATE],
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
         request = _request_from_params(
@@ -465,8 +496,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int | None = None,
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         agents: ReviewAgentsParam = None,
         ctx: Context | None = None,
     ) -> ToolResponse:
@@ -502,8 +533,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int = DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVERSE_ENGINEER],
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,
     ) -> ToolResponse:
@@ -540,8 +571,8 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         important_context: ImportantContextParam = "",
         timeout_seconds: int | None = None,
         extra_roots: list[str] | None = None,
-        model: str | None = None,
-        reasoning_effort: str | None = None,
+        model: ModelParam = None,
+        reasoning_effort: ReasoningEffortParam = None,
         agents: ReviewAgentsParam = None,
         danger: bool = DEFAULT_DANGER,
         ctx: Context | None = None,

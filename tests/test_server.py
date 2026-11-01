@@ -480,7 +480,7 @@ def test_readme_restates_the_published_defaults() -> None:
         ToolName.PLAN: ReasoningEffort.MEDIUM,
         ToolName.RESEARCH: ReasoningEffort.MEDIUM,
         ToolName.BRAINSTORM: ReasoningEffort.MEDIUM,
-        ToolName.BUILD: ReasoningEffort.MEDIUM,
+        ToolName.BUILD: ReasoningEffort.HIGH,
         ToolName.VALIDATE: ReasoningEffort.MEDIUM,
         ToolName.REVERSE_ENGINEER: ReasoningEffort.HIGH,
     }
@@ -525,3 +525,28 @@ def test_readme_restates_the_published_defaults() -> None:
     # agree; if they ever diverge, update the README and this test together.
     assert REVIEW_SUBAGENT_DEFAULT_MODEL == DEFAULT_MODEL
     assert f"Default model is `{DEFAULT_MODEL}` for all tools and review subagents" in readme
+
+    # Every advertised model has a README row, and the default is advertised.
+    from codex_dobby_mcp.models import CodexModel
+
+    assert DEFAULT_MODEL in {m.value for m in CodexModel}
+    for model in CodexModel:
+        assert f"| `{model.value}` |" in readme, model
+    for effort in ReasoningEffort:
+        assert f"`{effort.value}`" in readme, effort
+
+
+def test_model_and_effort_schema_advertises_known_values_without_gating() -> None:
+    from codex_dobby_mcp.models import CodexModel, ReasoningEffort
+    from codex_dobby_mcp.server import ModelParam, ReasoningEffortParam
+    from pydantic import TypeAdapter
+
+    model_schema = TypeAdapter(ModelParam).json_schema()
+    effort_schema = TypeAdapter(ReasoningEffortParam).json_schema()
+    assert model_schema["examples"] == [m.value for m in CodexModel]
+    assert effort_schema["examples"] == [e.value for e in ReasoningEffort]
+    assert "gpt-6-astra" in model_schema["description"]
+    assert "gpt-5.6" not in model_schema["description"]
+    # Open-ended on purpose: an unlisted model ID must still validate.
+    assert TypeAdapter(ModelParam).validate_python("gpt-7-future") == "gpt-7-future"
+    assert {"max", "ultra"} <= {e.value for e in ReasoningEffort}

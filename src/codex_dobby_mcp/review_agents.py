@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from codex_dobby_mcp.models import DEFAULT_REVIEW_AGENTS, ReasoningEffort, ReviewAgent
+from codex_dobby_mcp.models import DEFAULT_MODEL, DEFAULT_REVIEW_AGENTS, ReasoningEffort, ReviewAgent
 
 
 @dataclass(frozen=True)
@@ -15,7 +15,7 @@ class ReviewAgentDefinition:
     filename: str
 
 
-REVIEW_SUBAGENT_DEFAULT_MODEL = "gpt-6.1-sol"
+REVIEW_SUBAGENT_DEFAULT_MODEL = DEFAULT_MODEL
 REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT = ReasoningEffort.MEDIUM
 
 
