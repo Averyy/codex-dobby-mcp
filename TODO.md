@@ -110,6 +110,23 @@ regression test verified to fail when its fix is reverted:
 - Ruff is configured (`E4`, `E7`, `E9`, `F`, `B`) with a CI lint lane, and the
   latest-dependency lane now imports the installed distribution.
 
+## Completed on 2026-11-14
+
+Released [0.1.4 to PyPI](https://pypi.org/project/codex-dobby-mcp/0.1.4/) from tag `v0.1.4`. The release passed the locked MCP SDK 2.0.0 and latest 2.3.0 suites (737 tests each), the authenticated review smoke test, the installed-wheel stdio check, and GitHub CI on macOS and Linux with Python 3.12–3.14. A fresh public PyPI installation was verified after publication.
+
+Anticipated invocation, path, and request-model validation errors now use the public MCP `ToolError` type at tool boundaries so SDK 2.3 preserves their detail. Unexpected programming errors retain SDK handling.
+
+### Codex 0.169 compatibility verified on 2026-11-14
+
+- The full test suite and authenticated two-lens review smoke test passed on
+  `codex-cli 0.169.0`, including verified rollout integrity and complete coverage.
+- A real workspace-write `validate` run in an untrusted clone reproduced the
+  new project-trust diagnostic. Dobby now includes it in response `warnings`,
+  even on successful runs, and explains where to save intended trust so it
+  survives private runtime cleanup. The captured CLI warning is a test fixture.
+- The read-only sandbox denied a write probe under the normal Codex sessions
+  directory. The private per-run sessions isolation check under "Open" remains open.
+
 ## Open
 
 ### Runs stall before their first output item, and nothing recovers them (seen 2026-10-26)
@@ -244,17 +261,6 @@ reviewer reviews.
   `ASYNC`) in a dedicated change. `ASYNC240`/`ASYNC221` report ~130 findings
   that need individual judgement about which blocking calls are deliberate.
 
-### Codex 0.169 compatibility verified on 2026-11-14
-
-- The full test suite and authenticated two-lens review smoke test passed on
-  `codex-cli 0.169.0`, including verified rollout integrity and complete coverage.
-- A real workspace-write `validate` run in an untrusted clone reproduced the
-  new project-trust diagnostic. Dobby now includes it in response `warnings`,
-  even on successful runs, and explains where to save intended trust so it
-  survives private runtime cleanup. The captured CLI warning is a test fixture.
-- The read-only sandbox denied a write probe under the normal Codex sessions
-  directory. The private per-run sessions isolation check below remains open.
-
 ### The verification chain rests on one property Dobby cannot enforce
 
 Every rollout check assumes the read-only-sandboxed parent Codex process cannot
@@ -263,7 +269,7 @@ write under the private `CODEX_HOME/sessions`. That is Codex/Seatbelt sandbox
 rollout there. If a future Codex ever made `CODEX_HOME` agent-writable, a
 prompt-injected parent could fabricate a child rollout and defeat every check
   above at once. The sandbox policy still needs a dedicated re-check against
-  the current `codex-cli 0.164.0` baseline, then against each future baseline.
+  the current `codex-cli 0.169.0` baseline, then against each future baseline.
 
 ### Known-equivalent mutants (do not "fix" with tests)
 

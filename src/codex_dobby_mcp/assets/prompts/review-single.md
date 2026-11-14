@@ -10,7 +10,7 @@ Description:
 - {selected_review_agent_description}
 
 Process:
-- This review uses the selected lens directly instead of spawning subagents. Do not call `spawn_agent`, `wait_agent`, or `send_input`.
+- This review uses the selected lens directly instead of spawning subagents. Do not call collaboration tools.
 - Stay read-only.
 - Short-timeout mode for this run: `{review_short_timeout_mode}`.
 - Start with at most `{review_named_file_budget}` named files before branching outward.

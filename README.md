@@ -47,20 +47,20 @@ Dobby auto-detects these integrations from the active Codex MCP config. If an in
 
 ## Install
 
-Recommended local tool install:
+Install the published package from [PyPI](https://pypi.org/project/codex-dobby-mcp/):
 
 ```bash
-uv tool install .
+uv tool install codex-dobby-mcp
 codex-dobby-mcp
 ```
 
 One-off local execution without installing:
 
 ```bash
-uvx --from . codex-dobby-mcp
+uvx codex-dobby-mcp
 ```
 
-When this package is published to PyPI, replace `.` with `codex-dobby-mcp`.
+To install a local source checkout as a tool, run `uv tool install .` from that checkout.
 
 Development checkout:
 
@@ -117,7 +117,7 @@ Offload grunt work — build/test, code review, research, planning, implementati
 - For `review`, omit `agents` or pass one lens for a direct single-agent review. Pass two or more of `generalist`, `security`, `performance`, `architecture`, `correctness`, `ux`, and `regression` for v2 fan-out; use `timeout_seconds=1200` for multi-agent review.
 - For long work, start it with `mcp__codex-dobby__start_run` and then either block on `mcp__codex-dobby__wait_run` (parent sleeps in the tool call) or poll `mcp__codex-dobby__get_run` (parent keeps working). On Claude Code, `/loop` or `ScheduleWakeup` can schedule the polls for you so the parent is free between checks.
 - Always wait for `start_run` to return its `task_id` before calling `wait_run` or `get_run`; do not race the start and lookup calls in parallel.
-- To resume, continue, or check on a background run, call `wait_run`/`get_run` with its `task_id` — a Dobby run takes no further input once started, so to change course let it finish (or cancel) and `start_run` again.
+- To check on a background run, call `wait_run`/`get_run` with its `task_id` and `repo_root`. A Dobby run takes no further input once started; to change scope, start a new run. Dobby exposes no background-run cancellation tool.
 ```
 
 ## Requests
@@ -130,11 +130,13 @@ Every tool requires `repo_root`, the absolute path to the target git worktree. W
 
 `get_run` params: `task_id`, `repo_root`.
 
-`wait_run` params: `repo_root`, optional `task_id` (single run), optional `task_ids` (list — first-to-finish wins), `timeout_seconds` (default 540s / 9 min, clamped to `[1, 100_000]` / ~27.8 hours — matching Claude Code's `MCP_TOOL_TIMEOUT` default of `100000000` ms). Omit both `task_id` and `task_ids` to wait on every currently-live run for the repo. Passing both is rejected; an empty `task_ids` list is rejected. On timeout returns a `running` lookup whose `pending_task_ids` lists the ids still outstanding, and whose `summary` instructs the caller to re-call `wait_run` with that list until one finishes. Pick `timeout_seconds` below your MCP client's own `tools/call` ceiling — Claude Code defaults to ~28 hours (so the full clamp is usable); Codex CLI defaults to 60s per `[mcp_servers.<id>].tool_timeout_sec` (so raise that in `~/.codex/config.toml` before using long waits from Codex); Claude Desktop / Cursor / Cline / Continue vary and may cap low.
+`wait_run` params: `repo_root`, optional `task_id` (single run), optional `task_ids` (list — first-to-finish wins), `timeout_seconds` (default 540s / 9 min, clamped to `[1, 100_000]` / ~27.8 hours — matching Claude Code's `MCP_TOOL_TIMEOUT` default of `100000000` ms). Omit both `task_id` and `task_ids` to wait on every currently-live run for the repo. Passing both is rejected; an empty `task_ids` list is rejected. On timeout returns a `running` lookup whose `pending_task_ids` lists the ids still outstanding, and whose `summary` instructs the caller to re-call `wait_run` with that list until one finishes. Pick `timeout_seconds` below your MCP client's own `tools/call` ceiling — Claude Code defaults to ~28 hours (so the full clamp is usable); Codex CLI 0.169 defaults to 300s per `[mcp_servers.<id>].tool_timeout_sec` (so raise that in `~/.codex/config.toml` before using long waits from Codex); Claude Desktop / Cursor / Cline / Continue vary and may cap low.
 
 `list_runs` params: `repo_root`, optional `limit`.
 
-For clients with a short `tools/call` ceiling (Claude Desktop ~60s, unconfigured Codex CLI 60s), prefer `start_run` + `get_run`/`list_runs` for long `review`, `research`, `build`, `validate`, or `reverse_engineer` work. Where the ceiling is raised (Claude Code defaults to ~28h, Codex CLI with `tool_timeout_sec` overridden), `start_run` + `wait_run` is usually fewer round-trips than polling.
+For clients with a short `tools/call` ceiling, prefer `start_run` + `get_run`/`list_runs` for long `review`, `research`, `build`, `validate`, or `reverse_engineer` work. Where the ceiling is raised (Claude Code defaults to ~28h, Codex CLI with `tool_timeout_sec` overridden), `start_run` + `wait_run` is usually fewer round-trips than polling.
+
+Codex CLI 0.169's [300-second default](https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/codex-mcp/src/rmcp_client.rs#L122) is shorter than Dobby's 540-second default `wait_run`. Raise the server's `tool_timeout_sec` before using default or longer waits, or pass a `wait_run` timeout below the client limit.
 
 ## Defaults
 
@@ -157,7 +159,7 @@ Pass `model` to pick a different one. The tool schema advertises these known IDs
 | `plan` | 600s | medium | read-only |
 | `research` | 1200s | medium | read-only |
 | `brainstorm` | 600s | medium | read-only |
-| `review` | 600s default, 1200s recommended for multi-agent | medium | read-only |
+| `review` | 600s direct, 1200s multi-agent | medium | read-only |
 | `validate` | 600s | medium | `-s workspace-write` |
 | `build` | 1200s | high | `-s workspace-write` |
 | `reverse_engineer` | 1800s | high | `-s workspace-write` |
@@ -173,7 +175,7 @@ These defaults start GPT-6.1 Sol at medium for most technical work, following [O
 - Child Codex runs inherit the parent's environment, but Dobby seeds a private per-run `CODEX_HOME` under the system temp directory (`.../codex-dobby/<task-id>/codex-home`) instead of pointing children at the user's global Codex home directly.
 - `research` prefers codebase evidence and uses fetchaller MCP tools when available. If fetchaller is not installed or not configured for the run, the worker is told not to call it and to continue without web MCP support.
 - `validate` runs in the `workspace-write` sandbox with `approval_policy="never"` because validation often needs temp or cache writes; the worker prompt still forbids source edits and commits.
-- `review` uses a direct single-lens path for one agent, or explicitly enables Codex multi-agent v2 for multiple. The v2 parent spawns one deterministic task per selected custom reviewer with the exact custom role, a canonical assignment bound to the requested repo/task/files/context, and `fork_turns="none"`, then collects parent-observed completion results. Codex 0.147 intentionally persists the `message` tool argument as opaque provider ciphertext, so Dobby requires every other spawn field to remain exact, accepts only a single high-entropy opaque message value provisionally, and binds it to a SHA-256 assignment identity attested by the independently correlated child terminal result. Before accepting the execution manifest, Dobby also cross-checks root v2 mode, canonical child task/thread/role, verified child identity and no child collaboration calls, one strict read-only terminal JSON result, and an identical completed payload observed by the parent through v2 agent state. Global evidence failures quarantine all findings. The wrapper strips the internal attestation and reconstructs returned findings, next steps, warnings, and per-agent summaries from verified child results instead of trusting parent-authored synthesis. Review runs disable every inherited MCP server, and Dobby caps v2 session slots and rejects any reviewer collaboration call. Codex 0.164 keeps children in v2 mode and may omit started events, so Dobby correlates each spawn output with the child session path. Single-agent review defaults to `gpt-6.1-sol` at `medium` reasoning. Multi-agent review uses the resolved model with a `low`-reasoning orchestration parent and `medium` reviewer children by default; an explicit reasoning override applies to reviewers while the parent stays `low`.
+- `review` uses a direct single-lens path for one agent, or explicitly enables Codex multi-agent v2 for multiple. The v2 parent spawns one deterministic task per selected custom reviewer with the exact custom role, a canonical assignment bound to the requested repo/task/files/context, and `fork_turns="none"`, then collects parent-observed completion results. Codex 0.147 intentionally persists the `message` tool argument as opaque provider ciphertext, so Dobby requires every other spawn field to remain exact, provisionally accepts a single opaque message value matching the expected ciphertext shape, and binds it to a SHA-256 assignment identity attested by the independently correlated child terminal result. Before accepting the execution manifest, Dobby also cross-checks root v2 mode, canonical child task/thread/role, verified child identity and no child collaboration calls, one strict read-only terminal JSON result, and an identical completed payload observed by the parent through v2 agent state. Global evidence failures quarantine all findings. The wrapper strips the internal attestation and reconstructs returned findings, next steps, warnings, and per-agent summaries from verified child results instead of trusting parent-authored synthesis. Review runs disable every inherited MCP server, and Dobby caps v2 session slots and rejects any reviewer collaboration call. Codex 0.164 keeps children in v2 mode and may omit started events, so Dobby correlates each spawn output with the child session path. Single-agent review defaults to `gpt-6.1-sol` at `medium` reasoning. Multi-agent review uses the resolved model with a `low`-reasoning orchestration parent and `medium` reviewer children by default; an explicit reasoning override applies to reviewers while the parent stays `low`.
 - `reverse_engineer` includes a Ghidra MCP workflow only when Ghidra is installed and configured for the run. When Dobby can discover Ghidra from the active Codex configs (`CODEX_HOME/config.toml` and repo-local `.codex/config.toml`), it adds the configured Ghidra MCP helper repo as a writable helper root. When a live Ghidra UDS socket runtime directory is discoverable, Dobby also mounts that runtime path so child reverse-engineering workers can reach the already-running Ghidra instance. In that live-UDS case, Dobby enables workspace-write network access and passes the discovered socket roots through `network.allow_unix_sockets` for the child Codex run. If Ghidra is not installed or not configured, the worker is told not to call `mcp__ghidra__*`.
 - `reverse_engineer` responses include `reverse_engineer_details.ghidra`, which reports whether Ghidra was configured, whether the run used direct MCP calls or the mounted helper fallback, and which Ghidra calls were observed.
 - `start_run` launches the selected Dobby tool in the server process and returns a `task_id` immediately. `get_run` first checks any still-live in-memory run, then falls back to the run artifacts on disk.

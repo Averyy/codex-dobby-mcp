@@ -6,6 +6,7 @@
 - Preserve unrelated worktree changes. The repository may intentionally be dirty while Dobby reviews it.
 - Run the focused tests for changed code, then `uv run pytest` before handing off a runtime change.
 - Keep `README.md`, MCP tool descriptions, schemas, prompts, and tests synchronized when changing a public request or response contract.
+- Invalid-repository tests must use a guaranteed missing or invalid path: mutation runs place pytest's temporary directory inside a real git worktree, so `tmp_path` alone may be a valid repository and launch a worker.
 
 ## Mutation testing
 
@@ -58,6 +59,7 @@ known-weak lines do not fail the lane, while edits that rewrite one do.
 
 - Dobby targets the MCP Python SDK 2.x line (`mcp[cli]>=2.0.0,<3`), built on the public `MCPServer` API from `mcp.server.mcpserver`. Keep the locked MCP SDK at the supported minimum baseline and run the separate latest-dependency test lane before release.
 - Dobby's advertised initialize version comes from the public `MCPServer(..., version=__version__)` argument. Do not reach into `_lowlevel_server` or any other private SDK attribute to set it.
+- MCP SDK 2.3 hides unexpected handler exceptions. Preserve anticipated invocation, path, and request-model validation detail through the public `ToolError` type at tool boundaries; leave unexpected programming errors to SDK handling.
 - SDK 2.x never answers a request the client cancelled via `notifications/cancelled`, so Dobby carries no cancellation monkey-patch. If that upstream behaviour ever regresses, fix it upstream rather than re-adding a patch module.
 - Progress notifications use the SDK 2.x shapes: request `_meta` is a `RequestParamsMeta` TypedDict read with `meta.get("progress_token")`, and `ProgressNotification` is sent directly to `session.send_notification` with no `ServerNotification` wrapper. The wire payload is unchanged — `_meta.acpEvent`, `taskId`, and `perTaskCount` are a client-visible contract.
 - Run `uv run pytest`, then `CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live tests/test_live_codex_v2.py` with an authenticated Codex CLI before deploying a new Codex CLI compatibility baseline.

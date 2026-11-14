@@ -2,6 +2,8 @@
 
 Local stdio MCP server. Delegates scoped work to Codex CLI, returns structured results + persistent artifacts. Use when you want to offload long analysis, builds, reviews, research, or reverse-engineering without burning context in the parent session.
 
+Install the published package: `uv tool install codex-dobby-mcp`, or run it without installation with `uvx codex-dobby-mcp`. The verified CLI baseline is `codex-cli 0.169.0`; MCP SDK 2.x is supported, with locked tests on 2.0.0 and latest-dependency verification on 2.3.0 for release 0.1.4.
+
 ## Tools
 
 Worker tools (do real work, return a ToolResponse):
@@ -16,28 +18,30 @@ Worker tools (do real work, return a ToolResponse):
 
 Control-plane tools (return immediately unless noted):
 
-- `start_run(tool, ...)` — start any worker tool in the background. Returns `task_id`.
-- `get_run(task_id)` — non-blocking status/result lookup. Recovers from disk if server restarted.
-- `wait_run(task_id | task_ids | neither, timeout_seconds=540)` — blocks until done. See patterns below.
+- `start_run(tool, repo_root, ...)` — start any worker tool in the background. Returns `task_id`.
+- `get_run(task_id, repo_root)` — non-blocking status/result lookup. Recovers from disk if server restarted.
+- `wait_run(repo_root, task_id | task_ids | neither, timeout_seconds=540)` — blocks until done. See patterns below.
 - `list_runs(repo_root, limit=10)` — recover task ids after caller timeout.
 
 ## Call patterns
+
+In the examples below, `repo_root` is the absolute path of the target git worktree and must be passed on every call.
 
 Short work (≤ default timeout, and caller `tools/call` ceiling is generous): call the worker tool directly. Simplest.
 
 Long work or short caller ceiling:
 
-1. `start_run(tool="...", prompt="...", ...)` → `task_id`
+1. `start_run(tool="...", prompt="...", repo_root=repo_root, ...)` → `task_id`
 2. Then one of:
-   - `wait_run(task_id=...)` — blocks the parent inside the tool call until done. Default 540s, clamp `[1, 100_000s / ~27.8h]`. On timeout returns `state: "running"` + `pending_task_ids`; just re-call.
-   - `get_run(task_id)` — non-blocking peek. Use when the parent should keep doing other work.
+   - `wait_run(task_id=..., repo_root=repo_root)` — blocks the parent inside the tool call until done. Default 540s, clamp `[1, 100_000s / ~27.8h]`. On timeout returns `state: "running"` + `pending_task_ids`; just re-call.
+   - `get_run(task_id=..., repo_root=repo_root)` — non-blocking peek. Use when the parent should keep doing other work.
    - On Claude Code: schedule `get_run` polls via `ScheduleWakeup` or `/loop` so the parent is free between checks.
 
 Multiple runs:
 
 - Fan out with several `start_run` calls in parallel (independent tasks only).
-- `wait_run(task_ids=[a, b, c])` returns when the FIRST finishes; response includes `pending_task_ids` for the rest. Re-call with `task_ids=pending_task_ids` until empty.
-- `wait_run()` with no ids waits on every currently-live run for the repo (snapshot at call time; new runs started after don't join).
+- `wait_run(task_ids=[a, b, c], repo_root=repo_root)` returns when the FIRST finishes; response includes `pending_task_ids` for the rest. Re-call with `task_ids=pending_task_ids` and the same `repo_root` until empty.
+- `wait_run(repo_root=repo_root)` with no ids waits on every currently-live run for the repo (snapshot at call time; new runs started after don't join).
 - Passing both `task_id` and `task_ids` → rejected. Empty `task_ids` → rejected.
 
 Background tasks are shielded from waiter cancellation. An outer MCP timeout or client disconnect kills the `wait_run` call but NOT the underlying run — re-call or `get_run` to recover.
@@ -51,14 +55,15 @@ Per-tool `timeout_seconds`:
 | `plan` | 600 | read-only |
 | `research` | 1200 | read-only |
 | `brainstorm` | 600 | read-only |
-| `review` | 600 (1200 recommended for multi-agent) | read-only |
+| `review` | 600 direct, 1200 multi-agent | read-only |
 | `validate` | 600 | workspace-write |
 | `build` | 1200 | workspace-write |
 | `reverse_engineer` | 1800 | workspace-write |
 
 - Any explicit `timeout_seconds` must be ≥ 300s. Lower → rejected.
 - Default model: `gpt-6.1-sol` for all tools and review subagents.
-- Default reasoning: medium for `plan`, `research`, `brainstorm`, `review`, `validate`, and `build`; high for `reverse_engineer`. The multi-agent review coordinator uses low while reviewers use medium. Pass `reasoning_effort` to override a task default.
+- Default reasoning: medium for `plan`, `research`, `brainstorm`, direct `review`, and `validate`; high for `build` and `reverse_engineer`. The multi-agent review coordinator uses low while reviewers use medium. Pass `reasoning_effort` to override a task default.
+- Both `review` and `start_run(tool="review", ...)` automatically use 1200 seconds when multiple review lenses are selected and `timeout_seconds` is omitted.
 - `danger=true` on `build` / `reverse_engineer` escalates to `danger-full-access`.
 
 ## Rules
@@ -84,15 +89,17 @@ Don't:
 `wait_run`'s clamp is `[1, 100_000s]`, matching Claude Code's `MCP_TOOL_TIMEOUT` default of 100,000,000 ms (~27.8h). The actual effective ceiling is set by the CALLER's MCP client:
 
 - **Claude Code CLI**: default ~28h via `MCP_TOOL_TIMEOUT` env var. Full clamp usable.
-- **Codex CLI**: default **60s** per `[mcp_servers.<id>].tool_timeout_sec`. Must raise in `~/.codex/config.toml` before long waits land:
+- **Codex CLI 0.169**: default **300s** per `[mcp_servers.<id>].tool_timeout_sec`. Must raise in `~/.codex/config.toml` before long waits land:
   ```toml
   [mcp_servers.codex-dobby]
   command = "uv"
   args = ["--project", "/ABSOLUTE/PATH/TO/codex-dobby-mcp", "run", "codex-dobby-mcp"]
   tool_timeout_sec = 100000
   ```
-- **Claude Desktop**: hardcoded ~60s, not configurable.
+- **Claude Desktop**: client limits depend on the installed client; check its timeout configuration.
 - **Cursor / Continue / Cline**: vary; check per-server `timeout` field.
+
+Codex CLI 0.169's 300-second default is below Dobby's 540-second default wait. Raise the client timeout or pass a shorter `wait_run` timeout.
 
 If the client chops off a `wait_run`, the run keeps going — recover with `get_run(task_id)` or another `wait_run`.
 
@@ -162,7 +169,7 @@ If Dobby can't discover the integration, the worker prompt explicitly tells Code
 
 - Blocking `review` / `research` etc. still exist; they'll hit the caller's `tools/call` ceiling if it's short. Prefer `start_run` + `wait_run` for anything non-trivial.
 - `wait_run` timeout summaries tell the LLM explicitly to re-call with `pending_task_ids`. Follow that — it's the intended pattern.
-- A background run is NOT a Claude Code subagent. Continue or check one with `wait_run`/`get_run` plus its `task_id` — never `SendMessage` (that resumes harness subagents, not Dobby runs) and never from inside a spawned subagent (where `SendMessage`/`/loop`/`ScheduleWakeup` aren't provisioned). A run takes no further input once started; to change course, let it finish or cancel and `start_run` again.
+- A background run is NOT a Claude Code subagent. Check one with `wait_run`/`get_run` plus its `task_id` and `repo_root` — never `SendMessage` (that resumes harness subagents, not Dobby runs). A run takes no further input once started; to change scope, start a new run. Dobby exposes no background-run cancellation tool.
 - The multi-wait primitive is first-completed, not all-completed. For "wait until all done," call `wait_run` in a loop with remaining ids until `pending_task_ids` is empty.
-- `wait_run()` with no ids only sees runs started BEFORE the call. New runs don't join.
-- Don't mix dobby model/reasoning overrides with `agents=[...]` unless you know what you're doing; multi-agent review has its own model split.
+- `wait_run(repo_root=repo_root)` with no ids only sees runs started BEFORE the call. New runs don't join.
+- An explicit `model` applies to the review parent and selected reviewers. An explicit `reasoning_effort` applies to reviewers; the multi-agent coordinator stays at low.

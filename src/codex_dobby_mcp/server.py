@@ -649,7 +649,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"clamped to [1, {MAX_WAIT_RUN_TIMEOUT_SECONDS:_}s / ~{MAX_WAIT_RUN_TIMEOUT_SECONDS / 3600:.1f}h], "
             "matching Claude Code's MCP_TOOL_TIMEOUT default. Pick timeout_seconds below your own MCP "
             "client's tools/call ceiling — Claude Code defaults to ~28h (the full clamp is usable); Codex "
-            "CLI defaults to 60s per [mcp_servers.<id>].tool_timeout_sec (raise that first); Claude Desktop "
+            "CLI 0.169 defaults to 300s per [mcp_servers.<id>].tool_timeout_sec (raise that first); Claude Desktop "
             "/ Cursor / Cline / Continue vary."
         ),
     )

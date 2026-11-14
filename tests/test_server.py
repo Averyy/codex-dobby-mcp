@@ -556,8 +556,8 @@ def test_readme_restates_the_published_defaults() -> None:
         assert row in readme, row
 
     review_row = (
-        f"| `review` | {DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVIEW]}s default, "
-        f"{MULTI_AGENT_REVIEW_TIMEOUT_SECONDS}s recommended for multi-agent "
+        f"| `review` | {DEFAULT_TOOL_TIMEOUT_SECONDS[ToolName.REVIEW]}s direct, "
+        f"{MULTI_AGENT_REVIEW_TIMEOUT_SECONDS}s multi-agent "
         f"| {REVIEW_SUBAGENT_DEFAULT_REASONING_EFFORT.value} | {sandbox_cell(ToolName.REVIEW)} |"
     )
     assert review_row in readme

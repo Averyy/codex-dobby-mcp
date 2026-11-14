@@ -2,6 +2,11 @@
 
 All notable user-facing changes to Codex Dobby MCP are recorded here.
 
+## Unreleased
+
+- Refresh PyPI installation guidance, required `repo_root` examples, automatic multi-agent review timeouts, build reasoning defaults, and review override guidance.
+- Correct the documented Codex CLI 0.169 MCP call timeout to 300 seconds, including the `wait_run` tool description, and explain its interaction with Dobby's 540-second default wait.
+
 ## 0.1.4 - 2026-11-14
 
 - Preserve anticipated input-validation messages with MCP SDK 2.3, which otherwise reports handler exceptions as generic execution failures. Unexpected programming errors retain the SDK's error handling.

@@ -225,7 +225,7 @@ def test_single_agent_review_prompt_uses_direct_lens_mode() -> None:
     assert "- correctness" in rendered
     assert "- dobby_review_correctness" in rendered
     assert "This review uses the selected lens directly instead of spawning subagents." in rendered
-    assert "Do not call `spawn_agent`, `wait_agent`, or `send_input`." in rendered
+    assert "Do not call collaboration tools." in rendered
     assert "Short-timeout mode for this run: `no`." in rendered
     assert "Start with at most `4` named files before branching outward." in rendered
     assert "Read at most `8` additional files beyond Claude's named files" in rendered
