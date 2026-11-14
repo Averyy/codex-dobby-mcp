@@ -203,7 +203,10 @@ async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools(tmp_p
 async def test_every_tool_preserves_repo_validation_errors(name: str, tmp_path: Path) -> None:
     server = create_server(tmp_path)
     tool = {tool.name: tool for tool in server._tool_manager.list_tools()}[name]
-    arguments = {"repo_root": str(tmp_path)}
+    # Mutation runs put pytest's basetemp inside a real git worktree, so an
+    # existing tmp_path may itself be a valid repo. A missing path always fails
+    # before a worker can launch, regardless of the test runner's directory.
+    arguments = {"repo_root": str(tmp_path / "missing")}
     if name in {tool.value for tool in ToolName} or name == "start_run":
         arguments["prompt"] = "inspect"
     if name == "start_run":
@@ -211,7 +214,7 @@ async def test_every_tool_preserves_repo_validation_errors(name: str, tmp_path: 
     if name == "get_run":
         arguments["task_id"] = "missing"
 
-    with pytest.raises(ToolError, match="Repo root is not inside a git worktree"):
+    with pytest.raises(ToolError, match="Repo root does not exist"):
         await tool.run(arguments, Context())
     assert not (tmp_path / ".codex-dobby").exists()
 
