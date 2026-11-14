@@ -4030,6 +4030,31 @@ async def test_runner_returns_structured_error_when_worker_output_is_invalid(tmp
     assert "Codex completed with invalid structured output" in result.warnings
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("missing", "missing", True),
+        ("missing", "other", False),
+        ("nested/../missing", "missing", True),
+    ],
+)
+def test_same_path_compares_normalized_paths_when_files_are_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    left: str,
+    right: str,
+    expected: bool,
+) -> None:
+    """Missing paths must still compare correctly when samefile cannot stat them."""
+    monkeypatch.chdir(tmp_path)
+    relative = Path(left)
+    absolute = tmp_path / right
+    assert not relative.exists()
+    assert not absolute.exists()
+
+    assert runner_module._same_path(relative, absolute) is expected
+
+
 def test_runtime_mirror_exclusions_resolve_symlinks_and_case(
     tmp_path: Path,
 ) -> None:
