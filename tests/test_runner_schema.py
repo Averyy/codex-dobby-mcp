@@ -4136,8 +4136,10 @@ def test_config_reference_to_the_runtime_home_itself_is_not_mirrored(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("project_trust_disabled", [False, True])
 async def test_child_scratch_runtime_is_removed_from_the_repo_after_a_run(
     tmp_path: Path,
+    project_trust_disabled: bool,
 ) -> None:
     """The child's TMPDIR/cache tree must not accumulate inside the repo.
 
@@ -4159,11 +4161,16 @@ async def test_child_scratch_runtime_is_removed_from_the_repo_after_a_run(
         review_agents_root=review_agents_root(assets_root),
     )
 
+    trust_diagnostic = (
+        (project_root / "tests/fixtures/codex-0.169-project-trust-stderr.txt").read_bytes()
+        if project_trust_disabled else b""
+    )
+
     class FakeProcess:
         returncode = 0
 
         async def communicate(self, _input: bytes) -> tuple[bytes, bytes]:
-            return (b"", b"")
+            return (b"", trust_diagnostic)
 
         def kill(self) -> None:
             self.returncode = -9
@@ -4209,7 +4216,16 @@ async def test_child_scratch_runtime_is_removed_from_the_repo_after_a_run(
     # The run's own artifacts must survive the scratch cleanup.
     assert run_dir.exists()
     assert (run_dir / "result.json").exists()
-    assert not result.warnings
+    assert result.stop_reason == StopReason.END_TURN
+    assert result.completeness == Completeness.FULL
+    persisted = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    assert persisted["warnings"] == result.warnings
+    if project_trust_disabled:
+        assert len(result.warnings) == 1
+        assert "Codex disabled untrusted project-local configuration and MCP servers" in result.warnings[0]
+        assert "normal Codex configuration" in result.warnings[0]
+    else:
+        assert not result.warnings
 
 
 @pytest.mark.asyncio

@@ -124,6 +124,8 @@ Events use ACP's `session/update` payload shapes: `agent_message_chunk`, `tool_c
 
 Worker tools return `ToolResponse` with: `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed`, `file_diffs`, `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`, `stop_reason`. `review` adds `review_details`. `reverse_engineer` adds `reverse_engineer_details.ghidra`.
 
+Codex 0.169's disabled project-local configuration diagnostic is surfaced in `warnings` even when the worker succeeds. Save intended project trust in the normal parent Codex configuration before invoking Dobby (`codex exec --trust` in the target repo); Dobby copies saved trust into its temporary runtime and never grants trust automatically. Explicitly untrusted projects require updating their saved trust setting first.
+
 `stop_reason` (ACP-borrowed enum + Dobby extensions): `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`, `timeout`, `stall`, `sandbox_violation`, `error`.
 
 `file_diffs[i]` for mutating tools: `{path, oldText, newText, truncated}` per changed file. ACP camelCase on the wire, in `result.json`, and in `events.jsonl` (Pydantic uses snake_case internally + alias-based serialization with `by_alias=True`). `oldText=null` for new files, `newText=null` for deleted files, `truncated=true` for files >2 MB or binary. Read-only tools always return `file_diffs: []`.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import time
 
 import pytest
@@ -17,6 +18,7 @@ import pytest
 from codex_dobby_mcp.models import GhidraUsageMode, InvocationRequest, ToolName
 from codex_dobby_mcp.runner import (
     _codex_home_permission_issue,
+    _codex_project_trust_warning,
     _collect_sandbox_violations,
     _extract_access_path,
     _ghidra_usage_summary,
@@ -153,6 +155,46 @@ def test_sandbox_word_needs_a_blocking_verb() -> None:
     assert _sandbox_violation_from_line(
         "sandbox violation while writing", allow_plain_text=True
     ) is not None
+
+
+# --------------------------------------------------------- project trust hint
+# Captured from a real codex-cli 0.169 workspace-write validate run in an
+# untrusted clone of this repository on 2026-11-14.
+PROJECT_TRUST_DIAGNOSTIC = (
+    Path(__file__).parent / "fixtures" / "codex-0.169-project-trust-stderr.txt"
+).read_text(encoding="utf-8").strip()
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        PROJECT_TRUST_DIAGNOSTIC,
+        "ordinary startup output\n" + PROJECT_TRUST_DIAGNOSTIC + "\nmore output\n",
+        PROJECT_TRUST_DIAGNOSTIC + "\n" + PROJECT_TRUST_DIAGNOSTIC,
+    ],
+)
+def test_project_trust_warning_explains_where_to_save_trust(stderr: str) -> None:
+    warning = _codex_project_trust_warning(stderr)
+    assert warning is not None
+    assert "Codex disabled untrusted project-local configuration and MCP servers" in warning
+    assert "normal Codex configuration" in warning
+    assert "`codex exec --trust` in the target repo before rerunning Dobby" in warning
+    assert "trust saved only inside a Dobby run is discarded" in warning
+    assert "Explicitly untrusted projects require updating their saved trust setting first" in warning
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "",
+        "warning: unrelated startup warning",
+        "Untrusted project-local configuration is disabled.",
+        'print("' + PROJECT_TRUST_DIAGNOSTIC + '")',
+        "diagnostic = " + repr(PROJECT_TRUST_DIAGNOSTIC),
+    ],
+)
+def test_project_trust_hint_ignores_unrelated_diagnostics_and_source(stderr: str) -> None:
+    assert _codex_project_trust_warning(stderr) is None
 
 
 # ------------------------------------------------- codex home permission hint

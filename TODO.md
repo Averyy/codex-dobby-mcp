@@ -244,6 +244,17 @@ reviewer reviews.
   `ASYNC`) in a dedicated change. `ASYNC240`/`ASYNC221` report ~130 findings
   that need individual judgement about which blocking calls are deliberate.
 
+### Codex 0.169 compatibility verified on 2026-11-14
+
+- The full test suite and authenticated two-lens review smoke test passed on
+  `codex-cli 0.169.0`, including verified rollout integrity and complete coverage.
+- A real workspace-write `validate` run in an untrusted clone reproduced the
+  new project-trust diagnostic. Dobby now includes it in response `warnings`,
+  even on successful runs, and explains where to save intended trust so it
+  survives private runtime cleanup. The captured CLI warning is a test fixture.
+- The read-only sandbox denied a write probe under the normal Codex sessions
+  directory. The private per-run sessions isolation check below remains open.
+
 ### The verification chain rests on one property Dobby cannot enforce
 
 Every rollout check assumes the read-only-sandboxed parent Codex process cannot

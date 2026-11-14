@@ -4,6 +4,7 @@ All notable user-facing changes to Codex Dobby MCP are recorded here.
 
 ## 0.1.4 - unreleased
 
+- Surface Codex 0.169's disabled project-configuration diagnostic in response `warnings`, even on successful runs, with guidance to save intended project trust in the parent Codex configuration. Record the verified 0.169 authenticated multi-agent baseline.
 - Default to GPT-6.1 Sol. Start routine technical tools at medium reasoning, keep reverse engineering at high, and keep the multi-agent coordinator at low. Explicit model and effort overrides still work.
 - Support Codex CLI 0.164 multi-agent review rollouts: correlate v2 child sessions with spawn outputs when started events are absent, cap session slots, and reject reviewer collaboration calls. Retain the Codex 0.147 rollout compatibility fixture.
 - Require an explicit absolute `repo_root` on every MCP tool, including run lookup and wait tools.

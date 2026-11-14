@@ -25,8 +25,14 @@ It gives Claude a sharper tool surface than a raw shell handoff: planning stays 
 - Python 3.12+
 - `uv`
 - MCP Python SDK 2.x (`mcp[cli]>=2.0.0,<3`), installed automatically as a dependency
-- Codex CLI installed and authenticated. Multi-agent review requires a CLI that lists `multi_agent_v2` in `codex features list`; Dobby verifies this before fan-out. The rollout parser retains a `0.147.0` compatibility fixture, and the authenticated live baseline is `codex-cli 0.164.0`.
+- Codex CLI installed and authenticated. Multi-agent review requires a CLI that lists `multi_agent_v2` in `codex features list`; Dobby verifies this before fan-out. The rollout parser retains a `0.147.0` compatibility fixture, and the authenticated live baseline is `codex-cli 0.169.0` (verified 2026-11-14).
 - A git worktree for the target repo
+
+### Project trust
+
+Codex 0.169 requires explicit project trust before loading project-local configuration and MCP servers, including `codex exec --sandbox workspace-write`. If you intend to enable a project's configuration, save trust using `codex exec --trust` in that repo from your normal Codex environment before invoking Dobby. Explicitly untrusted projects require updating their saved trust setting first. See the [Codex change](https://github.com/openai/codex/pull/60041).
+
+Dobby copies the parent Codex configuration into each private runtime, preserving saved trust. A trust grant saved only inside a Dobby run disappears when its temporary runtime is deleted. When Codex reports disabled project-local configuration, Dobby includes an actionable message in response `warnings`, even if the worker succeeds. Dobby does not grant trust automatically.
 
 ### Optional MCP dependencies
 
@@ -319,7 +325,7 @@ uv run mcp dev src/codex_dobby_mcp/server.py:app
 uv run python -m codex_dobby_mcp
 ```
 
-The default suite includes a sanitized production-shape rollout corpus captured from a successful `codex-cli 0.147.0` multi-agent v2 run and synthetic coverage for the `0.164.0` child-session shape. Before deploying against a new Codex CLI release, also run the authenticated opt-in smoke test:
+The default suite includes a sanitized production-shape rollout corpus captured from a successful `codex-cli 0.147.0` multi-agent v2 run and synthetic coverage for the `0.164.0` child-session shape. The authenticated two-lens smoke test passed on `codex-cli 0.169.0` on 2026-11-14 with `manifest_validated: true` and `coverage_complete: true`. Before deploying against a new Codex CLI release, also run the authenticated opt-in smoke test:
 
 ```bash
 CODEX_DOBBY_RUN_LIVE_V2=1 uv run pytest -m live tests/test_live_codex_v2.py

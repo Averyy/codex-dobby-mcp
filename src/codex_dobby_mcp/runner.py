@@ -698,6 +698,9 @@ class CodexRunner:
         status = RunStatus.SUCCESS
         stop_reason: StopReason | None = None
         warnings = list(worker_result.warnings if worker_result else [])
+        project_trust_warning = _codex_project_trust_warning(stderr)
+        if project_trust_warning is not None:
+            warnings.append(project_trust_warning)
         error_reasons: list[str] = []
         sandbox_violations = _collect_sandbox_violations(stderr, stdout)
         codex_home_issue = _codex_home_permission_issue(sandbox_violations, stderr=stderr, stdout=stdout)
@@ -2826,6 +2829,29 @@ def _diagnostic_stdout_lines(stdout: str) -> list[str]:
             continue
         lines.append(line)
     return lines
+
+
+def _codex_project_trust_warning(stderr: str) -> str | None:
+    """Surface the CLI's trust diagnostic even when the worker succeeds.
+
+    Codex 0.169 no longer implicitly trusts project config in workspace-write
+    exec runs. Match its own stderr warning, rather than task output on stdout,
+    and point callers to the persistent parent config: trust saved inside a
+    Dobby child's private runtime disappears when that runtime is deleted.
+    """
+    if not any(
+        line.startswith("warning: Untrusted project-local configuration is disabled.")
+        for line in stderr.splitlines()
+    ):
+        return None
+    return (
+        "Codex disabled untrusted project-local configuration and MCP servers. "
+        "If you intend to enable them, save project trust in your normal Codex configuration "
+        "by running `codex exec --trust` in the target repo before rerunning Dobby. "
+        "Dobby copies that configuration into a temporary runtime; trust saved only inside "
+        "a Dobby run is discarded. Explicitly untrusted projects require updating their saved "
+        "trust setting first."
+    )
 
 
 def _codex_home_permission_issue(
