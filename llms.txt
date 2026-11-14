@@ -122,6 +122,8 @@ Events use ACP's `session/update` payload shapes: `agent_message_chunk`, `tool_c
 
 ## Return shapes
 
+Anticipated input errors retain their validation detail across supported MCP SDK 2.x releases. Unexpected programming errors use the SDK's error handling.
+
 Worker tools return `ToolResponse` with: `task_id`, `tool`, `status`, `summary`, `completeness`, `important_facts`, `next_steps`, `files_changed`, `file_diffs`, `artifact_paths`, `sandbox_violations`, `repo_root`, `exit_code`, `duration_ms`, `warnings`, `raw_output_available`, `model`, `reasoning_effort`, `result_state`, `stop_reason`. `review` adds `review_details`. `reverse_engineer` adds `reverse_engineer_details.ghidra`.
 
 Codex 0.169's disabled project-local configuration diagnostic is surfaced in `warnings` even when the worker succeeds. Save intended project trust in the normal parent Codex configuration before invoking Dobby (`codex exec --trust` in the target repo); Dobby copies saved trust into its temporary runtime and never grants trust automatically. Explicitly untrusted projects require updating their saved trust setting first.

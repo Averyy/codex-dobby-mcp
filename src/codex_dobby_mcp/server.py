@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from functools import wraps
 from pathlib import Path
 from typing import Annotated
 
 from mcp import types as mcp_types
 from mcp.server.mcpserver import Context, MCPServer
-from pydantic import AfterValidator, BeforeValidator, Field, WithJsonSchema
+from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import AfterValidator, BeforeValidator, Field, ValidationError, WithJsonSchema
 
 from codex_dobby_mcp._version import __version__
 from codex_dobby_mcp.background_runs import BackgroundRunManager
@@ -31,9 +33,26 @@ from codex_dobby_mcp.models import (
     ToolResponse,
     parse_review_agents_input,
 )
-from codex_dobby_mcp.paths import resolve_repo_root
+from codex_dobby_mcp.paths import PathResolutionError, resolve_repo_root
 from codex_dobby_mcp.review_agents import review_agent_assets_root, review_uses_orchestrator
-from codex_dobby_mcp.runner import CodexRunner
+from codex_dobby_mcp.runner import CodexRunner, InvocationValidationError
+
+
+def _report_input_errors(handler):
+    """Keep anticipated caller errors visible on every supported SDK 2.x.
+
+    SDK 2.3 hides unexpected exceptions. Translate only our known input-error
+    types into its public ToolError; programming errors retain SDK handling.
+    wraps preserves the signature and annotations used to publish tool schemas.
+    """
+    @wraps(handler)
+    async def wrapped(*args, **kwargs):
+        try:
+            return await handler(*args, **kwargs)
+        except (InvocationValidationError, PathResolutionError, ValidationError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    return wrapped
 
 
 def _restore_json_pre_parsed_text(value: object) -> object:
@@ -325,6 +344,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"{_recommended_timeout_phrase(ToolName.PLAN)}"
         ),
     )
+    @_report_input_errors
     async def plan(
         prompt: str,
         repo_root: RepoRootParam,
@@ -356,6 +376,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"{_recommended_timeout_phrase(ToolName.RESEARCH)}"
         ),
     )
+    @_report_input_errors
     async def research(
         prompt: str,
         repo_root: RepoRootParam,
@@ -387,6 +408,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"{_recommended_timeout_phrase(ToolName.BRAINSTORM)}"
         ),
     )
+    @_report_input_errors
     async def brainstorm(
         prompt: str,
         repo_root: RepoRootParam,
@@ -418,6 +440,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"{_recommended_timeout_phrase(ToolName.BUILD)}"
         ),
     )
+    @_report_input_errors
     async def build(
         prompt: str,
         repo_root: RepoRootParam,
@@ -451,6 +474,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"{_recommended_timeout_phrase(ToolName.VALIDATE)}"
         ),
     )
+    @_report_input_errors
     async def validate(
         prompt: str,
         repo_root: RepoRootParam,
@@ -489,6 +513,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             "when timeout_seconds is omitted."
         ),
     )
+    @_report_input_errors
     async def review(
         prompt: str,
         repo_root: RepoRootParam,
@@ -526,6 +551,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             f"{_recommended_timeout_phrase(ToolName.REVERSE_ENGINEER)}"
         ),
     )
+    @_report_input_errors
     async def reverse_engineer(
         prompt: str,
         repo_root: RepoRootParam,
@@ -563,6 +589,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             "when timeout_seconds is omitted. get_run/list_runs remain available for a non-blocking peek."
         ),
     )
+    @_report_input_errors
     async def start_run(
         tool: ToolName,
         prompt: str,
@@ -598,6 +625,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         return background_runs.start(spec)
 
     @server.tool(name="get_run", structured_output=True)
+    @_report_input_errors
     async def get_run(
         task_id: str,
         repo_root: RepoRootParam,
@@ -625,6 +653,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
             "/ Cursor / Cline / Continue vary."
         ),
     )
+    @_report_input_errors
     async def wait_run(
         repo_root: RepoRootParam,
         task_id: str | None = None,
@@ -643,6 +672,7 @@ def create_server(spawn_root: Path | None = None) -> MCPServer:
         )
 
     @server.tool(name="list_runs", structured_output=True)
+    @_report_input_errors
     async def list_runs(
         repo_root: RepoRootParam,
         limit: int = 10,

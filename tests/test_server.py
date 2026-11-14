@@ -11,6 +11,7 @@ from codex_dobby_mcp import server as server_module
 from codex_dobby_mcp.models import DEFAULT_TOOL_TIMEOUT_SECONDS, ReviewAgent, ToolName
 from codex_dobby_mcp.server import (
     _effective_start_run_timeout,
+    _report_input_errors,
     _request_from_params,
     create_server,
 )
@@ -191,6 +192,53 @@ async def test_start_run_tool_boundary_rejects_agents_for_non_review_tools(tmp_p
             },
             Context(),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name",
+    ["plan", "research", "brainstorm", "build", "validate", "review",
+     "reverse_engineer", "start_run", "get_run", "wait_run", "list_runs"],
+)
+async def test_every_tool_preserves_repo_validation_errors(name: str, tmp_path: Path) -> None:
+    server = create_server(tmp_path)
+    tool = {tool.name: tool for tool in server._tool_manager.list_tools()}[name]
+    arguments = {"repo_root": str(tmp_path)}
+    if name in {tool.value for tool in ToolName} or name == "start_run":
+        arguments["prompt"] = "inspect"
+    if name == "start_run":
+        arguments["tool"] = "plan"
+    if name == "get_run":
+        arguments["task_id"] = "missing"
+
+    with pytest.raises(ToolError, match="Repo root is not inside a git worktree"):
+        await tool.run(arguments, Context())
+    assert not (tmp_path / ".codex-dobby").exists()
+
+
+@pytest.mark.asyncio
+async def test_tool_boundary_preserves_request_model_validation_errors(tmp_path: Path) -> None:
+    server = create_server(tmp_path)
+    plan = {tool.name: tool for tool in server._tool_manager.list_tools()}["plan"]
+    with pytest.raises(ToolError, match="reasoning_effort"):
+        await plan.run(
+            {"prompt": "inspect", "repo_root": str(tmp_path), "reasoning_effort": "bogus"},
+            Context(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+async def test_input_error_adapter_leaves_programming_errors_to_the_sdk(error_type) -> None:
+    error = error_type("unexpected internal failure")
+
+    @_report_input_errors
+    async def fail():
+        raise error
+
+    with pytest.raises(error_type) as caught:
+        await fail()
+    assert caught.value is error
 
 
 @pytest.mark.parametrize(

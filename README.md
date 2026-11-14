@@ -28,6 +28,8 @@ It gives Claude a sharper tool surface than a raw shell handoff: planning stays 
 - Codex CLI installed and authenticated. Multi-agent review requires a CLI that lists `multi_agent_v2` in `codex features list`; Dobby verifies this before fan-out. The rollout parser retains a `0.147.0` compatibility fixture, and the authenticated live baseline is `codex-cli 0.169.0` (verified 2026-11-14).
 - A git worktree for the target repo
 
+Anticipated input errors, such as invalid repository paths or review agents on a non-review tool, retain their validation detail with supported MCP SDK 2.x releases. Unexpected programming errors use the SDK's error handling.
+
 ### Project trust
 
 Codex 0.169 requires explicit project trust before loading project-local configuration and MCP servers, including `codex exec --sandbox workspace-write`. If you intend to enable a project's configuration, save trust using `codex exec --trust` in that repo from your normal Codex environment before invoking Dobby. Explicitly untrusted projects require updating their saved trust setting first. See the [Codex change](https://github.com/openai/codex/pull/60041).

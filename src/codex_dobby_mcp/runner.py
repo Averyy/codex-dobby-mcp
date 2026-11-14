@@ -73,6 +73,10 @@ from codex_dobby_mcp.review_agents import (
 from codex_dobby_mcp.safeguards import child_environment, ensure_not_recursive
 
 
+class InvocationValidationError(ValueError):
+    """An anticipated caller error that can be safely shown at the tool boundary."""
+
+
 class RunnerError(RuntimeError):
     pass
 
@@ -1028,7 +1032,7 @@ class CodexRunner:
 
     def _resolve(self, tool: ToolName, request: InvocationRequest) -> ResolvedInvocation:
         if tool != ToolName.REVIEW and request.agents:
-            raise ValueError("agents is only supported when tool=review")
+            raise InvocationValidationError("agents is only supported when tool=review")
 
         requested_timeout_seconds = request.timeout_seconds
         requested_review_agents = list(request.agents) if tool == ToolName.REVIEW else []
